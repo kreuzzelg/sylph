@@ -33,27 +33,31 @@ jobs:
         shell: msys2 {0}
     steps:
       - uses: actions/checkout@v4
+      # 2026-10-05: MSYS2 moved libgomp out of mingw-w64-*-gcc-libs with gcc 16.2.
+      # A runner that gets gcc 16.2 from the mirror but gcc-libs 16.1 from the cache
+      # has no libgomp at all ("cannot find -lgomp"); installing the new libgomp
+      # package on top of gcc-libs 16.1 conflicts. A full update first (update: true)
+      # puts gcc, gcc-libs and libgomp at the same version, then libgomp installs.
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2, as upstream pins it
         with:
           msystem: UCRT64
-          update: false
+          update: true
           install: >-
             make
             mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-libgomp
             mingw-w64-ucrt-x86_64-python
-      # 2026-10-05: with MSYS2's gcc 16.2 the link fails with "cannot find -lgomp"
-      # even without -static, i.e. the OpenMP runtime is no longer part of the gcc
-      # package on this runner. Find and install whatever package now provides it,
-      # and print what the package database says so the next fix is informed.
+      # Diagnostic + last-resort fallback; never fails the job on its own.
       - name: OpenMP runtime
         run: |
-          ls /ucrt64/lib | grep -i gomp || echo "no libgomp in /ucrt64/lib"
-          pacman -Sy --noconfirm >/dev/null 2>&1 || true
-          echo "--- packages mentioning gomp/openmp:"; pacman -Ss 'gomp|openmp' | grep -i ucrt || true
-          pkgs=$(pacman -Ssq 'ucrt-x86_64-(lib)?gomp$|ucrt-x86_64-openmp$' 2>/dev/null | sed 's|^ucrt64/||' || true)
-          if [ -n "$pkgs" ]; then echo "installing: $pkgs"; pacman -S --noconfirm --needed $pkgs; fi
-          pacman -Fy >/dev/null 2>&1 && (pacman -F ucrt64/lib/libgomp.dll.a || true)
-          ls /ucrt64/lib | grep -i gomp || true
+          gcc --version | head -1
+          if ls /ucrt64/lib/libgomp.dll.a >/dev/null 2>&1; then
+            echo "libgomp present:"; ls /ucrt64/lib | grep -i gomp
+          else
+            echo "no libgomp in /ucrt64/lib; trying the split package"
+            pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-libgomp || true
+            ls /ucrt64/lib | grep -i gomp || echo "still no libgomp"
+          fi
       # The Makefile links -static; a static libgomp.a may not exist here. CI only
       # needs a runnable binary, so link the OpenMP runtime dynamically (a
       # command-line variable overrides the Makefile's LDFLAGS in every sub-make).
