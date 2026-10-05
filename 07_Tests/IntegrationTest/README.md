@@ -8,6 +8,6 @@ against real-world input.
 | Module | Test | State |
 |---|---|---|
 | `gguf.h` + `ggufinfo.py` (phase 1) | [`gguf_reader.md`](gguf_reader.md) · runner `run_gguf_reader.py` | written after the fact (phase 1 pre-dates the process); passes |
-| `gq.h` (phase 2) | `gq_kernels.md` | to write before phase 2 |
-| `src.h` / `glm_names.h` / `ts_cfg` / `ts_tok` (phase 3) | `src_facade.md` | to write before phase 3 |
+| `gq.h` (phase 2) | [`gq_kernels.md`](gq_kernels.md) · runner `run_gq_kernels.py` · golden `fixtures/e0/` (gguf-py, generator `make_e0_golden.py`) | written 2026-10-05 before implementation; oracles cross-checked 16/16; runner fails at build until phase 2 lands |
+| `src.h` / `qwen35_names.h` / `gguf_xform.h` / `ts_cfg` / `ts_tok` (phase 3) | `src_facade.md` | to write before phase 3 |
 | expert streaming (phase 4) | `expert_streaming.md` | to write before phase 4 |

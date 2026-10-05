@@ -1,0 +1,400 @@
+{
+ "fixtures": [
+  {
+   "name": "real_bartowski_down_exps_q6_k_e0",
+   "type": "Q6_K",
+   "type_id": 14,
+   "numel": 4096,
+   "raw_bytes": 3360,
+   "source": {
+    "kind": "range",
+    "url": "https://huggingface.co/bartowski/Qwen_Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf",
+    "tensor": "blk.0.ffn_down_exps.weight",
+    "ne0": 512,
+    "tensor_offset": 732730496,
+    "first_row": 0,
+    "rows": 8,
+    "byte_range": [
+     732730496,
+     732733855
+    ]
+   },
+   "sha256_bin": "d48738c498ae874f58c5b3bc9670a10a76f860028b62bae6e331591fda3be705",
+   "sha256_f32": "d46f2709890ec2fdb4676561aa4e8b54a2373a413a7f2ba08c7f7553e13812d2",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "real_bartowski_gate_inp_bf16",
+   "type": "BF16",
+   "type_id": 30,
+   "numel": 4096,
+   "raw_bytes": 8192,
+   "source": {
+    "kind": "range",
+    "url": "https://huggingface.co/bartowski/Qwen_Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf",
+    "tensor": "blk.40.ffn_gate_inp.weight",
+    "ne0": 2048,
+    "tensor_offset": 21987640960,
+    "first_row": 0,
+    "rows": 2,
+    "byte_range": [
+     21987640960,
+     21987649151
+    ]
+   },
+   "sha256_bin": "c5f14b05b84d3b88508fb5a41415c684f3d07a832d32acfe8ef486fba488bc91",
+   "sha256_f32": "0b81b86b7fd176bbf0d1da4309355414a5b26278e979945601936c5a7ac4b805",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "real_unsloth_attn_norm_f32",
+   "type": "F32",
+   "type_id": 0,
+   "numel": 2048,
+   "raw_bytes": 8192,
+   "source": {
+    "kind": "range",
+    "url": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+    "tensor": "blk.0.attn_norm.weight",
+    "ne0": 2048,
+    "tensor_offset": 977433056,
+    "first_row": 0,
+    "rows": 1,
+    "byte_range": [
+     977433056,
+     977441247
+    ]
+   },
+   "sha256_bin": "f452e90d3bc696497fce0aee0233ce7d3f7dfa4dbfc2ebcc992d426a5df9e4ee",
+   "sha256_f32": "f452e90d3bc696497fce0aee0233ce7d3f7dfa4dbfc2ebcc992d426a5df9e4ee",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "real_unsloth_attn_qkv_q8_0",
+   "type": "Q8_0",
+   "type_id": 8,
+   "numel": 8192,
+   "raw_bytes": 8704,
+   "source": {
+    "kind": "range",
+    "url": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+    "tensor": "blk.0.attn_qkv.weight",
+    "ne0": 2048,
+    "tensor_offset": 977441248,
+    "first_row": 4096,
+    "rows": 4,
+    "byte_range": [
+     986354144,
+     986362847
+    ]
+   },
+   "sha256_bin": "35caaa3f8de398b57064eaf687723be411c8de186d890a2306505666a872a8af",
+   "sha256_f32": "4736000d2d88c9d67de77ac1448bf5e54cfd172e3aad3aeb6b7fa92e3d815ded",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "real_unsloth_down_exps_q5_k_e0",
+   "type": "Q5_K",
+   "type_id": 13,
+   "numel": 4096,
+   "raw_bytes": 2816,
+   "source": {
+    "kind": "range",
+    "url": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+    "tensor": "blk.0.ffn_down_exps.weight",
+    "ne0": 512,
+    "tensor_offset": 995267040,
+    "first_row": 0,
+    "rows": 8,
+    "byte_range": [
+     995267040,
+     995269855
+    ]
+   },
+   "sha256_bin": "d61adcf5f55c282535a47cfd14681b40ca489af48ebc6ddfbc4fa6c3f6f975f9",
+   "sha256_f32": "9083c387fbe4a2c821d27b4d807cda618875d42d3b08cdb643fabad755582ce7",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "real_unsloth_gate_exps_q4_k_e0",
+   "type": "Q4_K",
+   "type_id": 12,
+   "numel": 8192,
+   "raw_bytes": 4608,
+   "source": {
+    "kind": "range",
+    "url": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+    "tensor": "blk.0.ffn_gate_exps.weight",
+    "ne0": 2048,
+    "tensor_offset": 1180930528,
+    "first_row": 0,
+    "rows": 4,
+    "byte_range": [
+     1180930528,
+     1180935135
+    ]
+   },
+   "sha256_bin": "8dfdfc0d92042b1fdc7c869b539c0d0b5437617fc885676c14058dd8f44b0989",
+   "sha256_f32": "dfe73b5794569f42c193694d8ad72d3f18497d2779051115b6f2aa33d67995d4",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "real_unsloth_gate_exps_q4_k_e200",
+   "type": "Q4_K",
+   "type_id": 12,
+   "numel": 8192,
+   "raw_bytes": 4608,
+   "source": {
+    "kind": "range",
+    "url": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+    "tensor": "blk.0.ffn_gate_exps.weight",
+    "ne0": 2048,
+    "tensor_offset": 1180930528,
+    "first_row": 102400,
+    "rows": 4,
+    "byte_range": [
+     1298895328,
+     1298899935
+    ]
+   },
+   "sha256_bin": "0ac9e5b272cc4f08bf79436059a3a5d84a01806f500261a9affee04f716779b4",
+   "sha256_f32": "ef59a3e1f9385281a737a07087a87b3d807c3c356e32bba20b5d3f8a64569aa6",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "real_unsloth_output_q6_k",
+   "type": "Q6_K",
+   "type_id": 14,
+   "numel": 8192,
+   "raw_bytes": 6720,
+   "source": {
+    "kind": "range",
+    "url": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+    "tensor": "output.weight",
+    "ne0": 2048,
+    "tensor_offset": 10990048,
+    "first_row": 0,
+    "rows": 4,
+    "byte_range": [
+     10990048,
+     10996767
+    ]
+   },
+   "sha256_bin": "00bf0e01ebbbd4c3d0e936c6adf546f5433a2578052d0c391c74f89b15a944d5",
+   "sha256_f32": "6c3dc8f673c5fb3c3145a27d23058bb99a73822fedc7d093f292157a87f804f0",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "real_unsloth_token_embd_q8_0",
+   "type": "Q8_0",
+   "type_id": 8,
+   "numel": 8192,
+   "raw_bytes": 8704,
+   "source": {
+    "kind": "range",
+    "url": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+    "tensor": "token_embd.weight",
+    "ne0": 2048,
+    "tensor_offset": 428175840,
+    "first_row": 0,
+    "rows": 4,
+    "byte_range": [
+     428175840,
+     428184543
+    ]
+   },
+   "sha256_bin": "358c776213cf2fe41f48299e31686accdb477dc6afde6a011b230bc08f588f60",
+   "sha256_f32": "df609d4ee021dc14932bdddfd86bf3e60bb5eaeb3afbc3ba315f5431799a28ce",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "synth_bf16",
+   "type": "BF16",
+   "type_id": 30,
+   "numel": 1032,
+   "raw_bytes": 2064,
+   "source": {
+    "kind": "synthetic",
+    "seed": 20261005,
+    "note": "random blocks, finite f16 scales, 6 edge blocks appended"
+   },
+   "sha256_bin": "4416fba83758662c2e150109b0152fe0f217edafd78998936d231e3754c8977b",
+   "sha256_f32": "82e1303ea70d844b6002d54fbed21b13cca889110f88c58f5cc4bcbfb164db58",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "synth_f16",
+   "type": "F16",
+   "type_id": 1,
+   "numel": 1032,
+   "raw_bytes": 2064,
+   "source": {
+    "kind": "synthetic",
+    "seed": 20261005,
+    "note": "random blocks, finite f16 scales, 6 edge blocks appended"
+   },
+   "sha256_bin": "b5765ff747cd9b68d4ee967a52f20fc86869144a12028546adb30f288b7bb32e",
+   "sha256_f32": "7ccaffffff7361afb0340511a2faf1c0a83fa8c57f138da7d9e1a458c9efd6fd",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "synth_f32",
+   "type": "F32",
+   "type_id": 0,
+   "numel": 1032,
+   "raw_bytes": 4128,
+   "source": {
+    "kind": "synthetic",
+    "seed": 20261005,
+    "note": "random blocks, finite f16 scales, 6 edge blocks appended"
+   },
+   "sha256_bin": "8fa28976c910fb46bfb922a268aaf28b2a4d670c2e42ba3cf63d1a0ba6e266dd",
+   "sha256_f32": "8fa28976c910fb46bfb922a268aaf28b2a4d670c2e42ba3cf63d1a0ba6e266dd",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "synth_q4_0",
+   "type": "Q4_0",
+   "type_id": 2,
+   "numel": 1216,
+   "raw_bytes": 684,
+   "source": {
+    "kind": "synthetic",
+    "seed": 20261005,
+    "note": "random blocks, finite f16 scales, 6 edge blocks appended"
+   },
+   "sha256_bin": "00ea93f2713f17ff9850714e5d95e4849adb8e161821e5ee076a0ba73ea888cb",
+   "sha256_f32": "906b9b15dfa434f3d2d1058d137a8f44bf2095f1c4b2c84c6a6fa68ecd4469b7",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "synth_q4_k",
+   "type": "Q4_K",
+   "type_id": 12,
+   "numel": 2560,
+   "raw_bytes": 1440,
+   "source": {
+    "kind": "synthetic",
+    "seed": 20261005,
+    "note": "random blocks, finite f16 scales, 6 edge blocks appended"
+   },
+   "sha256_bin": "a51c8ebe53e7e0f141864e13a8d44eacefaa4492411ba415f152ce537d8a92dd",
+   "sha256_f32": "db148c57de4d7542de6ec689c76cc47f84e72941bc7f389adaf454528ee9467a",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "synth_q5_k",
+   "type": "Q5_K",
+   "type_id": 13,
+   "numel": 2560,
+   "raw_bytes": 1760,
+   "source": {
+    "kind": "synthetic",
+    "seed": 20261005,
+    "note": "random blocks, finite f16 scales, 6 edge blocks appended"
+   },
+   "sha256_bin": "4fc385da61af9b26ae5a44459d0f130603e6f1cd021337005f23b79e8acde2e2",
+   "sha256_f32": "2b9648b8b6a3f81c6fdc74ca0afa06317b9066eac663abcba40e334d474dc95e",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "synth_q6_k",
+   "type": "Q6_K",
+   "type_id": 14,
+   "numel": 2560,
+   "raw_bytes": 2100,
+   "source": {
+    "kind": "synthetic",
+    "seed": 20261005,
+    "note": "random blocks, finite f16 scales, 6 edge blocks appended"
+   },
+   "sha256_bin": "baa54952324412310aa92174131fd41c0159fb61d7083accd5e85f4c87a31134",
+   "sha256_f32": "67ce6e954e2588bc666d78052dbdf82be80884ea0513eab62820cfe1f6b7d42c",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "synth_q8_0",
+   "type": "Q8_0",
+   "type_id": 8,
+   "numel": 1216,
+   "raw_bytes": 1292,
+   "source": {
+    "kind": "synthetic",
+    "seed": 20261005,
+    "note": "random blocks, finite f16 scales, 6 edge blocks appended"
+   },
+   "sha256_bin": "a6b7b00d4ea1e91d7ccc00beb9e088dba50b8cc823aac9a96d8e67debc023689",
+   "sha256_f32": "d53ed144c9a0a16590060dee6d7cc0b3bea4dc36f2db55e9300867e2380f1b3c",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  }
+ ],
+ "oracle": "llama.cpp gguf-py gguf.quants.dequantize (reference for ggml dequantize_row_*)"
+}

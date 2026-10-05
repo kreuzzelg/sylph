@@ -372,6 +372,17 @@ c --> "08_Documents/equivalence/<date>-<file>.md"
 | integration (`07_Tests/IntegrationTest`) | reader cross-check (done); kernels vs llama.cpp dequant dump; façade on both tiny sources yields identical `Cfg` and dense buffers |
 | system (`07_Tests/SystemTest`) | inspect real GGUF (done); **lossless oracle** from an F32 GGUF of the tiny Qwen3.6; **equivalence E1–E3** on the real model (owner's machine); **A/B** per `docs/benchmarking.md` |
 
+**Amendment 2026-10-05 (after the owner's review).** Upstream v1.12.1 already ships a
+stdlib GGUF reader (`tools/gguf_reader.py`) and a numpy dequantizer ported from ggml
+(`tools/gguf_dequant.py`, pinned by gguf-py golden vectors) for its GGUF→OLMoE
+converter. The E0 oracle therefore is: llama.cpp's gguf-py golden vectors committed under
+`07_Tests/IntegrationTest/fixtures/e0/` (real Qwen3.6 rows of every type + synthetic edge
+blocks), with upstream's module as the second, independent decoder (16/16 bit-exact on
+2026-10-05). The planned `tools/gq_ref.py` is dropped. The C reference decode must keep
+ggml's expression order and must not be FP-contracted (`-ffp-contract=off`), otherwise
+the sign of zero and the last bit differ from the golden. Contract of the test binary:
+`07_Tests/IntegrationTest/gq_kernels.md`.
+
 ## 12. Phased plan (details and status in `../04_Tasks/tasks.md`)
 
 | Phase | Deliverables | Exit |

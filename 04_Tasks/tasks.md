@@ -13,7 +13,7 @@ that phase's implementation.
 - [x] v1 specification + architecture (GLM-5.2 target, 2026-10-04)
 - [x] owner wrote `01_Requirements/` (2026-10-05)
 - [x] v2 specification + architecture (Qwen3.6 target, Ollama/llama.cpp as reference, equivalence levels E0–E3)
-- [ ] **Owner review of the v2 architecture** (blocks phase 2)
+- [x] **Owner review of the v2 architecture** (done 2026-10-05)
 - [ ] Owner answers the open questions (spec §9): Ollama tag/blob, calibration approach, MTP, GLM-5.2 roadmap
 
 ## Phase 1 — reader (`gguf.h`, `ggufinfo.py`) — done
@@ -28,16 +28,20 @@ that phase's implementation.
 
 ## Phase 2 — kernels (`gq.h`)
 
-Pre-conditions: architecture reviewed; `07_Tests/IntegrationTest/gq_kernels.md` written.
+Pre-conditions (met 2026-10-05): architecture reviewed; `07_Tests/IntegrationTest/gq_kernels.md` (+ runner, 17 golden fixtures) and `07_Tests/SystemTest/kernel_throughput.md` written.
 
 - [ ] type table, `gq_row_size`, `gq_supported` (F32, F16, BF16, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K)
-- [ ] `tools/gq_ref.py` pure-Python reference dequantizer (E0 oracle), cross-checked once against a llama.cpp dequant dump
+- [x] E0 oracle: gguf-py golden vectors in `07_Tests/IntegrationTest/fixtures/e0/` (real Qwen3.6 rows + synthetic edge blocks), cross-checked 16/16 bit-exact against upstream's `tools/gguf_dequant.py` — no new `gq_ref.py` needed
+- [ ] `gq_deq_row_T` reference path compiled without FP contraction (`-ffp-contract=off` for the unit / function attribute); sign-of-zero and expression order as ggml (gq_kernels.md §"What E0 pins")
+- [ ] `tests/test_gq_kernels` CLI: no-arg suite (`all passed`), `deq <TYPE> <bin> <numel>` (exit 2 `unsupported type`, exit 3 `size mismatch`), `moe-digest` (FNV-1a, thread-independent)
+- [ ] copy the eight `synth_*` golden pairs to `tests/fixtures/gq_e0/` for the `make check` E0 subset (FR-34)
 - [ ] `gq_deq_row_T` for every type; `gq_dot_row_T` scalar; AVX2; AVX-512/VNNI; NEON
 - [ ] `gq_q8_0_split` (Q8_0 → int8 plane + f32/32 scales) and its test against `gsgemv.h`'s `matmul_q_gs`
 - [ ] `gq_matmul` (dense; `Q6_K`/`Q8_0` lm_head), `gq_embed_row`
 - [ ] `gq_moe_run` (K-quant twin of `xf_moe_run`), fused gate+up, rank-ordered reduction
 - [ ] `gq_selftest` at startup; `tests/test_gq_kernels.c`
-- [ ] NFR-7 measurement: `Q4_K` expert GEMV vs planar int4 per byte; `Q6_K` lm_head vs int8 lm_head
+- [ ] `tests/bench_gq.c` + `make bench-gq` per `07_Tests/SystemTest/kernel_throughput.md`; NFR-7 measurement on the dev container and the owner's host → `08_Documents/kernels/`
+- [ ] `07_Tests/IntegrationTest/run_gq_kernels.py` passes (cases 0–2, 5, 6; 3–4 with numpy)
 
 ## Phase 3 — assembly (`src.h`, `qwen35_names.h`, `gguf_xform.h`, `ts_cfg`, tokenizer)
 
@@ -84,4 +88,5 @@ Pre-conditions: `07_Tests/IntegrationTest/expert_streaming.md`, `07_Tests/System
 
 - [ ] upstream sync procedure documented and exercised once more (`git subtree pull`)
 - [ ] decide whether the `coli` launcher keeps its name in sylph
+- [ ] consolidate the two stdlib GGUF readers (`c/ggufinfo.py` from phase 1, upstream's `c/tools/gguf_reader.py` since v1.12.1) and reuse upstream's `tools/gguf_dequant.py` in Python tooling
 - [ ] Ollama blob inspection by the owner (`ollama show --modelfile`, `coli gguf inspect <blob>`)
