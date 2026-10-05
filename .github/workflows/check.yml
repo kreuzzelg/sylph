@@ -27,6 +27,7 @@ jobs:
 
   windows:
     runs-on: windows-latest
+    timeout-minutes: 45   # upstream measures ~20 min for this suite on MinGW
     defaults:
       run:
         shell: msys2 {0}
@@ -40,5 +41,10 @@ jobs:
             make
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-python
+      # MSYS2's current gcc ships no static libgomp.a any more ("cannot find -lgomp"
+      # with gcc 16.2, 2026-10-05), so the engine Makefile's `-static` cannot link
+      # here. CI only needs a runnable binary, not a redistributable one: link the
+      # OpenMP runtime dynamically (libgomp-1.dll is on PATH in the msys2 shell).
+      # A command-line variable overrides the Makefile's LDFLAGS in every sub-make.
       - name: make check
-        run: make -C 06_Code/c check
+        run: make -C 06_Code/c check LDFLAGS="-lm -fopenmp -lpsapi"
