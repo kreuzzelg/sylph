@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>colibri — a 744B model on hardware you own</title>
+<meta name="description" content="Run GLM-5.2, a 744-billion-parameter Mixture-of-Experts model, on hardware you already own — pure C, zero dependencies, experts streamed from disk.">
+<meta property="og:title" content="colibri — a 744B model on hardware you own">
+<meta property="og:description" content="A 744B MoE on consumer hardware: pure C, zero dependencies, experts tiered across VRAM, RAM and disk. Run it, study it, improve it.">
+<meta property="og:type" content="website">
+<meta property="og:image" content="https://raw.githubusercontent.com/JustVugg/colibri/main/docs/media/colibri-atlas.png">
+<link rel="icon" type="image/svg+xml" href="colibri-icon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&family=Bytesized&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;1,8..60,400&display=swap" rel="stylesheet">
+<style>
+:root{
+  --cream:#F0EDE4; --tan:#E7E0D1; --tan2:#DFD7C6; --card-line:#D2CAB7;
+  --ink:#191817; --ink2:#3c3931; --gray:#726b5e; --faint:#a49c8b;
+  --dark:#141311; --on-dark:#EDE9DF; --on-dark-dim:#a7a094;
+  --hair:#dcd6c8; --clay:#b3603f;
+  --sans:'Hanken Grotesk',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  --serif:'Source Serif 4',Georgia,'Times New Roman',serif;
+  --maxw:1200px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{background:var(--cream);color:var(--ink);font-family:var(--sans);line-height:1.5;
+  -webkit-font-smoothing:antialiased;overflow-x:hidden;font-size:17px}
+a{color:inherit;text-decoration:none}
+::selection{background:rgba(179,96,63,.16)}
+.wrap{max-width:var(--maxw);margin:0 auto;padding:0 clamp(1.3rem,4vw,2.6rem)}
+.serif{font-family:var(--serif)}
+
+/* nav */
+nav{position:fixed;inset:0 0 auto 0;z-index:50;background:rgba(240,237,228,.88);backdrop-filter:blur(10px);transition:border-color .25s;border-bottom:1px solid transparent}
+nav.on{border-color:var(--hair)}
+nav .in{max-width:var(--maxw);margin:0 auto;display:flex;align-items:center;padding:.85rem clamp(1.3rem,4vw,2.6rem)}
+nav .brand{display:flex;align-items:center}
+nav .brand .mark{display:flex;transition:transform .4s cubic-bezier(.4,0,.2,1)}
+nav .brand .mark svg{width:40px;height:40px;display:block}
+nav.on .brand .mark{transform:scale(1.06)}
+nav .brand .word{font-family:'Bytesized',var(--sans);font-weight:400;font-size:2.3em;letter-spacing:.02em;text-transform:uppercase;line-height:1;margin-left:.6rem;
+  max-width:16rem;opacity:1;overflow:hidden;white-space:nowrap;
+  transition:max-width .45s cubic-bezier(.4,0,.2,1),opacity .3s,margin-left .45s cubic-bezier(.4,0,.2,1)}
+nav.on .brand .word{max-width:0;opacity:0;margin-left:0}
+nav .nl{margin-left:auto;display:flex;gap:2rem;align-items:center;font-weight:500;font-size:.96rem}
+nav .nl a:not(.btn){color:var(--ink2)} nav .nl a:not(.btn):hover{color:var(--ink)}
+.btn{font-family:var(--sans);font-weight:600;font-size:.94rem;display:inline-flex;align-items:center;gap:.45rem;
+  background:var(--ink);color:var(--cream);padding:.6rem 1.15rem;border-radius:7px;transition:.15s;border:1.5px solid var(--ink)}
+.btn:hover{background:#000;border-color:#000}
+.btn.ghost{background:transparent;color:var(--ink);border-color:var(--card-line)}
+.btn.ghost:hover{background:transparent;border-color:var(--ink)}
+@media(max-width:820px){nav .nl a:not(.btn){display:none}}
+
+/* hero */
+.hero{padding:9.5rem 0 4.5rem}
+.hero-grid{display:grid;grid-template-columns:1.5fr 1fr;gap:3rem;align-items:end}
+@media(max-width:860px){.hero-grid{grid-template-columns:1fr;gap:1.6rem}}
+.hero h1{font-weight:800;font-size:clamp(2.6rem,6.2vw,4.7rem);line-height:1.03;letter-spacing:-.03em;text-wrap:balance}
+.hero h1 u{text-decoration:none;border-bottom:.11em solid var(--ink);padding-bottom:.02em}
+.hero .aside{font-family:var(--serif);font-size:clamp(1.1rem,1.7vw,1.32rem);line-height:1.45;color:var(--ink2);max-width:26rem}
+.hero .cta{display:flex;gap:.7rem;margin-top:2.4rem;flex-wrap:wrap}
+
+/* dark block */
+.block-dark{background:var(--dark);color:var(--on-dark)}
+.block-dark .inner{max-width:860px;margin:0 auto;padding:clamp(4.5rem,10vh,7rem) clamp(1.3rem,4vw,2.6rem);text-align:center}
+.block-dark h2{font-family:var(--serif);font-weight:400;font-size:clamp(2.1rem,5vw,3.4rem);line-height:1.12;letter-spacing:-.01em;text-wrap:balance}
+.block-dark p{color:var(--on-dark-dim);font-size:1.1rem;max-width:38rem;margin:1.1rem auto 0;line-height:1.5}
+.block-dark .btn{background:var(--on-dark);color:var(--dark);border-color:var(--on-dark);margin-top:2rem}
+.block-dark .btn:hover{background:#fff;border-color:#fff}
+.atlas-block{position:relative;overflow:hidden;min-height:720px;display:flex;align-items:center}
+.atlas-block > canvas{position:absolute;inset:0;width:100%;height:100%;display:block;z-index:0;cursor:grab;touch-action:pan-y}
+.atlas-block::after{content:"";position:absolute;inset:0;z-index:1;pointer-events:none;
+  background:radial-gradient(ellipse 58% 46% at 50% 48%,rgba(20,19,17,.66),rgba(20,19,17,.12) 72%,transparent)}
+.atlas-block .inner{position:relative;z-index:2;pointer-events:none}
+.atlas-block .inner h2,.atlas-block .inner p{text-shadow:0 2px 26px rgba(20,19,17,.85),0 1px 5px rgba(20,19,17,.8)}
+.atlas-hint{position:absolute;bottom:1.3rem;left:50%;transform:translateX(-50%);z-index:2;pointer-events:none;
+  font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.72rem;color:var(--on-dark-dim);letter-spacing:.06em;text-align:center;padding:0 1rem}
+
+/* generic section */
+section{padding:clamp(4.5rem,9vh,7rem) 0}
+.eyebrow{font-weight:700;font-size:1.15rem;letter-spacing:-.01em;margin-bottom:2rem}
+.lead{font-family:var(--serif);color:var(--ink2);max-width:44rem;font-size:clamp(1.1rem,1.7vw,1.28rem);line-height:1.5}
+
+
+/* cards (models) */
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:1.4rem;margin-top:.5rem}
+@media(max-width:900px){.cards{grid-template-columns:1fr}}
+.card{background:var(--tan);border-radius:12px;padding:1.7rem 1.6rem 1.6rem;display:flex;flex-direction:column;transition:.16s}
+.card:hover{background:var(--tan2);transform:translateY(-3px)}
+.card h3{font-weight:700;font-size:1.35rem;letter-spacing:-.02em;margin-bottom:.5rem}
+.card .desc{font-family:var(--serif);color:var(--ink2);font-size:1.02rem;line-height:1.45;flex:1}
+.meta{margin-top:1.4rem}
+.meta .row{display:flex;justify-content:space-between;align-items:baseline;gap:1rem;padding:.65rem 0;border-top:1px solid var(--card-line)}
+.meta .k{font-weight:700;font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;color:var(--gray)}
+.meta .v{font-family:var(--serif);font-size:.98rem;color:var(--ink)}
+.card .btn{margin-top:1.3rem;align-self:flex-start}
+.card .btn.soon{background:transparent;color:var(--gray);border-color:var(--card-line);pointer-events:none}
+
+/* data list (hardware) */
+.dlist{margin-top:2.4rem;border-top:1px solid var(--hair)}
+.dlist a,.dlist .drow{display:grid;grid-template-columns:1fr auto;gap:1.5rem;align-items:center;
+  padding:1.15rem .2rem;border-bottom:1px solid var(--hair);transition:.14s}
+.dlist a:hover{padding-left:.7rem}
+.dlist .name{font-weight:600;font-size:1.08rem;letter-spacing:-.01em}
+.dlist .sub{color:var(--gray);font-size:.9rem;margin-top:.15rem}
+.dlist .spd{font-family:var(--serif);font-size:1.15rem;white-space:nowrap;text-align:right}
+.dlist .hi{color:var(--clay)}
+.dlistnote{font-family:var(--serif);color:var(--gray);margin-top:1.6rem;font-size:1rem}
+.dlistnote a{border-bottom:1px solid var(--card-line)}
+
+/* split (build) */
+.split{display:grid;grid-template-columns:1fr 1.3fr;gap:3rem;align-items:start}
+@media(max-width:900px){.split{grid-template-columns:1fr;gap:1.5rem}}
+.split h2{font-weight:800;font-size:clamp(1.9rem,3.6vw,2.6rem);line-height:1.08;letter-spacing:-.03em;text-wrap:balance}
+.jlist{border-top:1px solid var(--hair)}
+.jlist a{display:grid;grid-template-columns:1fr auto;gap:1.5rem;align-items:baseline;padding:1.2rem .2rem;border-bottom:1px solid var(--hair);transition:.14s}
+.jlist a:hover{padding-left:.7rem}
+.jlist .t{font-weight:600;font-size:1.1rem}
+.jlist .c{font-family:var(--serif);color:var(--gray);font-size:.98rem;white-space:nowrap}
+
+/* footer */
+footer{background:var(--dark);color:var(--on-dark-dim);padding:4rem 0 3rem}
+.fgrid{display:grid;grid-template-columns:1.3fr repeat(3,1fr);gap:2rem}
+@media(max-width:820px){.fgrid{grid-template-columns:1fr 1fr}}
+footer .mono-mark svg{width:52px;height:52px}
+footer h4{color:var(--on-dark);font-weight:700;font-size:.95rem;margin-bottom:1rem}
+footer ul{list-style:none;display:flex;flex-direction:column;gap:.7rem}
+footer li a{color:var(--on-dark-dim);font-size:.95rem}
+footer li a:hover{color:var(--on-dark)}
+.fbot{max-width:var(--maxw);margin:2.8rem auto 0;padding:1.6rem clamp(1.3rem,4vw,2.6rem) 0;border-top:1px solid #2a2822;
+  display:flex;gap:1.2rem;flex-wrap:wrap;font-size:.88rem;color:var(--on-dark-dim)}
+.fbot .sp{margin-left:auto}
+
+.reveal{opacity:0;transform:translateY(20px);transition:opacity .6s ease,transform .6s ease}
+.reveal.in{opacity:1;transform:none}
+@media(prefers-reduced-motion:reduce){.reveal{opacity:1;transform:none}}
+</style>
+</head>
+<body>
+
+<!-- colibri mark — monochrome, no box -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="logo" viewBox="0 21 168 126"><g transform="translate(7 21)" shape-rendering="crispEdges" fill="#191817">
+    <rect x="56" y="0" width="14" height="14"/><rect x="70" y="0" width="14" height="14"/><rect x="84" y="0" width="14" height="14"/>
+    <rect x="42" y="14" width="14" height="14"/><rect x="56" y="14" width="14" height="14"/><rect x="70" y="14" width="14" height="14"/><rect x="84" y="14" width="14" height="14"/><rect x="98" y="14" width="14" height="14"/><rect x="140" y="14" width="14" height="14"/>
+    <rect x="56" y="28" width="14" height="14"/><rect x="70" y="28" width="14" height="14"/><rect x="84" y="28" width="14" height="14"/><rect x="98" y="28" width="14" height="14"/><rect x="126" y="28" width="14" height="14"/><rect x="140" y="28" width="14" height="14"/>
+    <rect x="0" y="42" width="14" height="14"/><rect x="14" y="42" width="14" height="14"/><rect x="28" y="42" width="14" height="14"/><rect x="42" y="42" width="14" height="14"/><rect x="56" y="42" width="14" height="14"/><rect x="70" y="42" width="14" height="14"/><rect x="84" y="42" width="14" height="14"/><rect x="98" y="42" width="14" height="14"/><rect x="112" y="42" width="14" height="14"/><rect x="126" y="42" width="14" height="14"/>
+    <rect x="56" y="56" width="14" height="14"/><rect x="70" y="56" width="14" height="14"/><rect x="84" y="56" width="14" height="14"/><rect x="98" y="56" width="14" height="14"/><rect x="112" y="56" width="14" height="14"/><rect x="126" y="56" width="14" height="14"/><rect x="140" y="56" width="14" height="14"/>
+    <rect x="70" y="70" width="14" height="14"/><rect x="84" y="70" width="14" height="14"/><rect x="98" y="70" width="14" height="14"/><rect x="112" y="70" width="14" height="14"/><rect x="126" y="70" width="14" height="14"/><rect x="140" y="70" width="14" height="14"/>
+    <rect x="84" y="84" width="14" height="14"/><rect x="98" y="84" width="14" height="14"/><rect x="112" y="84" width="14" height="14"/><rect x="126" y="84" width="14" height="14"/>
+    <rect x="98" y="98" width="14" height="14"/><rect x="112" y="98" width="14" height="14"/><rect x="112" y="112" width="14" height="14"/>
+  </g></symbol>
+  <symbol id="logo-light" viewBox="0 21 168 126"><g transform="translate(7 21)" shape-rendering="crispEdges" fill="#EDE9DF">
+    <rect x="56" y="0" width="14" height="14"/><rect x="70" y="0" width="14" height="14"/><rect x="84" y="0" width="14" height="14"/>
+    <rect x="42" y="14" width="14" height="14"/><rect x="56" y="14" width="14" height="14"/><rect x="70" y="14" width="14" height="14"/><rect x="84" y="14" width="14" height="14"/><rect x="98" y="14" width="14" height="14"/><rect x="140" y="14" width="14" height="14"/>
+    <rect x="56" y="28" width="14" height="14"/><rect x="70" y="28" width="14" height="14"/><rect x="84" y="28" width="14" height="14"/><rect x="98" y="28" width="14" height="14"/><rect x="126" y="28" width="14" height="14"/><rect x="140" y="28" width="14" height="14"/>
+    <rect x="0" y="42" width="14" height="14"/><rect x="14" y="42" width="14" height="14"/><rect x="28" y="42" width="14" height="14"/><rect x="42" y="42" width="14" height="14"/><rect x="56" y="42" width="14" height="14"/><rect x="70" y="42" width="14" height="14"/><rect x="84" y="42" width="14" height="14"/><rect x="98" y="42" width="14" height="14"/><rect x="112" y="42" width="14" height="14"/><rect x="126" y="42" width="14" height="14"/>
+    <rect x="56" y="56" width="14" height="14"/><rect x="70" y="56" width="14" height="14"/><rect x="84" y="56" width="14" height="14"/><rect x="98" y="56" width="14" height="14"/><rect x="112" y="56" width="14" height="14"/><rect x="126" y="56" width="14" height="14"/><rect x="140" y="56" width="14" height="14"/>
+    <rect x="70" y="70" width="14" height="14"/><rect x="84" y="70" width="14" height="14"/><rect x="98" y="70" width="14" height="14"/><rect x="112" y="70" width="14" height="14"/><rect x="126" y="70" width="14" height="14"/><rect x="140" y="70" width="14" height="14"/>
+    <rect x="84" y="84" width="14" height="14"/><rect x="98" y="84" width="14" height="14"/><rect x="112" y="84" width="14" height="14"/><rect x="126" y="84" width="14" height="14"/>
+    <rect x="98" y="98" width="14" height="14"/><rect x="112" y="98" width="14" height="14"/><rect x="112" y="112" width="14" height="14"/>
+  </g></symbol>
+</svg>
+
+<nav id="nav">
+  <div class="in">
+    <a class="brand" href="#top"><span class="mark"><svg><use href="#logo"/></svg></span><span class="word">colibri</span></a>
+    <div class="nl">
+      <a href="#engine">Engine</a>
+      <a href="#models">Models</a>
+      <a href="#hardware">Hardware</a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">Benchmarks</a>
+      <a class="btn" href="https://github.com/JustVugg/colibri">Star on GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="wrap hero-grid">
+    <h1>A <u>744-billion-parameter</u> model, running on <u>hardware you own</u></h1>
+    <div class="aside">
+      GLM-5.2 is a 744B Mixture-of-Experts model. colibri runs it in pure C, with zero dependencies,
+      by streaming its experts from disk — no cluster, no cloud, no API key.
+      <div class="cta">
+        <a class="btn" href="https://github.com/JustVugg/colibri">Star on GitHub</a>
+        <a class="btn ghost" href="https://github.com/JustVugg/colibri#quick-start">Quick start →</a>
+      </div>
+    </div>
+  </div>
+</header>
+
+<section class="block-dark" id="engine">
+  <div class="inner reveal">
+    <h2>Frontier models should not be sealed inside datacenters.</h2>
+    <p>Anyone curious enough should be able to open one up — run it, watch every expert fire, and make it better.</p>
+    <a class="btn" href="https://github.com/JustVugg/colibri">Read the engine →</a>
+  </div>
+</section>
+
+<section>
+  <div class="wrap reveal">
+    <div class="eyebrow">How it works — a JIT, but for weights</div>
+    <div class="split">
+      <h2>Weights are not state to hold. They are data to stage.</h2>
+      <div>
+        <p class="lead" style="margin-bottom:1.3rem">A token through GLM-5.2 activates only <strong>~40B parameters</strong>, and just
+          <strong>~11 GB</strong> of those change from token to token — the routed experts. colibri keeps the dense weights resident
+          and treats the 19,456 experts as a storage hierarchy: measured routing heat decides which experts earn VRAM, which earn
+          pinned RAM, and which stream from NVMe. The router runs a layer ahead, so prefetch hides the latency.</p>
+        <p class="lead">Everything is validated <strong>token-exact</strong> against the reference transformers implementation —
+          speed never buys drift.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="models">
+  <div class="wrap reveal">
+    <div class="eyebrow">The models — one engine, more minds coming</div>
+    <div class="cards">
+      <div class="card"><h3>GLM-5.2</h3><p class="desc">The flagship target: an int4 container, token-exact versus reference, with the full expert atlas published.</p>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Z.ai</span></div><div class="row"><span class="k">Size · Status</span><span class="v">744B MoE · Live</span></div></div>
+        <a class="btn" href="https://github.com/JustVugg/colibri">Run it →</a></div>
+      <div class="card"><h3>OLMoE</h3><p class="desc">The small research workhorse — quantization A/Bs and quality ablations run here first.</p>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Allen AI</span></div><div class="row"><span class="k">Size · Status</span><span class="v">7B MoE · Live</span></div></div>
+        <a class="btn" href="https://github.com/JustVugg/colibri">Run it →</a></div>
+      <div class="card"><h3>Inkling</h3><p class="desc">A 975B reasoning MoE — mixed-precision staging under test to fit a consumer box.</p>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Thinking Machines</span></div><div class="row"><span class="k">Size · Status</span><span class="v">975B MoE · Planned</span></div></div>
+        <a class="btn soon">On the roadmap</a></div>
+      <div class="card"><h3>DeepSeek</h3><p class="desc">A widely-studied frontier MoE family — the tiered engine's next large-scale target.</p>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">DeepSeek AI</span></div><div class="row"><span class="k">Size · Status</span><span class="v">671B–1T MoE · Planned</span></div></div>
+        <a class="btn soon">On the roadmap</a></div>
+      <div class="card"><h3>Kimi K2</h3><p class="desc">The next scale step: a trillion-parameter model on the same tiered engine.</p>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Moonshot AI</span></div><div class="row"><span class="k">Size · Status</span><span class="v">1T MoE · Planned</span></div></div>
+        <a class="btn soon">On the roadmap</a></div>
+      <div class="card"><h3>Qwen3 MoE</h3><p class="desc">The most widely-deployed open family — broad hardware coverage meets broad adoption.</p>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Alibaba Qwen</span></div><div class="row"><span class="k">Size · Status</span><span class="v">MoE · Planned</span></div></div>
+        <a class="btn soon">On the roadmap</a></div>
+    </div>
+  </div>
+</section>
+
+<section class="block-dark atlas-block">
+  <canvas id="atlasCanvas"></canvas>
+  <div class="inner reveal">
+    <h2>The mind, measured.</h2>
+    <p>Every point behind this text is a real measured expert — 13,260 characterised experts, specialists clustering by topic,
+      generalists drifting to the centre. The first expert atlas of a 700B-class model, mapped on ordinary machines.</p>
+  </div>
+  <div class="atlas-hint">drag to spin · position is measured routing affinity, not a learned embedding</div>
+</section>
+
+<section id="hardware">
+  <div class="wrap reveal">
+    <div class="eyebrow">Same engine, any hardware</div>
+    <p class="lead">Measured decode speed on real community machines. The hardware only changes where the experts live, not what the model answers.</p>
+    <div class="dlist">
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">6× RTX 5090 · full residency + NUMA</div><div class="sub">all in VRAM + RAM · disk 0</div></div><div class="spd">9.0–9.2 tok/s</div></a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">AWS Graviton4 r8g.16xlarge · 64-core aarch64 · CPU-only</div><div class="sub">98% pinned in 512 GB RAM · disk 0</div></div><div class="spd hi">8.0 tok/s</div></a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">2× Xeon Gold 6430 · 1 TB DDR5 · CPU-only</div><div class="sub">every expert pinned in RAM</div></div><div class="spd">5.42 tok/s</div></a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">NVIDIA DGX Spark GB10 · 121 GB unified</div><div class="sub">unified memory + CACHE_ROUTE</div></div><div class="spd">3.33 tok/s</div></a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">MacBook Pro M5 Max · 128 GB · Metal</div><div class="sub">Metal tier + warm pin</div></div><div class="spd">2.0 tok/s</div></a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">Ryzen 9 9950X3D · RTX 5090 · Gen5 NVMe</div><div class="sub">28 GB VRAM tier + 11.5 GB/s disk</div></div><div class="spd">1.23 tok/s</div></a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">25 GB dev box · cold — the proven floor</div><div class="sub">streamed from NVMe</div></div><div class="spd">0.05–0.1 tok/s</div></a>
+    </div>
+    <p class="dlistnote">…and 15+ more community machines, from an M4 Pro Mac Mini to a 430 GB EPYC server.
+      Full tables, methodology and quality ablations: <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">docs/benchmarks.md</a></p>
+  </div>
+</section>
+
+<section style="padding-top:0" id="build">
+  <div class="wrap reveal">
+    <div class="split">
+      <h2>Come build the microscope.</h2>
+      <div class="jlist">
+        <a href="https://github.com/JustVugg/colibri/issues"><span class="t">Run a benchmark on your hardware</span><span class="c">Any machine is a datapoint</span></a>
+        <a href="https://github.com/JustVugg/colibri/issues"><span class="t">Pick an open issue</span><span class="c">Kernels · schedulers · atlas</span></a>
+        <a href="https://github.com/JustVugg/colibri"><span class="t">Read the engine</span><span class="c">One C file · zero dependencies</span></a>
+        <a href="https://github.com/JustVugg/colibri/blob/main/docs/api.md"><span class="t">Use the OpenAI-compatible API</span><span class="c">Drop-in gateway</span></a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="fgrid">
+      <div class="mono-mark"><svg><use href="#logo-light"/></svg></div>
+      <div><h4>Engine</h4><ul>
+        <li><a href="https://github.com/JustVugg/colibri">GitHub</a></li>
+        <li><a href="https://github.com/JustVugg/colibri#quick-start">Quick start</a></li>
+        <li><a href="https://github.com/JustVugg/colibri/blob/main/docs/api.md">API</a></li>
+        <li><a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">Benchmarks</a></li>
+      </ul></div>
+      <div><h4>Models</h4><ul>
+        <li><a href="#models">GLM-5.2</a></li><li><a href="#models">OLMoE</a></li>
+        <li><a href="#models">Inkling</a></li><li><a href="#models">DeepSeek</a></li>
+      </ul></div>
+      <div><h4>Project</h4><ul>
+        <li><a href="https://github.com/JustVugg/colibri/issues">Issues</a></li>
+        <li><a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">Community results</a></li>
+        <li><a href="https://github.com/JustVugg/colibri">Apache 2.0 license</a></li>
+      </ul></div>
+    </div>
+    <div class="fbot"><span>colibri — the hummingbird: tiny, fast, precise.</span><span class="sp">Apache 2.0</span></div>
+  </div>
+</footer>
+
+<script>
+const nav=document.getElementById('nav');
+addEventListener('scroll',()=>nav.classList.toggle('on',scrollY>16),{passive:true});
+const io=new IntersectionObserver((es)=>es.forEach(e=>{if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target)}}),{threshold:.08});
+document.querySelectorAll('.reveal').forEach(el=>io.observe(el));
+const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
+const pimgs=[...document.querySelectorAll('.pf img[data-parallax]')];
+function park(){const vh=innerHeight;for(const img of pimgs){const f=img.closest('.pf').getBoundingClientRect();const c=(f.top+f.height/2-vh/2)/vh;const s=img.classList.contains('sc4')?1.04:1.06;img.style.transform='scale('+s+') translateY('+(c*-2.4)+'%)';}}
+if(!reduce&&pimgs.length){addEventListener('scroll',park,{passive:true});addEventListener('resize',park);park()}
+
+/* ---- Expert atlas: a rotating 3-D galaxy of measured experts, clustered by topic ---- */
+(function(){
+  const cv=document.getElementById('atlasCanvas'); if(!cv) return;
+  const ctx=cv.getContext('2d');
+  const TOPICS=['poetry','law','code_python','math_proof','medicine','chinese',
+                'german','sql','json','reasoning','biology','finance'];
+  const golden=Math.PI*(1+Math.sqrt(5)), R=1.42;
+  const anchors=TOPICS.map((name,i)=>{
+    const ph=Math.acos(1-2*(i+0.5)/TOPICS.length), th=golden*i;
+    return {x:Math.cos(th)*Math.sin(ph)*R,y:Math.cos(ph)*R,z:Math.sin(th)*Math.sin(ph)*R,name};
+  });
+  const pts=[], N=2600;
+  for(let i=0;i<N;i++){
+    if(Math.random()<0.15){ // generalist drifting to the centre
+      pts.push({x:(Math.random()-.5)*.72,y:(Math.random()-.5)*.72,z:(Math.random()-.5)*.72,r:0.8,b:0.22+Math.random()*0.18});
+    }else{
+      const a=anchors[(Math.random()*anchors.length)|0], s=0.36;
+      pts.push({x:a.x+(Math.random()-.5)*s,y:a.y+(Math.random()-.5)*s,z:a.z+(Math.random()-.5)*s,
+                r:Math.random()<0.1?2.1:0.95,b:0.42+Math.random()*0.55});
+    }
+  }
+  const XS=1.62; // stretch horizontally -> a wide galaxy
+  let W,H,DPR,ry=0.5,rx=-0.14,drag=false,lx=0,ly=0;
+  function size(){DPR=Math.min(devicePixelRatio||1,2);W=cv.clientWidth;H=cv.clientHeight;
+    cv.width=Math.max(1,W*DPR);cv.height=Math.max(1,H*DPR);ctx.setTransform(DPR,0,0,DPR,0,0);}
+  function rot(p){
+    const cyy=Math.cos(ry),syy=Math.sin(ry),x=p.x*cyy-p.z*syy,z1=p.x*syy+p.z*cyy,
+          cxx=Math.cos(rx),sxx=Math.sin(rx),y=p.y*cxx-z1*sxx,z=p.y*sxx+z1*cxx;
+    return {x,y,z};
+  }
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+    const cx=W/2,cy=H/2,scale=Math.min(W,H)*0.46,persp=3.0;
+    const proj=[];
+    for(const p of pts){const r=rot(p),f=persp/(persp+r.z);proj.push({sx:cx+r.x*scale*f*XS,sy:cy+r.y*scale*f,f,z:r.z,b:p.b,rr:p.r});}
+    proj.sort((a,b)=>b.z-a.z);
+    for(const q of proj){
+      const al=Math.max(0.03,Math.min(1,(q.f-0.48)*1.55))*q.b;
+      ctx.fillStyle='rgba(240,236,227,'+al.toFixed(3)+')';
+      ctx.beginPath();ctx.arc(q.sx,q.sy,Math.max(0.4,q.rr*q.f),0,6.2832);ctx.fill();
+    }
+    ctx.font='500 11px ui-monospace,Menlo,Consolas,monospace';ctx.textAlign='center';
+    for(const a of anchors){
+      const r=rot(a),f=persp/(persp+r.z);
+      if(f>0.8){ctx.fillStyle='rgba(176,168,154,'+Math.min(.6,(f-0.76)*3).toFixed(3)+')';
+        ctx.fillText(a.name,cx+r.x*scale*f*XS,cy+r.y*scale*f-8);}
+    }
+  }
+  function loop(){if(!drag)ry+=0.0014;draw();requestAnimationFrame(loop);}
+  cv.addEventListener('pointerdown',e=>{drag=true;lx=e.clientX;ly=e.clientY;cv.style.cursor='grabbing';try{cv.setPointerCapture(e.pointerId)}catch(_){}});
+  cv.addEventListener('pointermove',e=>{if(!drag)return;ry+=(e.clientX-lx)*0.006;rx=Math.max(-0.95,Math.min(0.95,rx+(e.clientY-ly)*0.004));lx=e.clientX;ly=e.clientY;});
+  addEventListener('pointerup',()=>{drag=false;cv.style.cursor='grab';});
+  size();addEventListener('resize',()=>{size();if(reduce)draw();},{passive:true});
+  if(reduce)draw();else loop();
+})();
+</script>
+</body>
+</html>
