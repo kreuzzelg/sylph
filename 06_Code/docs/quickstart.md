@@ -79,12 +79,18 @@ Inside you'll find:
 |---|---|
 | `colibri.exe` | **the engine** — the C program that actually runs the model |
 | `coli` | the command-line launcher (`chat`, `serve`, `convert`, `doctor`, …) |
-| `openai_server.py`, `resource_plan.py`, `doctor.py` | Python support for the API server and placement planner |
+| `openai_server.py`, `resource_plan.py`, `doctor.py`, `autotune.py` | Python support for the API server, placement planner, diagnostics, and measured tuning |
 
 One setup step: **install Python 3** from
 [python.org](https://www.python.org/downloads/) — the `coli` launcher and the
 API gateway are Python scripts (the engine itself is pure C and needs nothing).
 No renaming, no configuration: the launcher finds `colibri.exe` next to itself.
+
+For better understanding, from powershell prompt, a complete invocation line 
+(relying on py launcher, to be launched from the folder where colibri.exe is) is:
+
+PS1> $env:COLI_MODEL="drive:/path/to/1st_copy/model/folder/"; $env:COLI_MODEL_MIRROR="/2nd_copy/model/folder/"; & py ./coli chat
+
 
 Then continue to [step 3](#3-get-the-model). Prefer to skip the launcher? You can
 run the engine directly — `.\colibri.exe` reads the model path from the `SNAP`
@@ -103,6 +109,7 @@ pacman -S --needed mingw-w64-ucrt-x86_64-gcc make git python
 ```bash
 xcode-select --install          # C compiler (clang)
 brew install libomp git python  # OpenMP for multithreading
+# MacPorts works too: sudo port install libomp   (the Makefile finds either)
 ```
 
 ---
@@ -119,11 +126,13 @@ cd colibri/c
 self-test. When it prints:
 
 ```
-engine self-test: 32/32  (expected 32/32)
+engine self-test: 32/32  (expected ~30-32/32; FP near-ties are toolchain-dependent)
 ```
 
-the engine is working correctly. (On Windows Option A you already have the
-binary — you can skip this step.)
+the engine is working correctly. Some toolchains report 30/32 or 31/32 because
+two tiny-oracle positions are floating-point near-ties; this is still a valid
+self-test result. (On Windows Option A you already have the binary — you can
+skip this step.)
 
 ---
 
@@ -137,6 +146,12 @@ A pre-converted **GLM-5.2 int4** model is on Hugging Face. Use the
 **group-scaled (gs64)** container with the **int8 MTP head**:
 
 **https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp**
+
+**GLM-5.3** is the same family and loads with the same engine. Its own
+group-scaled (gs64) container is about **419 GB** and ships **without** the MTP
+head, so speculative decoding stays off:
+
+**https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64**
 
 Group scales matter: the older per-row int4 containers
 (`mateogrgic/…-int4-with-int8-mtp`, `jlnsrk/…`) measure ~9pp worse on quality

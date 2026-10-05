@@ -4,10 +4,11 @@ Status: format specification + offline tools, PR 1 of a 3-PR ladder. This PR
 adds the codec (`c/rans.h`), the repack/verify tools
 (`c/tools/repack_rans.py`, `c/tools/rans_verify.py`) and this document —
 **no engine code paths change**. PR 2 (loader + CPU decode on expert load)
-and PR 3 (Metal batched decode) build on it. A registry row is *proposed*
-here, not claimed: the format's identity is the NAME string
-`int4-rans256-g0`; the numeric `fmt` ordinal is left for the maintainer to
-assign whenever a registry (FORMATS.md) lands.
+and PR 3 (Metal batched decode) build on it. The format's identity is the
+NAME string `int4-rans256-g0`; its registry row has since landed in
+FORMATS.md with ordinal *(none)* — no numeric `fmt` ordinal exists or is
+claimed before engine code consuming the format (PR 2) first merges into
+dev (see "Registry row (landed)" below).
 
 ## What it is, in one paragraph
 
@@ -76,7 +77,9 @@ Validity rules every conformant record satisfies (and validators enforce):
   least 4 bytes** — even a stream that encodes zero symbols carries its
   4 flushed state bytes;
 - the record's total length equals the derived framing exactly (no trailing
-  bytes), and every derived padding byte is zero;
+  bytes), and every derived padding byte is zero. That length is the
+  **physical extent**, known from stored framing before decode — not the
+  identity inference the stamp section forbids (`expected_bytes(O, I)`);
 - **amplification bound**: no admissible table can encode more than
   `payload_len * 8 * M_max` symbols into a payload (`M_max = 2^15`, the
   format's largest table size — a symbol's cost is bounded below by
@@ -153,7 +156,7 @@ lets tooling confirm two shards used the identical table without diffing
 the base64 blob. `table_id` is provenance metadata (a retuned future table
 would ship as `g1`); readers never resolve it externally.
 
-## THE STAMP IS MANDATORY (the load-bearing difference from fmt=7)
+## THE STAMP IS MANDATORY (the load-bearing difference from fmt=8)
 
 `__metadata__["colibri.fmt"]` maps each entropy-coded **weight** tensor
 name (never `.qs`) to the string `int4-rans256-g0`, JSON-encoded with
@@ -164,7 +167,13 @@ For the existing formats the engine can infer identity from byte arithmetic
 **That inference is structurally impossible here**: entropy-coded size is
 data-dependent — there is no `expected_bytes(O, I)` to compare against. The
 stamp is therefore the **only** signal that a `U8` tensor is entropy-coded
-at all. Consequences any consumer must respect:
+at all. Data-dependence applies to **identity inference**, not to **extent**:
+the record's physical length is fully determined by the stored framing before
+decode (header, stream offsets, payload, the two `round16()` pads; see the
+validity rules above, "the record's total length equals the derived framing
+exactly"), so page-aligned I/O (4 KiB-padded extents, `O_DIRECT`) remains
+available. The stamp is still mandatory because identity, not size, is what
+cannot be inferred. Consequences any consumer must respect:
 
 - an *unstamped* `U8` tensor must never be presumed entropy-coded by any
   size heuristic;
@@ -235,8 +244,17 @@ integrity** — these exact bytes came from that mint run; container
 engine-side load check ships with the consumer PR. The record wire format
 is untouched by all of this: the manifest is a sidecar file.
 
-## Proposed registry row
+## Registry row (landed)
+
+The registry row this section originally *proposed* now exists in
+`docs/FORMATS.md` (the authoritative copy — this table is a summary):
 
 | ordinal | name | weight bytes | scale layout | status |
 |---|---|---|---|---|
-| *(maintainer-assigned)* | `int4-rans256-g0` | data-dependent (chunk record above; **stamp mandatory**) | per-row `F32` `.qs`, raw (unchanged from int4-row) | proposed, offline tools only |
+| *(none)* | `int4-rans256-g0` | data-dependent (chunk record above; **stamp mandatory**) | per-row `F32` `.qs`, raw (unchanged from int4-row) | merged, offline tools only |
+
+The ordinal cell reads *(none)*, not *(maintainer-assigned)*: with no
+engine decode path there is nothing to compile an ordinal into, so — as
+the FORMATS.md row glosses the registry's ID-assignment rule — no public
+ordinal is claimed before engine code consuming the format (this ladder's
+PR 2) first merges into dev.

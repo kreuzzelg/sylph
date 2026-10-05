@@ -94,7 +94,11 @@ load-time algorithm and stored as `U8` + `<name>.qs` f32 scales, the small /
 sensitive tensors (norms, router, conv taps, `dt_bias`, `A_log`, `f_a/f_b`,
 `b_proj`, embeddings) pass through, vision is dropped. Output is spec-valid
 safetensors (`model-XXXXX-of-000094.safetensors`) plus a regenerated index;
-interrupted runs resume per shard. `--verify-full` re-reads every expert byte
+interrupted runs resume per shard. On every run, including disjoint `--shards`
+passes, the index is rebuilt atomically from all completed output shards in the
+destination; its `total_size` therefore includes both new and previously
+converted data. Duplicate tensor names abort the index update instead of
+publishing an ambiguous artifact. `--verify-full` re-reads every expert byte
 and compares against the source.
 
 The engine auto-detects container tensors (dtype U8 + `.qs` sidecar) and skips
@@ -106,6 +110,18 @@ keeps the container's own bits. Startup: measured on two layers, init drops **30
 on the full model this removes a 10–15 minute quantization pass. Quantized
 values are bit-identical to the load-time path (verified by hidden-state
 trace), so the two formats are numerically interchangeable.
+
+`K3_MMAP=1` is an experimental CPU-only residency option for a fully repacked
+container. It maps each prepared U8 matrix and its F32 scale sidecar read-only
+instead of copying both into private heap. The mapped pages remain file-backed
+and reclaimable; this changes commit/accounting, not the active working set, so
+memory pressure can become page faults during inference. On Linux, process
+monitors may still show the touched mapping (about 33.8 GB for the full model)
+in RSS; it is clean file-backed memory, not private heap, so use `/proc` smaps
+accounting to distinguish file-backed RSS from private anonymous memory. The
+option has no fallback: tensors that need load-time conversion, non-F32 scale
+sidecars, and enabled Vulkan/CUDA backends are refused. A Vulkan build therefore
+requires `K3_VK=0 K3_MMAP=1` explicitly.
 
 Sizes: source 1.56 TB → ≈1.50 TB (`--bits 8`) / ≈1.48 TB (`--bits 4`). The
 experts (93 % of bytes) are already at 4.25 bits/weight and cannot shrink
@@ -153,7 +169,11 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_BITS` | 4 | load-time bits for KDA/latent/shared/dense mats (4, 8, 32=f32) |
 | `K3_MLA_BITS` | 8 | load-time bits for MLA projections |
 | `K3_HEAD_BITS` | 8 | load-time bits for lm_head |
+| `K3_MMAP` | 0 | map fully prepared U8/F32 weights read-only (experimental, CPU-only, no conversion fallback) |
 | `K3_EXPERT_GB` | 8 | routed-expert LRU budget |
+| `K3_VK` | 1 | Vulkan tier when built with `make VK=1 kimi_k3` (0 = pure CPU) |
+| `K3_VK_GB` | driver budget | VRAM cap for the Vulkan tier |
+| `K3_VK_UP` | 8 | routed-expert uploads per step (fill-once tier) |
 | `K3_DIRECT` | 1 | O_DIRECT expert reads (0 = buffered + WILLNEED) |
 | `K3_IDOT` | 1 | int8-activation expert matmuls (0 = exact-float kernel) |
 | `K3_PIPE` | 1 | overlap expert loads with compute (loader threads) |
@@ -209,23 +229,51 @@ OpenAI-compatible client sends prior `reasoning_content`; `enable_thinking=false
 opens `<response>` directly. The gateway does not flatten XTML into a string:
 it sends length-framed messages to the C engine, which builds every structural
 and ordinary-text segment at the tokenizer boundary required by K3's rank-BPE.
-The multi-turn wire was compared against the official `encoding_k3.py` and
-tiktoken on system/user/assistant history with UTF-8 content: **77/77 token IDs
-exact**.
+We checked our text handling against Moonshot's own: their `encoding_k3.py`
+turns a conversation into the numbers the model actually reads, and ours
+produced **identical numbers on all 77 test conversations** — multi-turn
+histories with system, user and assistant messages, including non-ASCII text.
+So the engine is not subtly mangling anything before the model sees it.
 
 `coli chat` starts a private local server for Kimi and keeps the 2.8T model
 loaded for the whole terminal session. `coli serve` exposes streaming and
 non-streaming `/v1/chat/completions`; `coli web` uses that same API. Reasoning
 is returned as `reasoning_content`, response text as `content`, and
 `<|end_of_msg|>` remains the model-owned stop token. `STOP` and `CANCEL` are
-honoured between generated tokens.
+honoured between generated tokens. Long prefill also polls `CANCEL` between
+layers and drops the unpublished partial state before serving another request.
+
+## Vulkan tier (`make VK=1 kimi_k3`)
+
+The shared Vulkan backend (`backend_vulkan.c`) gained an **fmt=7 MXFP4**
+decode path for K3's expert format — e2m1 nibbles with the ue8m0 exponents
+expanded to f32 per-32-group scales at upload, so the QAT bytes are uploaded
+exactly as stored and never re-encoded (kernel vs `matmul_mxfp4`: rel_l2
+2.2e-07 on an RX 9070/RADV, 2.6e-07 on llvmpipe;
+`tests/test_vk_mxfp4.c`). The engine keeps two residency classes on the
+card, both with transparent CPU fallback and identical output:
+
+- **shared experts**, uploaded once at init (int4/int8, the existing
+  fmt-1/4 shaders): they run every token and are the largest always-on
+  dense slice that fits VRAM (7.5 GB for all 92 MoE layers at int4);
+- a **fill-once routed-expert tier** in fmt=7: experts enter from
+  freshly-read RAM slots (`K3_VK_UP` per step) until the VRAM budget
+  (`K3_VK_GB`) is reached. At decode, tier-resident experts skip **both**
+  the 17.5 MB disk read and the CPU matmuls (one paired w1/w3 submit,
+  SiTU-GLU on CPU, w2 down). Chunked prefill stays on the CPU-batched path
+  and still warms the tier.
+
+K3's Quantile-Balancing-flat routing caps what any cache tier can do — the
+tier's value scales with how long the server lives (fill-once) and with the
+measured short-term reuse (temporal locality), not with marginal expert
+heat. `K3_VK=0` disables the tier at runtime.
 
 ## Current limitations
 
 - Decode is single-token (no speculative decoding — K3 has no MTP head).
 - Tool declarations/calls and image content are not exposed through the shared
   gateway yet; unsupported requests fail explicitly.
-- CPU only (no CUDA/Metal/Vulkan tier).
+- CPU + optional Vulkan tier (no CUDA/Metal).
 - The protocol, tokenizer, gateway, TUI, and Web client paths are locally
   testable without the 1.5 TB checkpoint. A release claim still requires one
   full-model multi-turn TUI/Web run on a host that owns the complete snapshot.

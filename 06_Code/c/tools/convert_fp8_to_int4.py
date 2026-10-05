@@ -23,10 +23,111 @@ USO:
   # selftest del dequant fp8 (richiede torch)
   python3 tools/convert_fp8_to_int4.py --selftest
   # reale: scarica+converte+cancella shard per shard
-  python3 tools/convert_fp8_to_int4.py --repo zai-org/GLM-5.2-FP8 --outdir /home/vincenzo/glm52_i4
+  python3 tools/convert_fp8_to_int4.py --repo zai-org/GLM-5.2-FP8 --outdir /path/to/glm52_i4
 """
-import os, sys, glob, json, shutil, argparse
+import os, sys, glob, json, shutil, argparse, threading
 import numpy as np
+
+
+_positioned_write_lock = threading.Lock()
+
+
+# ---------- guardia di famiglia (#1304) ----------
+# Questo convertitore serve UNA famiglia: GLM-5.2. Ma `coli convert` accetta
+# qualunque --repo, e in una settimana due utenti gli hanno dato Qwen3.8:
+# i tensori BF16 che non riconosce come esperti GLM passano upcastati a f32,
+# ogni shard raddoppia, e #1304 si e' fermato a 424 GB scritti su 360 di
+# sorgente. Il controllo del model_type costa 5 KB di config.json e va fatto
+# PRIMA del primo shard, non dopo il disco pieno.
+#
+# I due insiemi qui sotto sono copie di family_registry.py, e una copia che
+# diverge e' esattamente il difetto che questa guardia cura: il test
+# tests/test_convert_guard.py li confronta col registry e fallisce alla prima
+# famiglia aggiunta o rinominata.
+GLM52_MODEL_TYPES = {"glm_moe_dsa", "glm5_moe", "glm"}
+OTHER_FAMILY_PATHS = {
+    "glm5_next":       "GLM-5.3-Flash: use tools/convert_glm53.py",
+    "glm5_next_text":  "GLM-5.3-Flash: use tools/convert_glm53.py",
+    "qwen4_exp":       "Qwen3.8-Flash-Next is NOT converted: download the official "
+                       "FP8 checkpoint (Qwen/Qwen3.8-Flash-Next-FP8) and run it "
+                       "directly; see docs/qwen38.md and issue #1304",
+    "qwen4_exp_text":  "Qwen3.8-Flash-Next is NOT converted: download the official "
+                       "FP8 checkpoint (Qwen/Qwen3.8-Flash-Next-FP8) and run it "
+                       "directly; see docs/qwen38.md and issue #1304",
+    "qwen3_5_moe":     "Qwen3.6: use tools/convert_qwen36.py",
+    "qwen3_5_moe_text":"Qwen3.6: use tools/convert_qwen36.py",
+    "inkling_mm_model":"Inkling: use tools/convert_inkling_int4.py",
+    "inkling":         "Inkling: use tools/convert_inkling_int4.py",
+    "olmoe":           "OLMoE: use tools/convert_olmoe.py",
+    "kimi_k3":         "Kimi K3: see docs/kimi_k3.md for its container pipeline",
+    "kimi_linear":     "Kimi K3: see docs/kimi_k3.md for its container pipeline",
+    "deepseek_v4":     "DeepSeek V4: see docs/deepseek-v4.md, section Download",
+    "deepseek_v41":    "DeepSeek V4.1: no conversion needed -- its experts already ship fp4 and its dense fp8; run tools/prepare_dsv41.py once, see docs/deepseek-v41.md",
+    "deepseek_v41_text": "DeepSeek V4.1: no conversion needed -- see docs/deepseek-v41.md",
+}
+
+
+def check_model_family(config, where):
+    """Ferma il convertitore su un checkpoint che non e' GLM-5.2.
+
+    `config` e' il config.json del checkpoint gia' parsato; `where` dice al
+    messaggio da dove viene (un path o un repo id). Ritorna in silenzio per
+    GLM-5.2; esce con indicazione per-famiglia per tutto il resto.
+    """
+    model_type = config.get("model_type")
+    if not isinstance(model_type, str) or not model_type:
+        raise SystemExit(f"ERROR: {where}: config.json has no usable model_type; "
+                         "refusing to guess. This converter is for GLM-5.2 only.")
+    if model_type in GLM52_MODEL_TYPES:
+        return
+    hint = OTHER_FAMILY_PATHS.get(model_type)
+    if hint:
+        raise SystemExit(f"ERROR: {where} is '{model_type}', not GLM-5.2.\n"
+                         f"  This converter would silently upcast most of its "
+                         f"tensors and roughly double the size (#1304).\n  {hint}")
+    raise SystemExit(f"ERROR: {where} is '{model_type}', which this converter does "
+                     f"not know. It converts GLM-5.2 only; other families have "
+                     f"their own tools under c/tools/, and Qwen3.8 needs none.")
+
+
+
+def _save_file_atomic(save_file, tensors, destination, **kwargs):
+    destination = os.fspath(destination)
+    temporary = destination + ".tmp"
+    try:
+        os.remove(temporary)
+    except FileNotFoundError:
+        pass
+    try:
+        save_file(tensors, temporary, **kwargs)
+        os.replace(temporary, destination)
+    finally:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+
+
+def _positioned_write(fd, data, offset):
+    remaining = memoryview(data)
+    pwrite = getattr(os, "pwrite", None)
+    if pwrite is not None:
+        while remaining:
+            written = pwrite(fd, remaining, offset)
+            if written == 0:
+                raise OSError("pwrite returned zero bytes")
+            remaining = remaining[written:]
+            offset += written
+        return
+
+    with _positioned_write_lock:
+        os.lseek(fd, offset, os.SEEK_SET)
+        while remaining:
+            written = os.write(fd, remaining)
+            if written == 0:
+                raise OSError("write returned zero bytes")
+            remaining = remaining[written:]
+
 
 # ---------- quantizzazione: identica al C (glm.c) ----------
 def quant_int8(w, bits):                       # w: [O,I] f32 -> (qbytes U8 [O*I], scale f32 [O])
@@ -280,9 +381,17 @@ def _rowwise(fn, w, *args):
         qs.append(q); ss.append(s)
     return np.concatenate(qs), np.concatenate(ss)
 
+E8_JOBS = 1                                     # --jobs: parallel e8 encodes per shard
+
+def _e8_job(item):
+    name, w = item
+    q, s = quant_e8(w)
+    return name, q, s
+
 def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
                   keep_mtp=False, keep_idx=False, group_size=0, bits_map=None):
     from safetensors import safe_open
+    e8_jobs = []                                # deferred: encoded in a pool after the scan
     with safe_open(path, framework="pt") as f:
         keys = set(f.keys())
         for name in f.keys():
@@ -309,8 +418,11 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
                     out_dict[name] = w.astype(np.float32); continue
                 if bits == E8:
                     # fmt=6 E8/IQ3 — routed-expert projections only, enforced in main().
-                    # Already row-blocked inside iq3_pack.encode.
-                    q, s = quant_e8(w)
+                    # Already row-blocked inside iq3_pack.encode. The python codec is
+                    # slow (~5.5s per expert matrix), so encodes are deferred and run
+                    # across a process pool after the shard scan (--jobs).
+                    e8_jobs.append((name, w))
+                    continue
                 elif bits == 3:
                     # int3-g64 (fmt=5): inherently group-64, distinct from grouped-int4.
                     q, s = _rowwise(quant_int3_g64, w)
@@ -321,6 +433,16 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
                                     quant_int4 if bits <= 4 else quant_int8, w, bits)
                 out_dict[name] = q
                 out_dict[name + ".qs"] = s
+    if e8_jobs:
+        if E8_JOBS > 1:
+            from multiprocessing import get_context
+            with get_context("spawn").Pool(E8_JOBS) as pool:   # spawn: safe after BLAS threads
+                for name, q, s in pool.imap(_e8_job, e8_jobs, chunksize=1):
+                    out_dict[name] = q; out_dict[name + ".qs"] = s
+        else:
+            for item in e8_jobs:
+                name, q, s = _e8_job(item)
+                out_dict[name] = q; out_dict[name + ".qs"] = s
 
 def free_gb(p): return shutil.disk_usage(p).free / 1e9
 
@@ -374,6 +496,15 @@ def check_or_record_params(outdir, prefix, params):
 def _bits(v):                                   # "e8" -> fmt=6 marker; anything else an int width
     return E8 if v == E8 else int(v)
 
+def source_label(a):
+    if a.selftest or a.selftest_nvfp4:
+        return "selftest"
+    if a.indir:
+        return "local " + a.indir
+    if a.repo:
+        return "download " + a.repo
+    raise SystemExit("one of --indir or --repo is required")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=None)
@@ -419,6 +550,11 @@ def main():
                          "concurrently; the main process still writes and checkpoints in "
                          "shard order, so output and out-NNNNN numbering are identical. "
                          "No effect on the --repo disk-safe path.")
+    ap.add_argument("--jobs", type=int, default=1,
+        help="parallel worker processes for the e8 encode WITHIN a shard (the python codec "
+             "is ~5.5s per expert matrix single-threaded; other quant modes are fast and "
+             "stay serial). Works on both --indir and the --repo disk-safe path. "
+             "Untested in combination with --workers>1; use one or the other.")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--selftest-nvfp4", action="store_true",
         help="unit-test del dequant NVFP4 (LUT e2m1 + round-trip), nessun download / no network")
@@ -430,6 +566,8 @@ def main():
              "repository (~756 GB of traffic) to retain only a few GB. Resumable per shard. "
              "Recommended: --ebits 8.")
     a = ap.parse_args()
+    global E8_JOBS
+    E8_JOBS = max(1, a.jobs)
     if a.ebits is None:
         # testa MTP a int4 = acceptance ~0-4% (misurato, issue #8): il draft sbaglia sempre
         # e la speculazione non parte mai. A int8: 39-59%, 2.2-2.8 token/forward.
@@ -476,7 +614,7 @@ def main():
     mode = "MTP head only" if a.mtp else "DSA indexer only" if a.indexer else "main model"
     grp = f"grouped gs={a.group_size} (fmt=4)" if (a.group_size and a.ebits <= 4) else \
           (f"PER-ROW (grouped branch needs bits<=4; ebits={a.ebits} disables it)" if a.group_size else "per-row")
-    print(f"[PLAN] mode: {mode} | source: {'local ' + a.indir if a.indir else 'download ' + a.repo} | "
+    print(f"[PLAN] mode: {mode} | source: {source_label(a)} | "
           f"experts {a.ebits}-bit, embed/lm_head {a.io_bits}-bit, x {a.xbits}-bit | {grp}")
 
     if a.selftest_nvfp4:
@@ -557,6 +695,11 @@ def main():
 
     os.makedirs(a.outdir, exist_ok=True)
     if a.indir:    # conversione locale (test)
+        cfg_path = os.path.join(a.indir, "config.json")
+        if os.path.exists(cfg_path):
+            with open(cfg_path) as fh:
+                check_model_family(json.load(fh), a.indir)
+        # niente config.json: fixture sintetiche (glm_tiny) -- si procede come sempre
         shards = sorted(glob.glob(os.path.join(a.indir, "*.safetensors")))
         from safetensors.numpy import save_file
         # #383: se l'indice c'e', i passaggi --mtp/--indexer convertono SOLO gli shard
@@ -654,7 +797,7 @@ def main():
                 done[key] = ""
             else:
                 name = f"{prefix}{n:05d}.safetensors"
-                save_file(out, os.path.join(a.outdir, name))
+                _save_file_atomic(save_file, out, os.path.join(a.outdir, name))
                 done[key] = name; n += 1; fresh += 1
             tmp_prog = prog_path + ".tmp"                 # scrittura atomica: una ripresa non vede mai un manifest mezzo scritto
             with open(tmp_prog, "w") as f: json.dump(prog, f, indent=1)   # EN: atomic write: a resume never sees a half-written manifest
@@ -705,6 +848,19 @@ def main():
     # EN: force the classic HTTP path, which curl proved works (measured 2026-07-02).
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")   # =0 per riabilitare xet / to re-enable xet
     from huggingface_hub import HfApi, hf_hub_download
+
+    # La guardia va qui: config.json pesa 5 KB e decide se i prossimi 300 GB
+    # hanno senso. Se il repo non ha config.json si procede con un avviso, per
+    # non rompere mirror atipici: il fallimento utile e' sul model_type
+    # sbagliato, non sulla rete.
+    try:
+        with open(hf_hub_download(a.repo, "config.json")) as fh:
+            check_model_family(json.load(fh), a.repo)
+    except SystemExit:
+        raise
+    except Exception as problem:
+        print(f"WARNING: could not read {a.repo}/config.json ({problem}); "
+              "proceeding without the family check.")
 
     # lock anti-doppione: DUE convertitori sulla stessa outdir si corrompono a vicenda.
     # EN: anti-duplicate lock: TWO converters on the same outdir corrupt each other.
@@ -768,7 +924,8 @@ def main():
             except Exception: pass
         if not os.path.exists(part):
             with open(part, "wb") as f: f.truncate(expected)   # file sparse / sparse file
-        fd = os.open(part, os.O_WRONLY)
+        flags = os.O_WRONLY | getattr(os, "O_BINARY", 0)
+        fd = os.open(part, flags)
         t0 = _t.time(); nres = [0]; log_lock = threading.Lock(); stopfail = []
         def worker(t):
             s0, s1 = segs[t]
@@ -786,7 +943,7 @@ def main():
                             if not chunk: break
                             rem = (s1 - s0) - done[t]     # mai oltre il segmento / never past the segment
                             if len(chunk) > rem: chunk = chunk[:rem]
-                            os.pwrite(fd, chunk, s0 + done[t])
+                            _positioned_write(fd, chunk, s0 + done[t])
                             done[t] += len(chunk)
                 except KeyboardInterrupt: raise
                 except Exception as ex:
@@ -923,7 +1080,7 @@ def main():
             print(f"[MTP {i+1}/{len(mtp_shards)}] downloading {sh}...", flush=True)
             p = download_retry(a.repo, sh, tmp)
             out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_mtp=True, group_size=a.group_size, bits_map=bits_map)
-            save_file(out, outp)
+            _save_file_atomic(save_file, out, outp)
             os.remove(p)
             for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
                 if os.path.isfile(blob): os.remove(blob)
@@ -947,7 +1104,7 @@ def main():
             print(f"[IDX {i+1}/{len(idx_shards)}] downloading {sh}...", flush=True)
             p = download_retry(a.repo, sh, tmp)
             out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_idx=True, group_size=a.group_size, bits_map=bits_map)
-            if out: save_file(out, outp)
+            if out: _save_file_atomic(save_file, out, outp)
             os.remove(p)
             for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
                 if os.path.isfile(blob): os.remove(blob)
@@ -965,7 +1122,7 @@ def main():
         print(f"[{i+1}/{len(shards)}] downloading {sh} ({free_gb(a.outdir):.0f} GB free)...", flush=True)
         p = download_retry(a.repo, sh, tmp)
         out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, group_size=a.group_size, bits_map=bits_map)
-        save_file(out, outp)
+        _save_file_atomic(save_file, out, outp)
         os.remove(p)                                       # <-- cancella subito lo shard fp8
         for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
             if os.path.isfile(blob): os.remove(blob)

@@ -54,7 +54,9 @@ TYPE_IDS = {name: tid for tid, (name, _, _) in GGML_TYPES.items()}
 # what the v1 engine will compute on (docs/gguf/REQUIREMENTS.md D2)
 V1_SUPPORTED = {TYPE_IDS[n] for n in ("F32", "F16", "BF16", "Q4_0", "Q8_0", "Q4_K", "Q5_K", "Q6_K")}
 # architectures the GLM-5.2 engine assembles (phase 3); everything else is refused loudly
-ENGINE_ARCHS = {"glm-dsa": "glm"}
+# qwen35moe = Qwen3.5/3.6 MoE (Qwen3.6-35B-A3B), the sylph primary target -> c/qwen36.c;
+# glm-dsa = GLM-5 / 5.2 -> c/colibri.c (secondary target).
+ENGINE_ARCHS = {"qwen35moe": "qwen36", "glm-dsa": "glm"}
 
 SPLIT_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$")
 EXPERT_RE = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
