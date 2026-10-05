@@ -22,3 +22,12 @@ extended sparsely to the size the Hugging Face tree API reports.
 - C dump: 1809 `T` lines, 11 `F` lines, under one second.
 
 **Result 2026-10-05:** pass — see `../../08_Documents/inspection-glm52-ud-q4_k_xl-2026-10-05.md`.
+
+## Qwen3.6-35B-A3B (added 2026-10-05)
+
+Same procedure on `unsloth/Qwen3.6-35B-A3B-GGUF` `UD-Q4_K_M` and
+`bartowski/Qwen_Qwen3.6-35B-A3B-GGUF` `Q4_K_M` (single files, first 48 MB + sparse extension).
+Pass criteria: `architecture qwen35moe (engine: qwen36)`, 733 / 753 tensors, type mix inside the
+v1 set, 40 trunk blocks (+1 nextn for bartowski, `eh_proj Q8_0`), tokenizer `gpt2 · pre qwen35 ·
+248320 tokens`; `coli doctor --deep` passes every `model.gguf.*` check.
+**Result 2026-10-05: pass** — `../../08_Documents/inspection-qwen36-gguf-2026-10-05.md`.

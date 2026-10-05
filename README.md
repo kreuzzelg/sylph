@@ -1,11 +1,13 @@
 # sylph
 
 **sylph** is an experimental fork of [colibrì](https://github.com/JustVugg/colibri)
-(the pure-C, zero-dependency engine that runs GLM-5.2's 744B Mixture-of-Experts
-model by streaming experts across VRAM, RAM and NVMe) that adds **direct GGUF
-support**: the engine reads llama.cpp GGUF files (K-quants and simple block
-types) and streams the routed experts straight from them, computing on the
-blocks as stored — no conversion, no re-quantization.
+(the pure-C, zero-dependency engine that runs large Mixture-of-Experts models by
+streaming experts across VRAM, RAM and NVMe) that adds **direct GGUF support**:
+the engine reads llama.cpp GGUF files (K-quants and simple block types) and
+streams the routed experts straight from them, computing on the blocks as
+stored — no conversion, no re-quantization. First target: **Qwen3.6-35B-A3B**
+on the `qwen36` engine, judged by **equivalence with Ollama / llama.cpp** on the
+same file ([why](01_Requirements/README.md)).
 
 Upstream colibrì deliberately does not want GGUF in its tree, so this work lives
 here. Everything that is not GGUF-specific is upstream's and is kept in sync via
