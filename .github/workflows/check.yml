@@ -8,6 +8,11 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  # As upstream: several tests read UTF-8 sources and fixtures with read_text()
+  # and no encoding; Windows Python would otherwise decode them as cp1252.
+  PYTHONUTF8: '1'
+
 jobs:
   linux:
     runs-on: ubuntu-latest
@@ -58,8 +63,9 @@ jobs:
             pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-libgomp || true
             ls /ucrt64/lib | grep -i gomp || echo "still no libgomp"
           fi
-      # The Makefile links -static; a static libgomp.a may not exist here. CI only
-      # needs a runnable binary, so link the OpenMP runtime dynamically (a
-      # command-line variable overrides the Makefile's LDFLAGS in every sub-make).
+      # Plain `make check` as upstream runs it: the Makefile links -static, which
+      # works once libgomp.a is installed (above). A command-line LDFLAGS override
+      # would leak via MAKEFLAGS into the `make -n` dry runs of
+      # test_makefile_platform.py and fail them.
       - name: make check
-        run: make -C 06_Code/c check LDFLAGS="-lm -fopenmp -lpsapi"
+        run: make -C 06_Code/c check
