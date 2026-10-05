@@ -23,8 +23,8 @@ that phase's implementation.
 - [x] verified on GLM-5.2 `UD-Q4_K_XL` (11 parts) and on Qwen3.6-35B-A3B `UD-Q4_K_M` (unsloth) + `Q4_K_M` (bartowski)
 - [x] `ENGINE_ARCHS`: `qwen35moe → qwen36`, `glm-dsa → glm`
 - [x] upstream colibrì v1.12.1 merged into `06_Code/` (subtree); GGUF additions re-applied
-- [ ] CI green on macOS and Windows (first Actions run)
-- [ ] `make check` of the merged `06_Code` run end to end on Linux (upstream's full suite)
+- [x] CI green on Linux, macOS and Windows (run 7, commit c77e88b, 2026-10-05; Windows needed the split `mingw-w64-ucrt-x86_64-libgomp` package, `update: true` and `PYTHONUTF8=1` as upstream)
+- [x] `make check` of the merged `06_Code` run end to end on Linux (upstream's full suite: all C suites pass, 1369 Python tests OK, 147 skipped without models/GPU)
 
 ## Phase 2 — kernels (`gq.h`)
 
