@@ -1,0 +1,13 @@
+# IntegrationTest
+
+One test per architecture module, written **after** the architecture review and
+**before** the module is implemented. Unit tests live next to the code in
+`06_Code/c/tests/`; these tests exercise a module against its neighbours and
+against real-world input.
+
+| Module | Test | State |
+|---|---|---|
+| `gguf.h` + `ggufinfo.py` (phase 1) | [`gguf_reader.md`](gguf_reader.md) · runner `run_gguf_reader.py` | written after the fact (phase 1 pre-dates the process); passes |
+| `gq.h` (phase 2) | `gq_kernels.md` | to write before phase 2 |
+| `src.h` / `glm_names.h` / `ts_cfg` / `ts_tok` (phase 3) | `src_facade.md` | to write before phase 3 |
+| expert streaming (phase 4) | `expert_streaming.md` | to write before phase 4 |

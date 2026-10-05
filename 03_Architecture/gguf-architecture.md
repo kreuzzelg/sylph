@@ -1,9 +1,10 @@
-# GGUF support for colibrì — architecture
+# GGUF support — architecture
 
-Status: **proposal** for the experiment branch `claude/epic-edison-u3ncsq`.
-Requirements, scope and decisions: [REQUIREMENTS.md](REQUIREMENTS.md).
-Everything below is written against `c/colibri.c` at commit `ecade07`
-(v1.3.0); line references are to that revision.
+Status: **proposal, awaiting owner review**. What the system must do:
+`../02_Specifications/gguf-specification.md`. Progress: `../04_Tasks/tasks.md`.
+Everything below is written against `06_Code/c/colibri.c` at upstream commit
+`ecade07` (colibrì v1.3.0); line references are to that revision. Paths are
+relative to `06_Code/` unless stated otherwise. Diagrams are PlantUML.
 
 ## 1. Design goals, in one paragraph
 
@@ -18,27 +19,35 @@ byte-for-byte identical (proven by the existing oracle gate).
 
 ## 2. As-is: the seams this design hooks into
 
-```
-                 ┌──────────────┐  config.json / generation_config.json
-   model dir ───►│ load_cfg     │─────────────────────────────► Cfg
-   (*.safetensors│ (l.940)      │
-    + json)      └──────────────┘
-        │        ┌──────────────┐
-        └───────►│ st.h  shards │  name → {fd, off, nbytes, dtype}
-                 │ st_init_multi│  mirror fds · O_DIRECT twins · hash index
-                 └──────┬───────┘
-                        │ st_find / st_read_raw / st_read_f32 / st_prefetch_rep
-          ┌─────────────┼──────────────────────────────┐
-          ▼             ▼                              ▼
-   qt_from_disk    expert_load_impl              uring_load_add / mmap views
-   (dense, l.1080) (slab, 1 pread, l.1509)       (l.1796 / l.1553)
-          │             │
-          ▼             ▼
-        QT {fmt 0..6, q4/q8/qf, s, O, I, gs}   ← qt_resolve_fmt infers fmt from byte counts
-          │
-          ▼
-   matmul_qt_ex (l.597) → CPU kernels in quant.h · CUDA/Metal by fmt
-   expert_gate_up (l.275) → fused pair for fmt 2/4
+```plantuml
+@startuml
+title As-is: how the GLM-5.2 engine reaches its weights (colibrì v1.3.0)
+skinparam componentStyle rectangle
+folder "model directory" as dir {
+  file "config.json\ngeneration_config.json\ntokenizer.json" as json
+  file "*.safetensors\n(U8 weights + .qs scales)" as st
+}
+component "load_cfg\n(colibri.c l.940)" as cfg
+component "st.h  shards\nst_init_multi · st_find · hash index\nmirror fds · O_DIRECT twins" as sth
+component "qt_from_disk\n(dense, l.1080)" as qfd
+component "expert_load_impl\n(slab, one pread, l.1509)" as eli
+component "uring_load_add / mmap views\n(l.1796 / l.1553)" as ur
+component "QT\n{fmt 0..6, q4/q8/qf, s, O, I, gs}" as qt
+component "matmul_qt_ex (l.597)\nquant.h CPU kernels · CUDA/Metal by fmt" as mm
+component "expert_gate_up (l.275)\nfused pair for fmt 2/4" as egu
+json --> cfg : hyperparameters, stop ids
+cfg --> "Cfg"
+st --> sth
+sth --> qfd : st_read_raw / st_read_f32
+sth --> eli : st_find x3 (+ .qs)
+sth --> ur
+qfd --> qt
+eli --> qt : views into slab
+ur --> qt
+note right of qt : qt_resolve_fmt infers fmt\nfrom byte counts
+qt --> mm
+qt --> egu
+@enduml
 ```
 
 Facts the design depends on:
@@ -61,27 +70,37 @@ Facts the design depends on:
 
 ## 3. To-be: component view
 
-```
- model path ──► source detect ──► ┌──────────────────────────────────────────┐
- (dir | .gguf)                    │ src.h   tensor-source façade              │
-                                  │  ts_init(path, mirror, extra_dirs)        │
-                                  │  ts_find(hf_name) → TsTensor              │
-                                  │  ts_cfg(Cfg*) · ts_tok(Tok*)              │
-                                  │  ts_expert(layer, eid) → ExpertParts      │
-                                  │  ts_read / ts_prefetch / ts_direct_fd_rep │
-                                  ├──────────────────┬───────────────────────┤
-                                  │ st.h (unchanged) │ gguf.h  (new)         │
-                                  │ safetensors      │ header · KV · tensors │
-                                  │ + .qs sidecars   │ splits · mirror · idx │
-                                  └──────────────────┴───────────────────────┘
-                                             │
-                     name map (glm_names.h) ─┘  "model.layers.%d.self_attn.q_a_proj.weight"
-                                                 ⇄ "blk.%d.attn_q_a.weight"
- QT fmt space:
-   0..6      colibrì formats (unchanged)             → quant.h kernels
-   32+type   ggml block types, scales in-block, s=NULL, gs=block size
-                                                     → gq.h kernels (new)
- Python:   ggufinfo.py (stdlib) ← coli · doctor.py · resource_plan.py · openai_server.py
+```plantuml
+@startuml
+title To-be: one tensor-source façade, two containers, two format families
+skinparam componentStyle rectangle
+actor "COLI_MODEL\n(dir | .gguf)" as path
+package "src.h — tensor-source façade" as src {
+  component "ts_init(path, mirror, extra_dirs)\nts_find(hf_name) → TsTensor\nts_cfg(Cfg*) · ts_tok(Tok*)\nts_expert(layer, eid) → ExpertParts\nts_read · ts_prefetch · ts_direct_fd_rep" as api
+  component "st.h (unchanged)\nsafetensors + .qs sidecars" as st
+  component "gguf.h (new)\nheader · KV · tensors\nsplits · mirror · index" as gg
+  component "glm_names.h\nHF ⇄ GGUF name table" as names
+  api --> st
+  api --> gg
+  api ..> names : ts_find / ts_has
+}
+path --> api : source detect
+package "QT fmt space" as fmts {
+  component "fmt 0..6\ncolibrì formats (unchanged)\n→ quant.h kernels" as f06
+  component "fmt 32 + ggml_type\nblock types, scales in-block\ns = NULL, gs = block size\n→ gq.h kernels (new)" as fgg
+}
+api --> f06
+api --> fgg
+component "colibri.c seams\nmodel_init · qt_from_disk · expert_load_impl\nuring_load_add · matmul_qt_ex · qt_bytes · expert_gate_up" as seams
+f06 --> seams
+fgg --> seams
+package "Python tooling" as py {
+  component "ggufinfo.py (stdlib)" as gi
+  component "coli · doctor.py\nresource_plan.py · openai_server.py" as tools
+  gi <-- tools
+}
+gg .. gi : same rules,\ncross-checked
+@enduml
 ```
 
 New files (all header-only C, static functions, like the rest of the tree):
@@ -327,7 +346,7 @@ main embedding and head as today.)
 | `Cfg` field | GGUF key (`glm-dsa.` prefix unless noted) | Notes |
 |---|---|---|
 | `hidden` | `embedding_length` | |
-| `n_layers` | `block_count − nextn_predict_layers` | llama.cpp counts the NextN block **inside** `block_count` (GLM-5.2: 79 = 78 + 1, MTP tensors under `blk.78.*`; verified on `unsloth/GLM-5.2-GGUF`, see [inspection report](inspection-glm52-ud-q4_k_xl-2026-10-05.md)) |
+| `n_layers` | `block_count − nextn_predict_layers` | llama.cpp counts the NextN block **inside** `block_count` (GLM-5.2: 79 = 78 + 1, MTP tensors under `blk.78.*`; verified on `unsloth/GLM-5.2-GGUF`, see [inspection report](../08_Documents/inspection-glm52-ud-q4_k_xl-2026-10-05.md)) |
 | `n_heads` | `attention.head_count` | |
 | `n_experts` | `expert_count` | may be < 256 (REAP) |
 | `topk` | `expert_used_count` | |
@@ -448,6 +467,40 @@ gate : T = blk.L.ffn_gate_exps.weight  ne={D, I, E}   slice e: off + e·I·row_s
 up   : T = blk.L.ffn_up_exps.weight    ne={D, I, E}   same
 down : T = blk.L.ffn_down_exps.weight  ne={I, D, E}   slice e: off + e·D·row_size(T.type, I)  nbytes D·row_size
 fmt[k] = QT_FMT_GGML(T.type); gs[k] = block; has_q = 0
+```
+
+```plantuml
+@startuml
+title One routed expert = three contiguous slices of three 3-D tensors
+skinparam componentStyle rectangle
+rectangle "blk.L.ffn_gate_exps.weight  ne={D, I, E}" as g {
+  rectangle "e=0" as g0
+  rectangle "…" as gd
+  rectangle "e: I rows × row_size(type, D)" as ge #lightblue
+  rectangle "…" as gd2
+}
+rectangle "blk.L.ffn_up_exps.weight  ne={D, I, E}" as u {
+  rectangle "e=0" as u0
+  rectangle "…" as ud
+  rectangle "e: I rows × row_size(type, D)" as ue #lightblue
+  rectangle "…" as ud2
+}
+rectangle "blk.L.ffn_down_exps.weight  ne={I, D, E}" as d {
+  rectangle "e=0" as d0
+  rectangle "…" as dd
+  rectangle "e: D rows × row_size(type, I)" as de #lightblue
+  rectangle "…" as dd2
+}
+rectangle "ESlot slab (host RAM)" as slab {
+  rectangle "gate bytes" as sg
+  rectangle "up bytes" as su
+  rectangle "down bytes" as sd
+}
+ge --> sg : pread (O_DIRECT window)
+ue --> su : pread
+de --> sd : pread
+note bottom of slab : QT.g / QT.u / QT.d are views into the slab\nfmt = 32 + type, s = NULL, gs = block
+@enduml
 ```
 
 (`D = hidden`, `I = moe_inter`, `E = n_experts`; QT shapes are `g,u: [O=I, I=D]`,
@@ -606,12 +659,12 @@ exact: engines differ in accumulation order).
 - **GLM-5.2 `Q4_K_M`-class GGUF**: `coli doctor --deep`, `coli chat`,
   `coli bench` subset, and the A/B of REQUIREMENTS §9.5.
 
-## 12. Phased plan (each phase = one PR-sized branch off the experiment branch)
+## 12. Phased plan (each phase = one PR-sized branch; the task list in `../04_Tasks/tasks.md` is authoritative)
 
 | Phase | Branch | Deliverables | Exit criteria |
 |---|---|---|---|
-| **0** | `claude/epic-edison-u3ncsq` | These two documents. | Reviewed. |
-| **1 — Reader** | `gguf/p1-reader` | `gguf.h`, `ggufinfo.py`, `tools/make_gguf_fixture.py`, `test_gguf.c`, `test_ggufinfo.py`, `coli gguf inspect`, `doctor` header/split/type checks. No engine wiring. | `make check` green on 3 OSes; inspects a real GGUF (any arch). |
+| **0** | (colibrì fork) | Specification + this document. | Owner review pending. |
+| **1 — Reader** | `gguf/p1-reader` (fork), now `06_Code/` | `gguf.h`, `ggufinfo.py`, `tools/make_gguf_fixture.py`, `test_gguf.c`, `test_ggufinfo.py`, `coli gguf inspect`, `doctor` header/split/type checks. No engine wiring. | `make check` green on 3 OSes; inspects a real GGUF (any arch). **Done 2026-10-05**, see `../08_Documents/inspection-glm52-ud-q4_k_xl-2026-10-05.md`. |
 | **2 — Kernels** | `gguf/p2-kernels` | `gq.h` (types of D2), `tools/gq_ref.py`, `test_gq_kernels.c`, startup selftest, `QT` fmt extension + `qt_bytes` + `matmul_qt_ex`/`expert_gate_up`/`qt_addrow` dispatch (dead until Phase 3). | Bit-exact dequant vs reference; SIMD parity; zero change to existing tests/oracle. |
 | **3 — Assembly** | `gguf/p3-assembly` | `src.h`, `glm_names.h`, `ts_cfg`, `ts_tok` (+`tok_load_from_arrays`), `model_init` through the façade, MLA reconciliation, `test_gguf_load.c`, `test_tok_gguf.c`, `tools/st2gguf.py`, `coli`/`doctor`/`resource_plan`/gateway source detection. Experts still load via the façade's safetensors arm; GGUF experts load but only through the simple 3-read path. | **Lossless oracle 32/32 + 20/20 from an F16 GGUF**; safetensors oracle unchanged. |
 | **4 — Streaming** | `gguf/p4-streaming` | per-slice O_DIRECT, mmap, uring, prefetch/pilot per part, mirror/split for GGUF, sidecar dir, MTP precision guard, indexer, stats/`[GGUF]` lines, `docs/gguf.md`, ENVIRONMENT/SETTINGS/CHANGELOG. | Real GLM-5.2 GGUF runs on Linux + macOS; A/B published (REQ §9.5); no safetensors regression. |

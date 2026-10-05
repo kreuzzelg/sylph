@@ -1,9 +1,13 @@
-# GGUF support for colibrì — requirements
+# GGUF support — specification
 
-Status: **draft for review** (experiment branch `claude/epic-edison-u3ncsq`).
-Companion document: [ARCHITECTURE.md](ARCHITECTURE.md). Decisions already taken
-by the maintainer of this branch are marked **[decided]**; everything else is a
-proposal and open to change.
+Status: **draft for review**. This document describes **what** the GGUF support
+must do. How it is built is in `../03_Architecture/gguf-architecture.md`; progress is
+tracked in `../04_Tasks/tasks.md`. Items marked **[decided]** are inputs the project
+owner fixed in conversation on 2026-10-04 and stand in for `01_Requirements/` until
+the owner writes them there.
+
+Programming language (fixed by the owner): **C** for the engine, header-only
+modules as in upstream; **Python 3 standard library** for the tooling.
 
 ## 1. Purpose
 
@@ -27,15 +31,15 @@ Why this matters:
   colibrì's tiering lets the project measure "bytes moved per useful token" on
   formats the community already trusts, next to the in-house fmt 1–6 family.
 
-## 2. Decisions already taken [decided]
+## 2. Inputs from the owner [decided]
 
 | # | Decision | Consequence |
 |---|---|---|
 | D1 | **Direction: load GGUF directly in the engine.** Not an offline GGUF→safetensors converter, not a GGUF exporter. | New reader + new kernels in C. The offline-converter and export directions are explicitly out of scope (see §5). |
 | D2 | **Quant coverage for v1: `F32`, `F16`, `BF16`, `Q4_0`, `Q8_0` *and* the K-quants `Q4_K`, `Q5_K`, `Q6_K`.** | Covers the common Hugging Face uploads (`Q4_K_M`, `Q5_K_M`, `Q6_K`, `Q8_0`, `UD-Q4_K_XL`). I-quants, `Q2_K`/`Q3_K`, ternary and `MXFP4` are later phases. |
-| D3 | **Pure C, zero dependencies stays.** No linking or vendoring of `ggml`/`llama.cpp`. | Own GGUF parser (`gguf.h`), own block-format kernels (`gq.h`). Reimplementing a documented block layout is fine (the IQ3 grid in `quant.h` already does this, MIT-attributed); importing library code is not. |
-| D4 | **Deliverable of this step: documents only, in English, under `docs/gguf/`.** | No engine code on this branch yet. The phase plan in ARCHITECTURE.md §12 is the proposal for the implementation branches. |
-| D5 | **Experiment branch.** Everything lands on `claude/epic-edison-u3ncsq` (and children), never directly on `main`/`dev`. | `main` keeps its oracle gate untouched; promotion to upstream `dev` is a separate decision once Phase 4 measurements exist. |
+| D3 | **Pure C, zero dependencies stays.** No linking or vendoring of `ggml`/`llama.cpp`. | Own GGUF parser and own block-format kernels. Reimplementing a documented block layout is fine (the IQ3 grid in `quant.h` already does this, MIT-attributed); importing library code is not. |
+| D4 | **Documents in English.** | Specification, architecture, tasks and reports are English Markdown; diagrams are PlantUML. |
+| D5 | **Separate repository (sylph).** Upstream colibrì does not want GGUF; the work lives in this repository with colibrì as a git subtree. | Upstream's own oracle gate must stay green at every step so upstream changes keep merging cleanly. |
 
 ## 3. Background: what exists today
 
@@ -100,7 +104,7 @@ Why this matters:
   with a precise message, never guess.
 - Other model families (`glm4moe`, `deepseek2`, `olmoe`, `kimi`, Inkling) in
   the engine. The reader and kernels are family-agnostic by construction, and
-  OLMoE-GGUF is proposed as a *test vehicle* (ARCHITECTURE.md §11.4), but no
+  OLMoE-GGUF is proposed as a *test vehicle* (see the architecture, test strategy), but no
   product commitment.
 - Vision towers, multimodal projector tensors (`mmproj`).
 - Writing GGUF (no `gguf_write`).
@@ -109,7 +113,7 @@ Why this matters:
 ## 6. Functional requirements
 
 Priority: **MUST** (v1 acceptance), **SHOULD** (v1 if cheap, else Phase 5),
-**MAY** (later). Phase numbers refer to ARCHITECTURE.md §12.
+**MAY** (later). Phase numbers refer to `../04_Tasks/tasks.md`.
 
 ### 6.1 Container reading
 
@@ -142,7 +146,7 @@ Priority: **MUST** (v1 acceptance), **SHOULD** (v1 if cheap, else Phase 5),
 | FR-15 | Fill `Cfg` from GGUF metadata (`glm-dsa.embedding_length`, `block_count`, `expert_count`, `expert_used_count`, `expert_feed_forward_length`, `feed_forward_length`, `leading_dense_block_count`, `expert_shared_count`, `expert_weights_scale`, `expert_weights_norm`, `expert_gating_func`, `attention.head_count`, `attention.q_lora_rank`, `attention.kv_lora_rank`, `attention.key_length_mla`, `attention.value_length_mla`, `rope.dimension_count`, `rope.freq_base`, `attention.layer_norm_rms_epsilon`, indexer keys, `nextn_predict_layers`). The same `CKR` range validation as `load_cfg` applies. | MUST | 3 |
 | FR-16 | Map every HF tensor name the engine uses (`model.layers.%d.self_attn.q_a_proj.weight`, …) to its GGUF name (`blk.%d.attn_q_a.weight`, …) in **one table**, so `model_init` keeps its HF vocabulary and the mapping is reviewable in one place. | MUST | 3 |
 | FR-17 | Locate expert `e` of layer `L` as **three slices of three 3-D tensors** (`blk.L.ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps`; shape `{ne0, ne1, n_expert}`), each slice contiguous: `offset + e × ne1 × row_size(type, ne0)`. | MUST | 3–4 |
-| FR-18 | Reconcile MLA weights: GGUF `glm-dsa` files carry the **absorbed split** `attn_k_b` (`{qk_nope, kv_lora, n_head}`, per-head transposed) and `attn_v_b` (`{kv_lora, v_head, n_head}`) and may or may not carry the fused `attn_kv_b`. The engine must work with either, without narrowing precision (see ARCHITECTURE.md §7.3). | MUST | 3 |
+| FR-18 | Reconcile MLA weights: GGUF `glm-dsa` files carry the **absorbed split** `attn_k_b` (`{qk_nope, kv_lora, n_head}`, per-head transposed) and `attn_v_b` (`{kv_lora, v_head, n_head}`) and may or may not carry the fused `attn_kv_b`. The engine must work with either, without narrowing precision (see the architecture, MLA reconciliation). | MUST | 3 |
 | FR-19 | Build the tokenizer from `tokenizer.ggml.tokens`, `merges`, `token_type`, `bos/eos_token_id`, `tokenizer.ggml.pre` (→ pre-tokenizer family `cl100k` for GLM) **in memory**, reusing `tok.h`'s structures. A `tokenizer.json` next to the GGUF, if present, may be preferred but is never required. | MUST | 3 |
 | FR-20 | Stop tokens: union of `tokenizer.ggml.eos_token_id`, `eot_token_id` if present, and the GLM control tokens resolved by name (`<|user|>`, `<|observation|>`, `<|endoftext|>`), mirroring today's `config.json` ∪ `generation_config.json` union. | MUST | 3 |
 | FR-21 | `coli` chooses the engine from `general.architecture`: `glm-dsa` → `colibri`; `glm4moe`, `deepseek2`, anything else → explicit "not supported by this engine" (no silent GLM fallback as today's `model_arch()` does for unknown `model_type`). | MUST | 3 |
@@ -160,7 +164,7 @@ Priority: **MUST** (v1 acceptance), **SHOULD** (v1 if cheap, else Phase 5),
 | FR-28 | `COLI_MMAP=1`: views into mapped parts at the slice offsets, same pre-touch and Metal registration behaviour. | SHOULD | 4 |
 | FR-29 | `URING=1`: one SQE per slice; the "requires quantized expert tensors" check becomes "requires a locatable expert", source-agnostic. | SHOULD | 4 |
 | FR-30 | `PILOT`/readahead/`PREFETCH` issue `WILLNEED` per slice on the replica that will serve the read. | SHOULD | 4 |
-| FR-31 | `PIN`, `AUTOPIN`, `REPIN`, `.coli_usage`, `.coli_kv`, `STATS`, the web **Brain/Atlas** pages work unchanged: expert identity is `(layer, eid)`, independent of the source. Sidecar files get a GGUF-specific location (ARCHITECTURE.md §9.3) so two GGUFs in one directory never share usage history or KV state. | MUST | 4 |
+| FR-31 | `PIN`, `AUTOPIN`, `REPIN`, `.coli_usage`, `.coli_kv`, `STATS`, the web **Brain/Atlas** pages work unchanged: expert identity is `(layer, eid)`, independent of the source. Sidecar files get a GGUF-specific location (see the architecture, sidecar files) so two GGUFs in one directory never share usage history or KV state. | MUST | 4 |
 | FR-32 | VRAM expert tier (`CUDA_EXPERT_GB`): experts in GGML formats stay on the CPU tier in v1 (`coli_cuda_tensor_upload` refuses unknown `fmt` → CPU, as it does for fmt 5). Dense tensors likewise. Native CUDA kernels for `Q4_K`/`Q6_K`/`Q8_0` are Phase 5. | MUST (fallback) / SHOULD (kernels) | 4 / 5 |
 | FR-33 | Metal: same CPU fallback in v1; batched Metal `moe_gemv` for K-quants is Phase 5+. | MAY | 5+ |
 
@@ -236,10 +240,10 @@ v1 is accepted when all of the following hold on the experiment branch:
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| `glm-dsa` GGUFs may lack `attn_kv_b` and ship only the absorbed `attn_k_b`/`attn_v_b` (per-head transposed). | Attention path mismatch. | FR-18; ARCHITECTURE §7.3 reconciles by widening `attn_k_b` to f16/f32 at load (≈0.6–1.3 GB resident for 78 layers) in v1, transposed kernel later. Verify on the first real file (`coli gguf inspect`). |
+| `glm-dsa` GGUFs may lack `attn_kv_b` and ship only the absorbed `attn_k_b`/`attn_v_b` (per-head transposed). | Attention path mismatch. | FR-18; The architecture reconciles by widening `attn_k_b` to f16/f32 at load (≈1–2 GB resident for 79 layers) in v1, transposed kernel later. Verify on the first real file (`coli gguf inspect`). |
 | MTP head quantized too coarsely in public GGUFs. | Draft acceptance collapses (#8). | FR-23: auto-disable below 8 bits with a warning; measure acceptance in the A/B. |
 | llama.cpp's `glm-dsa` indexer/tensor set is still moving (indexer runtime landed after the loader; metadata keys changed once). | Files in the wild differ by converter version. | Reader tolerates missing optional keys with defaults; `doctor` prints `general.*` provenance; the name table is one place to patch. |
-| Public quants keep the dense set at `Q8_0` (`UD-Q4_K_XL`: 21.0 GB resident vs 9.9 GB for the int4 container). | Small hosts cannot hold the dense set; re-quantizing is forbidden by NFR-3. | `coli doctor` fails `memory.ram` on the dense set alone (done, phase 1); inspect `UD-Q4_K_M`/`UD-Q4_K_S` for a 4–5-bit attention set; phase 5 can keep `Q8_0` dense tensors on the GPU. See the [inspection report](inspection-glm52-ud-q4_k_xl-2026-10-05.md). |
+| Public quants keep the dense set at `Q8_0` (`UD-Q4_K_XL`: 21.0 GB resident vs 9.9 GB for the int4 container). | Small hosts cannot hold the dense set; re-quantizing is forbidden by NFR-3. | `coli doctor` fails `memory.ram` on the dense set alone (done, phase 1); inspect `UD-Q4_K_M`/`UD-Q4_K_S` for a 4–5-bit attention set; phase 5 can keep `Q8_0` dense tensors on the GPU. See the [inspection report](../08_Documents/inspection-glm52-ud-q4_k_xl-2026-10-05.md). |
 | K-quant dequant cost on CPU-bound hosts. | Slower than fmt=4 at full residency. | NFR-5 measured honestly; FR-13 int8-activation path in Phase 5; fused pair (FR-12). |
 | Three reads per expert instead of one, possibly across split files. | More IOPS, worse O_DIRECT efficiency on some drives. | Offset-ordered reads, `PIPE`/`URING` batching per slice; measure on NVMe; an optional on-disk "expert index" cache is a Phase 6 idea, not v1. |
 | Tokenizer drift (byte-level BPE from GGUF arrays vs HF `tokenizer.json`). | Wrong tokens → wrong outputs. | Test: encode/decode of `tests/tok_o200k_cases.txt`-style corpus must match the `tokenizer.json` path on the same model; prefer the HF file when present. |
@@ -251,7 +255,7 @@ v1 is accepted when all of the following hold on the experiment branch:
    `unsloth/GLM-5.2-GGUF` `UD-Q4_K_XL` — inspected on 2026-10-05: 11 parts,
    1809 tensors, type mix `Q4_K`/`Q5_K`/`Q6_K`/`Q8_0`/`F32` only (all in the v1
    set), MTP head `Q8_0`, indexer on every layer, dense set 21.0 GB
-   ([report](inspection-glm52-ud-q4_k_xl-2026-10-05.md)). Open: whether a
+   ([report](../08_Documents/inspection-glm52-ud-q4_k_xl-2026-10-05.md)). Open: whether a
    lighter dense set (`UD-Q4_K_M`) should be the reference for ≤25 GB hosts.
 2. **MTP policy**: auto-disable below 8 bits (FR-23) or hard-refuse? Proposal:
    warn + disable, `MTP=1` forces.
@@ -259,10 +263,8 @@ v1 is accepted when all of the following hold on the experiment branch:
    not an acceptance blocker.
 4. **Sidecar location** for `.coli_usage`/`.coli_kv` next to a GGUF
    (ARCHITECTURE §9.3 proposes `<dir>/.coli-<basename>/`).
-5. **Upstream intent**: should the phases be shaped as PRs against
-   `JustVugg/colibri` `dev` from the start (small, each with `make check`), or
-   as one experiment branch merged later? The architecture assumes PR-sized
-   phases either way.
+5. ~~Upstream intent~~ — resolved: the work lives in this repository (D5);
+   phases stay PR-sized so `make check` gates each one.
 
 ## 12. Assumptions
 
@@ -288,4 +290,4 @@ v1 is accepted when all of the following hold on the experiment branch:
 - `glm-dsa` tensor shapes and keys: `src/models/glm-dsa.cpp`, `src/llama-arch.cpp` (llama.cpp master, 2026-10)
 - Split handling: `src/llama-model-loader.cpp`
 - GLM-5.2 GGUF availability: https://huggingface.co/unsloth/GLM-5.2-GGUF, https://huggingface.co/sunshaohui/GLM-5.2-GGUF
-- In-repo: `c/st.h`, `c/colibri.c` (`load_cfg`, `qt_resolve_fmt`, `qt_from_disk`, `model_init`, `expert_load_impl`, `uring_load_add`, `matmul_qt_ex`), `c/quant.h`, `c/tok.h`, `c/coli`, `c/doctor.py`, `c/resource_plan.py`, `CONTRIBUTING.md`, `docs/benchmarks.md`
+- In-repo (`06_Code/`): `c/st.h`, `c/colibri.c` (`load_cfg`, `qt_resolve_fmt`, `qt_from_disk`, `model_init`, `expert_load_impl`, `uring_load_add`, `matmul_qt_ex`), `c/quant.h`, `c/tok.h`, `c/coli`, `c/doctor.py`, `c/resource_plan.py`, `CONTRIBUTING.md`, `docs/benchmarks.md`
