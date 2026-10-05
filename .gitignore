@@ -1,0 +1,5 @@
+# sylph root: the engine tree keeps its own ignore rules in 06_Code/.gitignore
+*.gguf
+07_Tests/**/tmp_*/
+__pycache__/
+*.pyc

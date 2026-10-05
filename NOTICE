@@ -1,0 +1,8 @@
+sylph
+Copyright 2026 kreuzzelg
+
+This project is derived from colibrì (https://github.com/JustVugg/colibri),
+Copyright JustVugg and contributors, licensed under the Apache License, Version 2.0.
+The engine sources live in 06_Code/ as a git subtree of that project and keep
+its full commit history; sylph adds GGUF container support on top. Upstream
+colibrì does not endorse or maintain this derivative.
