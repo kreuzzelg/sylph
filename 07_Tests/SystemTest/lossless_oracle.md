@@ -15,7 +15,7 @@ through the container as before and through a GGUF written by `tools/st2gguf.py`
 |---|---|
 | `qwen36_tiny/` + `qwen36_tiny/ref_full.json` | `python3 tools/make_qwen36_tiny.py --out qwen36_tiny --ref-mode full --emit-ref qwen36_tiny/ref_full.json` (torch + transformers from `tools/oracle-requirements.txt`; seeded, so the reference ids are reproducible: 5 prompt ids, 16 greedy continuations through **both** layer kinds) |
 | `qwen36_tiny_c/` | `python3 tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_c --ebits 8` (upstream's container; experts int8, dense f16 → the engine's f32 with `COLI_DENSE_I8=0`) |
-| `qwen36_tiny_f32.gguf`, `_f16.gguf`, `_q8_0.gguf` | `python3 tools/st2gguf.py qwen36_tiny --out qwen36_tiny_f32.gguf --type f32` (and `--type f16`; `--type q8_0 --expert-type q8_0`) |
+| `qwen36_tiny_f32.gguf`, `_f16.gguf`, `_q8_0.gguf`, `_xq8_0.gguf` | `python3 tools/st2gguf.py qwen36_tiny --out qwen36_tiny_f32.gguf --type f32` (and `--type f16`; `--type q8_0 --expert-type q8_0`; `--type f32 --expert-type q8_0` = experts-only Q8_0, the file comparable to the int8 container) |
 | `qwen36_tiny/ref_logprobs.tsv` | `python3 07_Tests/SystemTest/make_tiny_ref_logprobs.py qwen36_tiny qwen36_tiny/ref_full.json` (torch): teacher-forced f32 forward over `full_ids`, per scored position the target log-prob and the top-5, in the `PPL_DUMP` format below |
 
 ## Commands
@@ -74,10 +74,13 @@ within 1e-6. The reference script writes the same format from torch.
    orders of magnitude above the gate. The script's defaults stay at the generic E1
    values; the job passes the calibrated ones explicitly.
 4. **Reported, not required.** F16 and Q8_0 GGUF: matching tokens and ΔNLL vs the
-   reference, next to the int8 container's (`qwen36_tiny_c`) — the Q8_0 GGUF is
-   expected within 3× of the container's ΔNLL (both are 8-bit experts). The ΔNLL
-   dumps for these three were added to the job after run 13 (which reported tokens
-   only); run 14 fills them in.
+   reference, next to the int8 container's (`qwen36_tiny_c`). The expectation "Q8_0
+   within 3× of the container" holds for the **experts-only** Q8_0 GGUF (`_xq8_0`,
+   dense F32 like the container with `COLI_DENSE_I8=0`); the all-Q8_0 file also
+   quantizes every dense matrix and sits an order of magnitude above (run 14: 11× the
+   container; on the `src_facade.md` fixture dense Q8_0 alone accounts for ~90 % of the
+   all-Q8_0 ΔNLL). The ΔNLL dumps were added after run 13 (tokens only); the `_xq8_0`
+   file after run 14.
 5. **Tokenizer-less reference mode.** The GGUF written without `--tokenizer` loads
    and runs the reference-id mode (no `tokenizer.json` on disk); text mode refuses
    with the usual `[enc] no tokenizer` message.
@@ -100,3 +103,4 @@ and architecture §10 were amended on 2026-10-06 accordingly.
 |---|---|
 | 2026-10-06 | written; `tools/st2gguf.py`, the GGUF source in `qwen36.c`, `PPL_DUMP`, `make_tiny_ref_logprobs.py`, `compare_logprobs.py` and the `gguf-oracle` CI job are phase-3 deliverables. Later the same day: all of them implemented; the job is in `check.yml`, its first run decides this row. torch is not installable in the development container (download.pytorch.org is egress-blocked; the PyPI wheel downloads but is CUDA-linked and untested), so the first execution is the CI job, then the owner's machine. |
 | 2026-10-06 (CI run 13, commit 2375ec1) | **Passes.** Container unchanged and F32 GGUF: `Matching tokens: 16/16` at cap 1, 2 and 8 (all six runs). Façade cross-check on the torch-built snapshot: 317 tensors / slices, 629 520 values bit-exact (F32) and within one f16 ulp (F16). E1 subset: 16 positions, same targets, top-1 identical everywhere, mean \|ΔNLL\| 6.25e-8, max 1.0e-6 (one print ulp); TF-NLL 5.319704 on both sides (ppl 204.32); the dump reproduces the printed TF-NLL. Reported: F16 GGUF 16/16, Q8_0 GGUF 16/16 with `COLI_DENSE_I8=0` and `=1`; the int8 container 16/16. Thresholds calibrated to 1e-6 / 1e-5 (criterion 3). The same run's Windows job failed on `tests/test_gguf_load.c` (a local variable named `far`, an empty macro in the Windows headers) — renamed, no behaviour change. Summary: `08_Documents/equivalence/2026-10-06-tiny-oracle-ci.md`. |
+| 2026-10-06 (CI run 14, commit 52fc566) | Passes with the calibrated gate: F32 GGUF vs torch mean / max \|ΔNLL\| **0 / 0** on this runner (run 13's single print ulp was runner-dependent rounding), top-1 identical, TF-NLL 5.319704 both. Reported ΔNLL vs torch: F16 GGUF mean 4.18e-5 / max 9.5e-5 (TF-NLL 5.319702); all-Q8_0 GGUF 2.68e-3 / 1.07e-2 (5.319592); int8 container 2.35e-4 / 5.8e-4 (5.319812); top-1 identical everywhere, all 16/16. Criterion 4 reworded: the 3× expectation applies to experts-only Q8_0, added to the job as `_xq8_0`. Windows: see tasks.md. |

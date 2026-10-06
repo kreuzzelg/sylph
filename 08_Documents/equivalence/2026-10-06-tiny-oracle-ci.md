@@ -91,13 +91,52 @@ generic E1 values for other uses.
   numerically the transformers model (E1 below print resolution, E3 token-exact), and
   the container path is untouched by the phase-3 changes (NFR-5).
 - Shown: the F16 and Q8_0 GGUFs and the int8 container reproduce the same 16 tokens;
-  their ΔNLL was not measured in run 13 (tokens only). The job now dumps and compares
-  them as reported values; run 14 onward records them.
+  their ΔNLL against torch is in the run-14 section below.
 - Not shown: anything about K-quants on a real model (the tiny fixture's experts are
   F32/F16/Q8_0), tokenizer equivalence (placeholder tokenizer here; that is
   `tests/test_tok_gguf` on the real metadata, 52/52 lines), or equivalence with
   llama.cpp's own numerics on the same GGUF — that is E1–E3 of phase 4 on the owner's
   machine (`07_Tests/SystemTest/equivalence.md`, to be written).
+
+## Run 14 (commit `52fc566`, same day): reported ΔNLL and the gate
+
+https://github.com/kreuzzelg/sylph/actions/runs/37538448619. The E1 gate ran with the
+calibrated thresholds and measured **mean 0 / max 0** between the F32 GGUF dump and the
+torch dump on this runner (every one of the 16 log-probs identical to 7 digits); run 13's
+single 1e-6 was rounding that depends on the runner. The reported step dumped the other
+three sources against the same torch reference:
+
+| Source (`./qwen36 8 8`, `COLI_DENSE_I8=0`) | TF-NLL | mean \|ΔNLL\| | max \|ΔNLL\| | top-1 | tokens |
+|---|---|---|---|---|---|
+| torch reference | 5.319704 | — | — | — | — |
+| GGUF F32 (the gate) | 5.319704 | 0 | 0 | identical | 16/16 |
+| GGUF F16 | 5.319702 | 4.18e-5 | 9.5e-5 | identical | 16/16 |
+| int8 container (`convert_qwen36.py --ebits 8`) | 5.319812 | 2.35e-4 | 5.8e-4 | identical | 16/16 |
+| GGUF Q8_0, dense and experts | 5.319592 | 2.68e-3 | 1.07e-2 | identical | 16/16 |
+
+The `FAIL` lines these three print in the log are against `compare_logprobs.py`'s
+generic defaults (1e-4 / 1e-3); the step is reported-only (`|| true`), and the numbers
+are the point. F16 is four orders of magnitude above the gate and two below 8-bit, as
+expected for f16 weights with f32 arithmetic.
+
+**Criterion 4 and the Q8_0 GGUF.** The protocol expected the Q8_0 GGUF within 3× of the
+int8 container (both 8-bit experts); it measured 11×. The premise was off: the all-Q8_0
+file also quantizes every dense matrix (attention, DeltaNet projections, lm_head), the
+container with `COLI_DENSE_I8=0` keeps dense in f32. Attribution on the `src_facade.md`
+fixture (engine vs engine, F32 GGUF as the reference, three `st2gguf.py` variants):
+
+| Variant (`src_facade.md` fixture) | mean \|ΔNLL\| | max \|ΔNLL\| |
+|---|---|---|
+| dense F32, experts Q8_0 | 5.0e-3 | 2.3e-2 |
+| dense Q8_0, experts F32 | 4.7e-2 | 2.8e-1 |
+| dense and experts Q8_0 | 4.9e-2 | 2.9e-1 |
+
+Dense Q8_0 carries ~90 % of the all-Q8_0 difference on that fixture; projected onto the
+CI fixture, experts-only Q8_0 lands near the container's 2.35e-4. That is a projection,
+so the job now also writes `qwen36_tiny_xq8_0.gguf` (`--type f32 --expert-type q8_0`)
+and reports its ΔNLL against torch from run 15 on; criterion 4 in `lossless_oracle.md`
+names that file as the one the 3× expectation applies to. Nothing here is a defect:
+Q8_0 is a lossy format, and its loss on random tiny weights is in the expected range.
 
 ## Same run, other jobs
 
@@ -105,3 +144,5 @@ linux and macos (`make check`) green. windows red: `tests/test_gguf_load.c` decl
 local `int far`, and `far` is an empty macro in the Windows headers that `qwen36.c`
 pulls in on MinGW. Renamed; reproduced and re-verified locally with `-Dfar= -Dnear=`
 on both new tests. No behaviour change.
+Run 14 (commit `52fc566`): all four jobs green, the Windows `make check` with both new tests
+included (33 minutes on the hosted runner, as the earlier phases).
