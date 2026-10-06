@@ -88,4 +88,4 @@ and architecture §10 were amended on 2026-10-06 accordingly.
 
 | Date | Result |
 |---|---|
-| 2026-10-06 | written; `tools/st2gguf.py`, the GGUF source in `qwen36.c`, `PPL_DUMP`, `make_tiny_ref_logprobs.py`, `compare_logprobs.py` and the `gguf-oracle` CI job are phase-3 deliverables. torch is not installable in the development container (download.pytorch.org is egress-blocked; the PyPI wheel downloads but is CUDA-linked and untested), so the first execution is the CI job, then the owner's machine. |
+| 2026-10-06 | written; `tools/st2gguf.py`, the GGUF source in `qwen36.c`, `PPL_DUMP`, `make_tiny_ref_logprobs.py`, `compare_logprobs.py` and the `gguf-oracle` CI job are phase-3 deliverables. Later the same day: all of them implemented; the job is in `check.yml`, its first run decides this row. torch is not installable in the development container (download.pytorch.org is egress-blocked; the PyPI wheel downloads but is CUDA-linked and untested), so the first execution is the CI job, then the owner's machine. |

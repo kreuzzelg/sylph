@@ -5,8 +5,8 @@ Same geometry and tensor names as upstream's tools/make_qwen36_tiny.py default
 preset (hidden 64, 8 blocks with attention at 3 and 7, 4 query / 2 kv heads of
 16, rope over 8 dims, 8 experts top-2 of width 32, shared expert 32, vocab 320,
 DeltaNet 4 key heads / 8 value heads of 8, conv kernel 4), but the weights are
-seeded random numbers written straight into one float32 safetensors file plus
-config.json. No transformers run, so no reference ids: this fixture pins the
+seeded random numbers (bf16-representable, as a real checkpoint's) written straight
+into one float32 safetensors file plus config.json. No transformers run, so no reference ids: this fixture pins the
 PLUMBING (two sources, one engine, identical tensors), the torch-built fixture
 in SystemTest/lossless_oracle.md pins the MATH.
 
@@ -72,9 +72,22 @@ def tensor_shapes(g):
     return shapes
 
 
+def bf16_round(v):
+    """Round to the nearest bf16-representable float: real checkpoints are bf16, and it
+    keeps the converter's 1 + w exact in f32 (so the un-transform is bit-exact)."""
+    b = struct.unpack("<I", struct.pack("<f", v))[0]
+    b = (b + 0x7FFF + ((b >> 16) & 1)) & 0xFFFF0000
+    return struct.unpack("<f", struct.pack("<I", b))[0]
+
+
 def values(name, n, rng):
     """Plausible magnitudes per tensor kind (what matters is that both sources see
-    the same numbers; the kinds only keep the engine's math well-conditioned)."""
+    the same numbers; the kinds only keep the engine's math well-conditioned).
+    Every value is bf16-representable, as in a real checkpoint."""
+    return [bf16_round(v) for v in raw_values(name, n, rng)]
+
+
+def raw_values(name, n, rng):
     if name.endswith("A_log"):
         return [math.log(rng.uniform(1.0, 16.0)) for _ in range(n)]
     if name.endswith("dt_bias"):

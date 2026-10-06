@@ -77,10 +77,57 @@ def _tensor_sizes(path):
         yield name, end - start, dtype
 
 
+def _analyze_gguf(resolved, model):
+    """sylph: the same analysis for a GGUF source. Routed experts are the slices
+    of blk.N.ffn_{gate,up,down}_exps; everything else is dense. Dense bytes are
+    what the file holds: the engine uses GGUF matrices as the author quantized
+    them (Q8_0 split losslessly, K-quants raw), so no reload ratio applies."""
+    import ggufinfo
+    parts = ggufinfo.open_set(str(model))
+    summary = ggufinfo.summarize(parts)
+    expert_groups, dense_bytes = {}, 0
+    for t in ggufinfo.all_tensors(parts):
+        if not t.nbytes:
+            continue
+        m = ggufinfo.EXPERT_RE.match(t.name)
+        if m and len(t.ne) >= 3 and t.ne[2] > 0:
+            layer, n_exp = int(m.group(1)), t.ne[2]
+            for e in range(n_exp):
+                expert_groups[(layer, e)] = expert_groups.get((layer, e), 0) + t.nbytes // n_exp
+        else:
+            dense_bytes += t.nbytes
+    layer_sizes = {}
+    for (layer, _), size in expert_groups.items():
+        layer_sizes.setdefault(layer, []).append(size)
+    per_layer = {layer: int(max(sizes)) for layer, sizes in layer_sizes.items()}
+    return {
+        "path": str(model),
+        "shards": len(parts),
+        "model_bytes": sum(p.size for p in parts),
+        "dense_bytes": dense_bytes,
+        "dense_disk_bytes": dense_bytes,
+        "expert_fixed_bytes": 0,
+        "trunk_int8_bytes": 0,
+        "expert_bytes": sum(expert_groups.values()),
+        "expert_count": len(expert_groups),
+        "expert_layers": len(per_layer),
+        "typical_expert_bytes": int(statistics.median(per_layer.values())) if per_layer else 0,
+        "max_expert_bytes": max(per_layer.values(), default=0),
+        "expert_bytes_by_layer": per_layer,
+        "per_cap_bytes": sum(per_layer.values()),
+        "config": resolved.config,
+        "resolved_family": resolved,
+        "gguf": {"architecture": summary["architecture"], "type_mix": summary["type_mix"],
+                 "trunk_layers": summary["trunk_layers"], "unsupported_v1": summary["unsupported_v1"]},
+    }
+
+
 def analyze_model(model):
     resolved = resolve_model(model)
     model = Path(resolved.model_dir)
     config = resolved.config
+    if config.get("_gguf"):
+        return _analyze_gguf(resolved, model)
     shards = sorted(model.glob("*.safetensors"))
     if not shards:
         raise ValueError(f"no safetensors shards: {model}")

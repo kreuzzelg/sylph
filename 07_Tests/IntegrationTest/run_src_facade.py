@@ -186,15 +186,15 @@ def case6(tmp, ggufs):
     try:
         res = family_registry.resolve_model(ggufs["f32"])
         fc = res.family_config
-        check(res.family.id == "qwen36" and fc.get("hidden_size") == 64 and fc.get("num_hidden_layers") == 8 and fc.get("num_experts") == 8,
-              f"resolve_model: family {res.family.id}, hidden {fc.get('hidden_size')}, layers {fc.get('num_hidden_layers')}, experts {fc.get('num_experts')}")
+        check(res.descriptor.id == "qwen36" and fc.get("hidden_size") == 64 and fc.get("num_hidden_layers") == 8 and fc.get("num_experts") == 8,
+              f"resolve_model: family {res.descriptor.id}, hidden {fc.get('hidden_size')}, layers {fc.get('num_hidden_layers')}, experts {fc.get('num_experts')}")
     except Exception as ex:   # noqa: BLE001
         check(False, f"resolve_model on a GGUF: {type(ex).__name__}: {ex}")
     try:
         a = resource_plan.analyze_model(ggufs["f32"])
         s = ggufinfo.summarize(ggufinfo.open_set(ggufs["f32"]))
-        eb = a.get("expert_bytes", a.get("experts_bytes"))
-        check(eb == s["expert_bytes_total"] if "expert_bytes_total" in s else eb is not None, f"analyze_model expert bytes {eb} (summary {s.get('expert_bytes_total')})")
+        check(a.get("expert_bytes") == s["expert_bytes"] and a.get("dense_bytes") == s["dense_bytes"] and a.get("expert_layers") == 8,
+              f"analyze_model expert/dense bytes {a.get('expert_bytes')}/{a.get('dense_bytes')} equal the summary's {s['expert_bytes']}/{s['dense_bytes']}, 8 expert layers")
     except Exception as ex:   # noqa: BLE001
         check(False, f"analyze_model on a GGUF: {type(ex).__name__}: {ex}")
     for args in (["doctor", "--model", ggufs["f32"], "--gpu", "none"], ["plan", "--model", ggufs["f32"]]):
@@ -235,7 +235,9 @@ def rewrite(src, dst, kv_override=None, drop=(), retype=None, add_tensors=()):
                 rs = ggufinfo.row_size(tid, t.ne[0]); n = rs
                 for e in t.ne[1:]: n *= e
                 payload = (payload * (n // len(payload) + 1))[:n]
-            w.add_tensor(t.name, tid, t.ne, payload=payload)
+            ne = list(t.ne)
+            while len(ne) > 1 and ne[-1] == 1: ne.pop()      # the reader pads to 4 dims; llama.cpp writes none
+            w.add_tensor(t.name, tid, ne, payload=payload)
     for name, tid, ne in add_tensors:
         w.add_tensor(name, tid, ne)
     w.write(dst)
@@ -270,7 +272,9 @@ def case7(tmp, hf, ggufs):
     w.add("qwen35moe.nextn_predict_layers", 4, 1)   # U32
     with open(nextn, "rb") as f:
         for t in part.tensors:
-            f.seek(t.off); w.add_tensor(t.name, t.type, t.ne, payload=f.read(t.nbytes))
+            ne = list(t.ne)
+            while len(ne) > 1 and ne[-1] == 1: ne.pop()
+            f.seek(t.off); w.add_tensor(t.name, t.type, ne, payload=f.read(t.nbytes))
     w.write(tmp / "nextn2.gguf")
     r = run([T_LOAD, tmp / "nextn2.gguf", hf], cwd=C)
     check(r.returncode == 0 and "nextn" in (r.stdout + r.stderr).lower(), f"NextN block: loads with 8 trunk blocks and reports the skipped block ({last_line(r)[:100]})")

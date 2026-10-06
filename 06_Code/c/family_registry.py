@@ -1539,8 +1539,69 @@ def tuning_replay_prompt(family, prompt):
     return family.tune_prompt_template.format(prompt=prompt, prompt_len=len(prompt))
 
 
+def _gguf_config(model):
+    """An HF-shaped config dict from a GGUF's metadata (sylph). The planner, the
+    launcher and the engine's own Cfg key on the same fields config.json carries;
+    here they come from the `<arch>.*` keys and the tokenizer arrays. Only the
+    architectures ggufinfo.ENGINE_ARCHS maps are accepted."""
+    import ggufinfo
+    parts = ggufinfo.open_set(str(model))
+    kv = parts[0].kv
+    arch = kv.get("general.architecture")
+    engine = ggufinfo.ENGINE_ARCHS.get(arch)
+    if engine is None:
+        raise UnknownFamilyError(f"unsupported GGUF architecture: {arch}")
+    family = family_by_id(engine)
+    cfg = {"model_type": family.model_types[0], "architectures": [], "_gguf": True,
+           "_gguf_architecture": arch, "_gguf_path": str(model)}
+    tokens = kv.get("tokenizer.ggml.tokens")
+    if arch == "qwen35moe":
+        def g(key, default=None):
+            return kv.get(f"qwen35moe.{key}", default)
+        blocks = int(g("block_count") or 0)
+        nextn = int(g("nextn_predict_layers", 0) or 0)
+        layers = blocks - nextn
+        interval = int(g("full_attention_interval", 4) or 4)
+        vocab = len(tokens) if isinstance(tokens, list) else None
+        if vocab is None:
+            out = next((t for t in ggufinfo.all_tensors(parts) if t.name == "output.weight"), None)
+            vocab = out.ne[1] if out is not None else None
+        cfg.update(
+            hidden_size=g("embedding_length"), num_hidden_layers=layers, vocab_size=vocab,
+            num_attention_heads=g("attention.head_count"), num_key_value_heads=g("attention.head_count_kv"),
+            head_dim=g("attention.key_length"), num_experts=g("expert_count"), num_experts_per_tok=g("expert_used_count"),
+            moe_intermediate_size=g("expert_feed_forward_length"),
+            shared_expert_intermediate_size=g("expert_shared_feed_forward_length", g("expert_feed_forward_length")),
+            intermediate_size=g("feed_forward_length", g("expert_feed_forward_length")),
+            linear_num_key_heads=g("ssm.group_count"), linear_num_value_heads=g("ssm.time_step_rank"),
+            linear_key_head_dim=g("ssm.state_size"), linear_value_head_dim=g("ssm.state_size"),
+            linear_conv_kernel_dim=g("ssm.conv_kernel"), full_attention_interval=interval,
+            layer_types=["full_attention" if (i + 1) % interval == 0 else "linear_attention" for i in range(layers)],
+            rms_norm_eps=g("attention.layer_norm_rms_epsilon"), rope_theta=g("rope.freq_base"),
+            max_position_embeddings=g("context_length"), attn_output_gate=True, norm_topk_prob=False,
+            mtp_num_hidden_layers=nextn,
+            eos_token_id=kv.get("tokenizer.ggml.eos_token_id"), bos_token_id=kv.get("tokenizer.ggml.bos_token_id"))
+    else:
+        block_count = kv.get(f"{arch}.block_count")
+        cfg.update(hidden_size=kv.get(f"{arch}.embedding_length"), num_hidden_layers=block_count,
+                   vocab_size=len(tokens) if isinstance(tokens, list) else None)
+    return cfg
+
+
 def resolve_model(model_dir):
     model = Path(model_dir).expanduser().resolve()
+    try:
+        import ggufinfo
+        is_gguf = ggufinfo.is_gguf_source(str(model))
+    except ImportError:
+        is_gguf = False
+    if is_gguf:
+        # sylph: a GGUF carries its config; model_dir is the file (or the directory
+        # holding the parts) and family_config is the whole synthesized config.
+        config = _gguf_config(model)
+        family = family_for_config(config)
+        return ResolvedFamily(family, _normalize_model_type(config.get("model_type")),
+                              config, config, str(model))
     path = model / "config.json"
     try:
         config = json.loads(path.read_text(encoding="utf-8"))

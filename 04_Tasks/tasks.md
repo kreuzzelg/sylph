@@ -49,21 +49,21 @@ Pre-conditions (met 2026-10-05): architecture reviewed; `07_Tests/IntegrationTes
 
 Pre-conditions (met 2026-10-06): `07_Tests/IntegrationTest/src_facade.md` (+ runner, torch-free fixture generator, tokenizer corpus) and `07_Tests/SystemTest/lossless_oracle.md` written.
 
-- [ ] `src.h` façade; safetensors arm delegates verbatim to `st.h`
-- [ ] `qwen35_names.h` (table of ARCH §6.1)
-- [ ] `gguf_xform.h`: norm `1+w → w`, `ssm_a` handling (A1), v-head un-permutation for the 7 affected tensors, `Q8_0` split; `tests/test_gguf_xform.c` seeded from the audit
-- [ ] `ts_cfg` from `qwen35moe.*` keys + shapes (ARCH §6.2); `validate_cfg` reused
-- [ ] tokenizer array constructor (`pre = qwen35`), equality test vs `tokenizer.json` path and vs `llama-tokenize`
-- [ ] `model_init_range` / `load_tq` / `load_expert_merged` through the façade (container path byte-identical)
-- [ ] logprob dump (`PPL_DUMP=<file>` on the `PPL=1` path; format fixed in `lossless_oracle.md`: header line + `pos\ttarget\tlogprob\t<coli_logprob_tail>`)
-- [ ] `07_Tests/SystemTest/make_tiny_ref_logprobs.py` (torch, same format) and `compare_logprobs.py` (stdlib: top-1, mean/max |ΔNLL|, TF-NLL consistency)
-- [ ] `tools/st2gguf.py` per the contract in `src_facade.md` (stdlib; F32/F16/BF16/Q8_0; converter transforms; placeholder tokenizer; `qwen36_tensor_kinds` as the name contract)
-- [ ] `coli`/`family_registry`: GGUF source → family; `resource_plan` byte accounting
-- [ ] `tests/test_gguf_load.c` (no-arg suite + `<gguf> <hf_dir> [--tol f16]` cross-check) and `tests/test_tok_gguf.c` (`<gguf> <tokenizer.json> [corpus] [--llama-tokenize]`) per `src_facade.md`
-- [ ] `SNAP=<file.gguf>` selects the GGUF source in `qwen36.c`; startup `[GGUF]` line
-- [ ] `gguf-oracle` job in `.github/workflows/check.yml` (upstream's tiny-oracle recipe + st2gguf + GGUF runs + E1 subset)
+- [x] `src.h` façade (`ts_init/ts_find/ts_read_f32/ts_read_q8_split/ts_read_raw_rows/ts_expert`); the safetensors arm delegates verbatim to `st.h` — 2026-10-06
+- [x] `qwen35_names.h` (table of ARCH §6.1, both directions, per-expert slices)
+- [x] `gguf_xform.h`: norm `1+w → w`, `A_log = log(−ssm_a)` (A1 resolved: the engine keeps `dn_alog`; the round trip costs ≤ 4·2⁻²⁴ absolute), v-head un-permutation for the 7 tensors on f32 rows/elements/columns and on raw block rows/column blocks, `Q8_0` split via `gq.h`; pinned by `tests/test_gguf_load` (no separate `test_gguf_xform.c`)
+- [x] `cfg_from_gguf` in `qwen36.c` from `qwen35moe.*` keys + shapes (ARCH §6.2), layer kinds from the interval confirmed by tensor presence, NextN skipped; `validate_cfg` reused
+- [x] `load_tokenizer_gguf` (arrays; `pre = qwen35`); `tests/test_tok_gguf`: identical ids and decodes on all 52 corpus lines against Qwen's `tokenizer.json` (GGUF vocab padded with `[PADn]` to 248320); `--llama-tokenize` comparison left for the owner
+- [x] `model_init_range` / `load_t_n` / `load_tq` / `load_expert_merged` through the façade; `QW{kq,ktype,gs}` + `matmul_d` dispatch (Q8_0 split → `matmul_q_gs`, K-quants → `gq_matmul`); `Slot{kq,ktype,kbytes}` + `moe_gq_run`; xf_mode/tier guards (container path untouched)
+- [x] logprob dump (`PPL_DUMP=<file>` on the `PPL=1` path; header line + `pos\ttarget\tlogprob\t<coli_logprob_tail>`)
+- [x] `07_Tests/SystemTest/make_tiny_ref_logprobs.py` (torch) and `compare_logprobs.py` (stdlib); first execution in the `gguf-oracle` CI job
+- [x] `tools/st2gguf.py` per the contract in `src_facade.md` (stdlib; F32/F16/BF16/Q8_0; converter transforms; placeholder or JSON tokenizer; `qwen36_tensor_kinds` as the name contract)
+- [x] `family_registry.resolve_model` (config synthesized from the metadata), `resource_plan.analyze_model` (slices → expert bytes), `coli info/plan/doctor` and `require_model` on a GGUF path
+- [x] `tests/test_gguf_load.c` and `tests/test_tok_gguf.c` per `src_facade.md` (both in `make check`)
+- [x] `SNAP=<file.gguf>` (or a directory of parts) selects the GGUF source; startup `[GGUF] qwen35moe · N blocks · …` line
+- [x] `gguf-oracle` job in `.github/workflows/check.yml` (upstream's tiny-oracle recipe + st2gguf + GGUF runs + E1 subset) — first run pending
 - [ ] **System test `lossless_oracle.md`**: F32 GGUF token-exact 16/16 at cap 1/2/8 against upstream's torch-built `ref_full.json`; container run unchanged; E1 subset within the calibrated thresholds
-- [ ] `07_Tests/IntegrationTest/run_src_facade.py` passes (cases 0–4, 6, 7, 8; 5 with network)
+- [x] `07_Tests/IntegrationTest/run_src_facade.py` passes: `RESULT: ok (0 failures)`, all 8 cases including the network case (2026-10-06)
 
 ## Phase 4 — streaming + equivalence harness
 
@@ -94,5 +94,6 @@ Pre-conditions: `07_Tests/IntegrationTest/expert_streaming.md`, `07_Tests/System
 
 - [ ] upstream sync procedure documented and exercised once more (`git subtree pull`)
 - [ ] decide whether the `coli` launcher keeps its name in sylph
+- [ ] phase 4: `token_embd` lookup from the raw Q8_0 rows (`gq_embed_row`) instead of the f32 table the container path keeps (saves ~1.5 GB RSS on the 35B)
 - [ ] consolidate the two stdlib GGUF readers (`c/ggufinfo.py` from phase 1, upstream's `c/tools/gguf_reader.py` since v1.12.1) and reuse upstream's `tools/gguf_dequant.py` in Python tooling
 - [ ] Ollama blob inspection by the owner (`ollama show --modelfile`, `coli gguf inspect <blob>`)

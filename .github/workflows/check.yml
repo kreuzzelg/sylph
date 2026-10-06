@@ -21,6 +21,64 @@ jobs:
       - name: make check
         run: make -C 06_Code/c check
 
+  # sylph phase 3 -- the lossless oracle (07_Tests/SystemTest/lossless_oracle.md):
+  # upstream's torch-built tiny Qwen3.6 fixture through the container (unchanged)
+  # and through an F32 GGUF written by tools/st2gguf.py, token-exact against the
+  # transformers reference at several cache capacities, plus the E1 subset
+  # (PPL_DUMP vs torch log-probs). Same torch recipe as upstream's own job.
+  gguf-oracle:
+    name: "Linux (tiny Qwen3.6 oracle: container vs GGUF, torch reference)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: 06_Code/c/tools/oracle-requirements.txt
+      - name: Install torch (CPU) + transformers
+        run: pip install -r 06_Code/c/tools/oracle-requirements.txt
+      - name: Tiny fixture, container, GGUFs, reference log-probs
+        run: |
+          cd 06_Code/c
+          python3 tools/make_qwen36_tiny.py --out qwen36_tiny --ref-mode full --emit-ref qwen36_tiny/ref_full.json
+          python3 tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_c --ebits 8
+          python3 tools/st2gguf.py qwen36_tiny --out qwen36_tiny_f32.gguf --type f32
+          python3 tools/st2gguf.py qwen36_tiny --out qwen36_tiny_f16.gguf --type f16
+          python3 tools/st2gguf.py qwen36_tiny --out qwen36_tiny_q8_0.gguf --type q8_0 --expert-type q8_0
+          python3 ../../07_Tests/SystemTest/make_tiny_ref_logprobs.py qwen36_tiny qwen36_tiny/ref_full.json
+      - name: Build the engine and the façade test
+        run: make -C 06_Code/c qwen36 tests/test_gguf_load tests/test_tok_gguf
+      - name: Façade cross-check against the torch-built snapshot (F32 bit-exact, F16 one ulp)
+        run: |
+          cd 06_Code/c
+          ./tests/test_gguf_load qwen36_tiny_f32.gguf qwen36_tiny
+          ./tests/test_gguf_load qwen36_tiny_f16.gguf qwen36_tiny --tol f16
+      - name: Token-exact -- container unchanged and F32 GGUF, cache capacity 1, 2 and 8
+        run: |
+          cd 06_Code/c
+          for cap in 1 2 8; do
+            echo "::group::container cap=$cap"
+            COLI_DENSE_I8=0 SNAP=qwen36_tiny_c ./qwen36 "$cap" 8 qwen36_tiny/ref_full.json
+            echo "::endgroup::"
+            echo "::group::GGUF F32 cap=$cap"
+            COLI_DENSE_I8=0 SNAP=qwen36_tiny_f32.gguf ./qwen36 "$cap" 8 qwen36_tiny/ref_full.json
+            echo "::endgroup::"
+          done
+      - name: Reported, not required -- F16 and Q8_0 GGUF
+        run: |
+          cd 06_Code/c
+          COLI_DENSE_I8=0 SNAP=qwen36_tiny_f16.gguf  ./qwen36 2 8 qwen36_tiny/ref_full.json || true
+          COLI_DENSE_I8=0 SNAP=qwen36_tiny_q8_0.gguf ./qwen36 2 8 qwen36_tiny/ref_full.json || true
+          COLI_DENSE_I8=1 SNAP=qwen36_tiny_q8_0.gguf ./qwen36 2 8 qwen36_tiny/ref_full.json || true
+      - name: E1 subset -- PPL_DUMP of the F32 GGUF vs the torch log-probs
+        run: |
+          cd 06_Code/c
+          PPL=1 PPL_DUMP=dump_f32.tsv COLI_DENSE_I8=0 SNAP=qwen36_tiny_f32.gguf ./qwen36 8 8 qwen36_tiny/ref_full.json | tee ppl.log
+          nll=$(grep -oP 'TF-NLL: \K[0-9.]+' ppl.log)
+          python3 ../../07_Tests/SystemTest/compare_logprobs.py qwen36_tiny/ref_logprobs.tsv dump_f32.tsv --tf-nll "$nll"
+
   macos:
     runs-on: macos-latest
     steps:

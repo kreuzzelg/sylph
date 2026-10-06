@@ -364,6 +364,13 @@ def require_model(model, file="tokenizer.json", engine=None, target="", build="c
     """
     if not model:
         sys.exit(f"{C.yel}no model directory given.{C.r}\n  {NO_MODEL_HINT}")
+    from ggufinfo import is_gguf_source
+    if is_gguf_source(model):
+        # sylph: a GGUF carries config and tokenizer itself; only the engine must exist
+        if engine and not os.path.exists(engine):
+            label = f"{target} " if target else ""
+            sys.exit(f"{C.yel}{label}engine is not built.{C.r} Run: {build}")
+        return
     if not os.path.isdir(model):
         sys.exit(f"{C.yel}model not found:{C.r} {model}\n  set COLI_MODEL or use --model")
     if file and not os.path.exists(os.path.join(model, file)):
@@ -1174,6 +1181,13 @@ def cmd_build(a):
     sys.exit(subprocess.call(["make","-C",HERE,target]))
 
 def cmd_info(a):
+    from ggufinfo import is_gguf_source
+    if a.model and is_gguf_source(a.model):
+        # sylph: the metadata view is the model card of a GGUF source
+        import ggufinfo
+        parts = ggufinfo.open_set(a.model, os.environ.get("COLI_MODEL_DIRS", ""))
+        print(ggufinfo.format_inspect(parts, ggufinfo.summarize(parts)))
+        return
     banner("info", model=a.model)
     if not a.model:
         sys.exit(f"{C.yel}no model directory given.{C.r}\n  {NO_MODEL_HINT}")

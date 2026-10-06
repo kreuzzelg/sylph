@@ -60,6 +60,7 @@ static int qwen36_max_ctx(void) {
 #include "serve_poll.h"       /* CANCEL a meta' turno (#1332) */
 #include "cli_args.h"
 #include "st.h"
+#include "src.h"          /* sylph: tensor-source façade (safetensors container | GGUF), gq.h kernels */
 #include "omp_tune.h"
 #include "kv_prefix.h"
 #include "pin_pool.h"   /* riuso del prefisso tra turni (shared) */
@@ -424,6 +425,58 @@ static void load_tokenizer(const char *path){
     free(buf);
 }
 
+/* sylph: the same tables from a GGUF's tokenizer.ggml.* arrays. token_type:
+ * 1 normal, 3 control (the JSON's special added tokens: decode to nothing),
+ * 4 user-defined (the non-special added tokens: <think> & co., decoded),
+ * 5 unused ([PADn] placeholders). Added tokens of both kinds go to the
+ * specials list the encoder splits on first, as load_tokenizer does with
+ * added_tokens. merges are "a b" strings. */
+static void load_tokenizer_gguf(const GgufSet *G){
+    int64_t n = gguf_kv_arr_len(G, "tokenizer.ggml.tokens");
+    if (n <= 0) { fprintf(stderr, "[tok] GGUF has no tokenizer.ggml.tokens\n"); return; }
+    const char *pre = gguf_kv_str(G, "tokenizer.ggml.pre");
+    if (pre && strcmp(pre, "qwen35") && strcmp(pre, "qwen2"))
+        fprintf(stderr, "[tok] tokenizer.ggml.pre is '%s'; this engine's pre-tokenizer is Qwen's (qwen35) -- ids may differ\n", pre);
+    int64_t nt = gguf_kv_arr_len(G, "tokenizer.ggml.token_type");
+    g_tok = calloc((size_t)n, sizeof(char*));
+    int nadded = 0;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t ty = 1; if (nt == n) gguf_kv_arr_i64(G, "tokenizer.ggml.token_type", i, &ty);
+        if (ty == 3 || ty == 4) nadded++;
+        if (ty == 3) continue;                       /* control: never decoded */
+        const char *s = gguf_kv_arr_str(G, "tokenizer.ggml.tokens", i);
+        if (s) g_tok[i] = strdup(s);
+    }
+    g_tok_n = (int)n;
+    smap_init(&g_rev, 1<<19);
+    for (int i=0;i<g_tok_n;i++) if (g_tok[i]) smap_put(&g_rev, g_tok[i], i);
+    smap_init(&g_merge, 1<<19);
+    int64_t nm = gguf_kv_arr_len(G, "tokenizer.ggml.merges");
+    for (int64_t r = 0; r < nm; r++) {
+        const char *mk = gguf_kv_arr_str(G, "tokenizer.ggml.merges", r); if (!mk) continue;
+        const char *sp = strchr(mk, ' '); if (!sp) continue;
+        int la = (int)(sp - mk), lb = (int)strlen(sp + 1);
+        char *key = malloc((size_t)la + 1 + (size_t)lb + 1);
+        memcpy(key, mk, (size_t)la); key[la] = 0x1F; memcpy(key + la + 1, sp + 1, (size_t)lb); key[la + 1 + lb] = 0;
+        smap_put(&g_merge, key, (int)r);
+    }
+    if (nadded && g_nspecial == 0) {
+        g_nspecial = nadded;
+        g_sp_str = malloc((size_t)nadded*sizeof(char*)); g_sp_id = malloc((size_t)nadded*sizeof(int)); g_sp_len = malloc((size_t)nadded*sizeof(int));
+        int k = 0;
+        for (int64_t i = 0; i < n && k < nadded; i++) {
+            int64_t ty = 1; if (nt == n) gguf_kv_arr_i64(G, "tokenizer.ggml.token_type", i, &ty);
+            if (ty != 3 && ty != 4) continue;
+            const char *s = gguf_kv_arr_str(G, "tokenizer.ggml.tokens", i);
+            g_sp_str[k] = strdup(s ? s : ""); g_sp_id[k] = (int)i; g_sp_len[k] = (int)strlen(g_sp_str[k]); k++;
+        }
+        g_nspecial = k;
+    }
+    build_byte_sym();
+    fprintf(stderr, "[tok] loaded %lld pieces (%lld merges, %d added) from the GGUF metadata (pre %s)\n",
+            (long long)n, (long long)(nm < 0 ? 0 : nm), nadded, pre ? pre : "?");
+}
+
 /* Decode token ids to text using g_tok, writing to stdout. Handles Qwen's
  * byte-representation markers (Ġ=space, Ċ=newline, ▁=space) and <0xXX> byte
  * fallback. Only active when a tokenizer was loaded. */
@@ -703,10 +756,14 @@ typedef struct {
  * tier uploads). q4/sg: the same matrix as int4 planar blocks of 64 with one
  * scale per group (COLI_DENSE_BITS=4), the layout the K1b grouped kernel
  * reads; ng = I/64 groups per row. */
-typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; float *sg; int ng; } QW;
+/* kq/ktype: a GGUF dense matrix kept as the raw ggml blocks the author
+ * quantized (K-quants: the lm_head), run by gq_matmul. gs: the int8 plane
+ * carries one scale per `gs` inputs (GGUF Q8_0 split losslessly into
+ * gsgemv.h's layout, gs = 32) instead of one per row. */
+typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; float *sg; int ng; uint8_t *kq; int ktype; int gs; } QW;
 static void qw_free(QW *w) {
-    free((void*)w->w); free(w->q); free(w->sc); free(w->q4); free(w->sg);
-    w->w = NULL; w->q = NULL; w->sc = NULL; w->q4 = NULL; w->sg = NULL; w->ng = 0;
+    free((void*)w->w); free(w->q); free(w->sc); free(w->q4); free(w->sg); free(w->kq);
+    w->w = NULL; w->q = NULL; w->sc = NULL; w->q4 = NULL; w->sg = NULL; w->ng = 0; w->kq = NULL; w->ktype = 0; w->gs = 0;
 }
 
 /* ---------- per-layer dense weights ---------- */
@@ -731,7 +788,11 @@ typedef struct {
 /* pw: the expert as expert_ffn.h wants it (planar int4, gate|up|down), the
  * only weight copy a slot holds when the shared kernel is active; g/u/d and
  * g4/u4/d4 are then NULL. */
-typedef struct { int eid; int pinned; int is_int4; int8_t *g, *u, *d; uint8_t *g4, *u4, *d4; uint8_t *pw; float *gs, *us, *ds; uint64_t used; } Slot;
+/* kq/ktype/kbytes: the GGUF flavour -- the three raw block slices of
+ * ffn_{gate,up,down}_exps as stored (gq_moe_run computes on them); g/u/d, pw
+ * and the scales are then NULL. */
+typedef struct { int eid; int pinned; int is_int4; int8_t *g, *u, *d; uint8_t *g4, *u4, *d4; uint8_t *pw; float *gs, *us, *ds; uint64_t used;
+                 uint8_t *kq; int ktype[3]; size_t kbytes[3]; } Slot;
 typedef struct {
     Slot *slots;
     int *slot_by_expert;                  /* expert id -> resident slot, -1 if absent */
@@ -749,6 +810,9 @@ typedef struct {
 typedef struct {
     Cfg c;
     shards S;
+    TensorSource src;       /* sylph: where the weights come from (S for the container, GGUF otherwise) */
+    int is_gguf;
+    size_t gguf_slot_bytes; /* largest expert (three slices) over all blocks */
     int quant_bits;
     float *embed, *final_norm;
     QW lm_head;
@@ -1050,6 +1114,7 @@ static int xf_act_mode(void){ static int v=-1; if(v<0){ const char *e=getenv("QW
 static int xf_mode(Model *m) {
     static int v = -1;
     if (v >= 0) return v;
+    if (m->is_gguf) { v = 0; return 0; }   /* GGUF experts run on gq_moe_run (K-quant twin of this kernel) */
     const char *e = getenv("QWEN_EXPERT_KERNEL");
     int on = !(e && *e == '0');
 #ifdef COLI_CUDA
@@ -1233,6 +1298,11 @@ static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O)
 #ifdef COLI_QWEN_BATCH_TEST
     g_qwen_matmul_d_calls++;
 #endif
+    /* sylph: GGUF matrices as stored -- raw K-quant blocks (gq.h) or the
+     * Q8_0 split with one scale per 32 inputs (gsgemv.h's group kernel). The
+     * per-row paths below assume one scale per row and never see these. */
+    if (w->kq) { for (int s = 0; s < S; s++) gq_matmul(y+(int64_t)s*O, x+(int64_t)s*I, w->ktype, w->kq, I, O); return; }
+    if (w->q && w->gs) { for (int s = 0; s < S; s++) matmul_q_gs(y+(int64_t)s*O, x+(int64_t)s*I, w->q, w->sc, I, O, w->gs); return; }
     if (w->q) {
         if (w->q4 || dense_idot_on()) {
             /* integer dot: the activation rows to int8 once, then the K1b
@@ -1271,11 +1341,11 @@ static inline int qtd(int hp1, float *y, const float *x, int I, int O){
 /* Bytes of w's dense-i8 copy (int8 rows + per-row scales), 0 when there is
  * none (COLI_DENSE_I8=0): nothing to offer, the CPU path stands. */
 static size_t qdw_bytes(const QW *w){
-    return w->q ? (size_t)w->I * w->O + (size_t)w->O * sizeof(float) : 0;
+    return (w->q && !w->gs) ? (size_t)w->I * w->O + (size_t)w->O * sizeof(float) : 0;   /* GGUF group-scaled / K-quant: nothing to offer (phase 5) */
 }
 /* Upload w's dense-i8 copy to `dev`; handle+1, or 0 when it stays on the CPU. */
 static int qdw_place(const QW *w, int dev){
-    if (dev == QT_PLACE_CPU || !w->q) return 0;
+    if (dev == QT_PLACE_CPU || !w->q || w->gs) return 0;
     int h = qt_dense_init(w->q, w->sc, w->I, w->O, dev);
     return h >= 0 ? h + 1 : 0;
 }
@@ -1479,20 +1549,103 @@ static void load_meta(Cfg *c, const char *snap) {
                c->dn_vheads, c->dn_kheads, c->dn_kdim, c->dn_vdim, c->dn_convk, c->dn_conv_dim);
 }
 
+/* sylph: Cfg from a qwen35moe GGUF (architecture §6.2). Every dimension the
+ * container path takes from config.json + qwen36_meta.json comes from the
+ * qwen35moe.* keys or from tensor shapes; validate_cfg runs afterwards as for
+ * the container. Layer kinds come from full_attention_interval AND must agree
+ * with the tensors each block carries (FR-23). NextN blocks are skipped. */
+static void cfg_from_gguf(Model *m) {
+    Cfg *c = &m->c; TensorSource *ts = &m->src; GgufSet *G = &ts->G;
+#define GK(key) gguf_kv_i64_or(G, "qwen35moe." key, -1)
+    int64_t blocks = GK("block_count"), nextn = gguf_kv_i64_or(G, "qwen35moe.nextn_predict_layers", 0);
+    CFG_NEED(blocks > 0 && blocks <= 512 && nextn >= 0 && nextn < blocks, "qwen35moe.block_count %lld / nextn_predict_layers %lld out of range", (long long)blocks, (long long)nextn);
+    c->n_layers = (int)(blocks - nextn);
+    c->hidden = (int)GK("embedding_length");
+    c->q_heads = (int)GK("attention.head_count"); c->kv_heads = (int)GK("attention.head_count_kv");
+    c->head_dim = (int)GK("attention.key_length");
+    int64_t vlen = GK("attention.value_length"); CFG_NEED(vlen == c->head_dim, "attention.value_length %lld != key_length %d", (long long)vlen, c->head_dim);
+    c->k_head_dim = c->v_head_dim = c->head_dim;
+    c->n_experts = (int)GK("expert_count"); c->topk = (int)GK("expert_used_count");
+    c->inter = (int)GK("expert_feed_forward_length");
+    int64_t sh = GK("expert_shared_feed_forward_length"); c->shared_inter = sh > 0 ? (int)sh : c->inter;
+    double eps = 1e-6, theta = 10000.0;
+    gguf_kv_f64(G, "qwen35moe.attention.layer_norm_rms_epsilon", &eps); gguf_kv_f64(G, "qwen35moe.rope.freq_base", &theta);
+    c->eps = (float)eps; c->theta = (float)theta;
+    int64_t rot = GK("rope.dimension_count");
+    CFG_NEED(c->hidden > 0 && c->q_heads > 0 && c->kv_heads > 0 && c->head_dim > 0 && c->n_experts > 0 && c->topk > 0 && c->inter > 0,
+             "qwen35moe.* keys incomplete (embedding_length %d, head_count %d/%d, key_length %d, expert_count %d, expert_used_count %d, expert_feed_forward_length %d)",
+             c->hidden, c->q_heads, c->kv_heads, c->head_dim, c->n_experts, c->topk, c->inter);
+    CFG_NEED(rot > 0 && rot <= c->head_dim && rot % 2 == 0, "rope.dimension_count %lld invalid for head_dim %d", (long long)rot, c->head_dim);
+    c->rotary_dim = (int)rot; c->rope_dim = c->head_dim; c->partial_rotary_factor = (float)rot / (float)c->head_dim;
+    c->dn_vheads = (int)GK("ssm.time_step_rank"); c->dn_kheads = (int)GK("ssm.group_count");
+    c->dn_kdim = c->dn_vdim = (int)GK("ssm.state_size"); c->dn_convk = (int)GK("ssm.conv_kernel");
+    int64_t inner = GK("ssm.inner_size");
+    CFG_NEED(inner == (int64_t)c->dn_vheads * c->dn_vdim, "ssm.inner_size %lld != time_step_rank*state_size (%d*%d)", (long long)inner, c->dn_vheads, c->dn_vdim);
+    c->dn_conv_dim = 2 * c->dn_kheads * c->dn_kdim + c->dn_vheads * c->dn_vdim;
+    c->n_group = 1; c->topk_group = 1; c->norm_topk = 0; c->has_bias = gguf_find(G, "blk.0.exp_probs_b.bias") != NULL;
+    c->expert_gs = 0; c->expert_down_bits = 0; c->expert_down_gs = 0;
+    int64_t ntok = gguf_kv_arr_len(G, "tokenizer.ggml.tokens");
+    GgufTensor *emb = gguf_find(G, "token_embd.weight"), *outw = gguf_find(G, "output.weight");
+    CFG_NEED(emb && emb->n_dims == 2 && emb->ne[0] == c->hidden, "token_embd.weight missing or not {%d, vocab}", c->hidden);
+    c->vocab = (int)(ntok > 0 ? ntok : emb->ne[1]);
+    CFG_NEED(c->vocab == emb->ne[1] && (!outw || outw->ne[1] == c->vocab), "vocab %d disagrees with token_embd/output rows", c->vocab);
+    /* layer kinds: the interval says, the tensors confirm */
+    int64_t interval = GK("full_attention_interval"); if (interval <= 0) interval = 4;
+    c->is_attn = calloc((size_t)c->n_layers, sizeof(uint8_t)); c->n_active = 0;
+    int first_attn = -1;
+    for (int i = 0; i < c->n_layers; i++) {
+        char a[64], d[64]; snprintf(a, sizeof a, "blk.%d.attn_q.weight", i); snprintf(d, sizeof d, "blk.%d.attn_qkv.weight", i);
+        int has_q = gguf_find(G, a) != NULL, has_qkv = gguf_find(G, d) != NULL;
+        int say_attn = ((i + 1) % interval) == 0;
+        CFG_NEED(has_q || has_qkv, "block %d: missing %s (neither attn_q nor attn_qkv is present)", i, say_attn ? a : d);
+        CFG_NEED(!(has_q && has_qkv), "block %d carries both attn_q and attn_qkv -- cannot tell its layer kind", i);
+        CFG_NEED(has_q == say_attn, "layer kind mismatch at block %d: full_attention_interval %lld says %s but the block carries %s",
+                 i, (long long)interval, say_attn ? "attention" : "DeltaNet", has_q ? "attn_q (attention)" : "attn_qkv (DeltaNet)");
+        c->is_attn[i] = (uint8_t)has_q; if (has_q) { c->n_active++; if (first_attn < 0) first_attn = i; }
+    }
+    c->attn_output_gate = 1; c->has_qk_norm = 1; c->q_head_dim = 2 * c->head_dim; c->o_in = c->q_heads * c->head_dim;
+    if (first_attn >= 0) {
+        char nm[64]; snprintf(nm, sizeof nm, "blk.%d.attn_q.weight", first_attn); GgufTensor *q = gguf_find(G, nm);
+        snprintf(nm, sizeof nm, "blk.%d.attn_output.weight", first_attn); GgufTensor *o = gguf_find(G, nm);
+        snprintf(nm, sizeof nm, "blk.%d.attn_q_norm.weight", first_attn);
+        CFG_NEED(q && o && q->ne[1] % c->q_heads == 0, "block %d: attn_q/attn_output missing or attn_q rows not a multiple of head_count", first_attn);
+        c->q_head_dim = (int)(q->ne[1] / c->q_heads); c->attn_output_gate = c->q_head_dim == 2 * c->head_dim;
+        c->o_in = (int)o->ne[0]; c->has_qk_norm = gguf_find(G, nm) != NULL;
+    }
+    /* geometry for the un-permutations, and the expert slab size */
+    ts->vh = c->dn_vheads; ts->vk = c->dn_kheads; ts->vdim = c->dn_vdim; ts->kdim = c->dn_kdim; ts->convk = c->dn_convk;
+    ts->n_layers = c->n_layers; ts->nextn = (int)nextn;
+    m->gguf_slot_bytes = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        TsExpert e; CFG_NEED(ts_expert(ts, i, 0, &e) == 0, "block %d has no ffn_{gate,up,down}_exps tensors", i);
+        CFG_NEED(e.cols[0] == c->hidden && e.rows[0] == c->inter && e.cols[1] == c->hidden && e.rows[1] == c->inter && e.cols[2] == c->inter && e.rows[2] == c->hidden,
+                 "block %d expert tensors {%lld,%lld}/{%lld,%lld}/{%lld,%lld} do not match hidden %d / expert_feed_forward_length %d",
+                 i, (long long)e.cols[0], (long long)e.rows[0], (long long)e.cols[1], (long long)e.rows[1], (long long)e.cols[2], (long long)e.rows[2], c->hidden, c->inter);
+        if (ts_expert_bytes(&e) > m->gguf_slot_bytes) m->gguf_slot_bytes = ts_expert_bytes(&e);
+    }
+    char line[1024]; ts_describe(ts, line, sizeof line);
+    fprintf(stderr, "%s · %.2f MB per expert slot\n", line, m->gguf_slot_bytes / 1048576.0);
+    if (nextn) fprintf(stderr, "[GGUF] skipping %lld NextN (MTP) block%s (blk.%d..); the engine predicts one token per step\n", (long long)nextn, nextn > 1 ? "s" : "", c->n_layers);
+    fprintf(stderr, "[meta] from GGUF: q_heads=%d kv_heads=%d head_dim=%d q_head_dim=%d o_in=%d rotary_dim=%d n_experts=%d topk=%d inter=%d shared_inter=%d attn_output_gate=%d n_active=%d | DeltaNet vheads=%d kheads=%d kdim=%d vdim=%d convk=%d conv_dim=%d\n",
+            c->q_heads, c->kv_heads, c->head_dim, c->q_head_dim, c->o_in, c->rotary_dim, c->n_experts, c->topk, c->inter, c->shared_inter,
+            c->attn_output_gate, c->n_active, c->dn_vheads, c->dn_kheads, c->dn_kdim, c->dn_vdim, c->dn_convk, c->dn_conv_dim);
+#undef GK
+}
+
 /* `want` is the element count the forward pass will index with. The container
  * is a file, not an invariant: this used to allocate whatever st_numel reported
  * while every read afterwards used CONFIG dims, so a short tensor was a plain
  * heap OOB read (embed is indexed as m->embed + ids[s]*D). The expert path
  * already refuses a wrong size; this is the same discipline for the dense set. */
 static float *load_t_n(Model *m, const char *name, int64_t want) {
-    int64_t n = st_numel(&m->S, name);
-    if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
+    int64_t n = ts_numel(&m->src, name);
+    if (n < 0) { if (m->is_gguf) ts_refuse_missing(&m->src, name); fprintf(stderr, "missing %s\n", name); exit(1); }
     if (want > 0 && n != want) {
         fprintf(stderr, "%s: %lld elements, config implies %lld -- refusing\n",
                 name, (long long)n, (long long)want); exit(1);
     }
     float *p = falloc(n);
-    st_read_f32(&m->S, name, p, 0);
+    ts_read_f32(&m->src, name, p, n);
     return p;
 }
 
@@ -1508,10 +1661,38 @@ static float *load_t_n(Model *m, const char *name, int64_t want) {
  * model_init_range/load_t_n, never main()'s dense-i8 block) -- passing it
  * through keeps their f32-only behavior exactly as it was; `tag` is unused
  * on that path. */
+static int g_gguf_q8_split = 0, g_gguf_kq = 0, g_gguf_f32 = 0;   /* how the GGUF dense set was taken (startup line) */
 static void load_tq(Model *m, const char *name, int I, int O, int quantize, const char *tag, QW *out) {
+    memset(out, 0, sizeof *out); out->I = I; out->O = O;
+    if (m->is_gguf) {
+        /* FR-8/NFR-3: the author's bytes, never re-quantized. Q8_0 becomes the
+         * int8 plane + per-32 scales gsgemv.h's group kernel reads (lossless);
+         * K-quants stay raw blocks for gq_matmul; F32/F16/BF16 take the same
+         * int8-at-load path a container's f16 does. With the int8 path off
+         * (COLI_DENSE_I8=0) or when a permuted Q8_0 matrix cannot move whole
+         * blocks, the exact dequantization to f32 is used instead. */
+        int t = ts_ggml_type(&m->src, name);
+        if (quantize && dense_i8_on()) {
+            if (t == GQ_Q8_0) {
+                int8_t *q = malloc((size_t)I * O); float *sc = malloc((size_t)O * (size_t)(I / 32) * sizeof(float));
+                if (!q || !sc) { fprintf(stderr, "OOM load_tq %s\n", name); exit(1); }
+                if (!ts_read_q8_split(&m->src, name, I, O, q, sc)) { out->q = q; out->sc = sc; out->gs = 32; g_gguf_q8_split++; return; }
+                free(q); free(sc);
+            } else if (t == GQ_Q4_K || t == GQ_Q5_K || t == GQ_Q6_K || t == GQ_Q4_0) {
+                uint8_t *raw; size_t nb;
+                if (!ts_read_raw_rows(&m->src, name, I, O, &raw, &nb)) { out->kq = raw; out->ktype = t; g_gguf_kq++; return; }
+            }
+        }
+        float *p = load_t_n(m, name, (int64_t)I * O);
+        out->w = p;
+        if (quantize && dense_i8_on() && (t == GQ_F32 || t == GQ_F16 || t == GQ_BF16)) {
+            qw_quantize(p, I, O, tag, out);
+            if (getenv("COLI_KEEP_F32")) out->w = p; else { free(p); out->w = NULL; }
+        } else g_gguf_f32++;
+        return;
+    }
     float *p = load_t_n(m, name, (int64_t)I * O);
-    out->w = p; out->q = NULL; out->sc = NULL; out->I = I; out->O = O;
-    out->q4 = NULL; out->sg = NULL; out->ng = 0;
+    out->w = p;
     if (!quantize || !dense_i8_on()) return;
     qw_quantize(p, I, O, tag, out);
     if (getenv("COLI_KEEP_F32")) out->w = p; else { free(p); out->w = NULL; }
@@ -1522,9 +1703,20 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
                              int load_boundaries, int allocate_state) {
     memset(m, 0, sizeof(*m));
     m->quant_bits = bits;
-    load_cfg(&m->c, snap);
-    int n_layers_from_config = m->c.n_layers;
-    load_meta(&m->c, snap);
+    int n_layers_from_config;
+    m->is_gguf = ts_is_gguf_path(snap);
+    if (m->is_gguf) {
+        /* sylph: a GGUF carries config, names and tokenizer itself (no
+         * config.json / qwen36_meta.json); open it first, then read Cfg from
+         * its qwen35moe.* keys and tensor shapes. */
+        ts_init(&m->src, &m->S, snap, NULL);
+        cfg_from_gguf(m);
+        n_layers_from_config = m->c.n_layers;
+    } else {
+        load_cfg(&m->c, snap);
+        n_layers_from_config = m->c.n_layers;
+        load_meta(&m->c, snap);
+    }
     validate_cfg(&m->c, n_layers_from_config);
     /* load_cfg and validate_cfg both guard n_layers, but the compiler can't see
      * across function boundaries, so re-assert here to silence -Walloc-size-larger-than. */
@@ -1532,7 +1724,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     if (m->c.rotary_dim > m->c.head_dim || m->c.rotary_dim % 2 != 0) {
         fprintf(stderr, "rotary_dim %d invalid for head_dim %d\n", m->c.rotary_dim, m->c.head_dim); exit(1);
     }
-    st_init(&m->S, snap);
+    if (!m->is_gguf) ts_init(&m->src, &m->S, snap, NULL);   /* the container arm: st_init, verbatim */
     Cfg *c = &m->c;
     if (layer_end == 0) layer_end = c->n_layers;
     if (layer_begin < 0 || layer_end > c->n_layers ||
@@ -1578,13 +1770,13 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         /* q/k norms are per-head [head_dim]; only on attention layers, load if present */
         if (c->has_qk_norm) {
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.q_norm.weight", ai);
-            l->qn = st_has(&m->S, nm) ? load_t_n(m, nm, c->head_dim) : NULL;
+            l->qn = ts_has(&m->src, nm) ? load_t_n(m, nm, c->head_dim) : NULL;
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.k_norm.weight", ai);
-            l->kn = st_has(&m->S, nm) ? load_t_n(m, nm, c->head_dim) : NULL;
+            l->kn = ts_has(&m->src, nm) ? load_t_n(m, nm, c->head_dim) : NULL;
         } else { l->qn = NULL; l->kn = NULL; }
         /* router correction bias (optional) */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.e_score_correction_bias", ai);
-        if (st_has(&m->S, nm)) { l->gate_bias = falloc(c->n_experts); st_read_f32(&m->S, nm, l->gate_bias, 0); }
+        if (ts_has(&m->src, nm)) { l->gate_bias = falloc(c->n_experts); ts_read_f32(&m->src, nm, l->gate_bias, c->n_experts); }
         else l->gate_bias = NULL;
         /* shared expert (dense, int8-during-load) */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert.gate_proj.weight", ai);
@@ -1595,7 +1787,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         load_tq(m, nm, c->shared_inter, c->hidden, quantize_dense, "shexp", &l->sh_d); QCOUNT(l->sh_d);
         /* shared_expert_gate: Linear(hidden -> 1), sigmoid-gated shared expert */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert_gate.weight", ai);
-        l->sh_gate = st_has(&m->S, nm) ? load_t_n(m, nm, c->hidden) : NULL;
+        l->sh_gate = ts_has(&m->src, nm) ? load_t_n(m, nm, c->hidden) : NULL;
         if (c->is_attn[i]) {
             /* Gated Attention (full_attention) layer, dense projections int8-during-load */
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.q_proj.weight", ai);
@@ -1679,8 +1871,18 @@ static int down_gs_of(const Cfg *c){ return c->expert_down_bits ? c->expert_down
 static int64_t scale_count_d (const Cfg *c){ int gs = down_gs_of(c); return gs ? (int64_t)c->hidden * ((c->inter + gs - 1) / gs) : c->hidden; }
 
 static void slot_ensure_allocated(Model *m, Slot *s) {
-    if (s->g || s->pw) return;
+    if (s->g || s->pw || s->kq) return;
     Cfg *c = &m->c;
+    if (m->is_gguf) {
+        /* GGUF flavour: one slab for the three raw slices, sized for the
+         * largest expert of any block (ffn_down_exps alternates Q5_K/Q6_K in
+         * unsloth's files). No scales: they live inside the blocks. */
+        s->kq = malloc(m->gguf_slot_bytes);
+        if (!s->kq) { fprintf(stderr, "Error: OOM allocating slot weights\n"); exit(1); }
+        s->g = s->u = s->d = NULL; s->g4 = s->u4 = s->d4 = NULL; s->pw = NULL; s->gs = s->us = s->ds = NULL;
+        s->pinned = 0; s->is_int4 = 0;
+        return;
+    }
     int64_t ng = (int64_t)c->inter * c->hidden;
     int64_t nd = (int64_t)c->hidden * c->inter;
     if (xf_mode(m)) {
@@ -1764,7 +1966,18 @@ static void unpack_int4_to_int8(int8_t *out, const uint8_t *raw, int64_t n)
     }
 }
 
+/* GGUF arm: expert `eid` of block `layer` = three contiguous slices of the 3-D
+ * expert tensors, read as stored (FR-27: the slot keeps raw K-quant blocks). */
+static void load_expert_gguf(Model *m, int layer, int eid, Slot *s) {
+    TsExpert e;
+    if (ts_expert(&m->src, layer, eid, &e)) { fprintf(stderr, "[GGUF] block %d has no ffn_*_exps tensors\n", layer); exit(1); }
+    if (ts_expert_bytes(&e) > m->gguf_slot_bytes) { fprintf(stderr, "[GGUF] block %d expert %d: %zu bytes exceed the slot (%zu)\n", layer, eid, ts_expert_bytes(&e), m->gguf_slot_bytes); exit(1); }
+    uint8_t *p = s->kq;
+    for (int k = 0; k < 3; k++) { ts_read_expert_slice(&m->src, &e, k, p); s->ktype[k] = e.type[k]; s->kbytes[k] = e.bytes[k]; p += e.bytes[k]; }
+    s->is_int4 = 0;
+}
 static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
+    if (m->is_gguf) { load_expert_gguf(m, layer, eid, s); return; }
     char nm[256], qsnm[256];
     int la = m->active_of[layer];   /* container stores experts under active index */
     snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.merged_weight", la, eid);
@@ -1856,6 +2069,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
  * stores true int4 packed weights, 0 otherwise.  Used to pick the Vulkan
  * pipeline at init time. */
 static int container_layer_is_int4(Model *m, int layer) {
+    if (m->is_gguf) return 0;
     Cfg *cc = &m->c;
     int64_t ng = (int64_t)cc->inter * cc->hidden, nd = (int64_t)cc->hidden * cc->inter;
     int64_t want_w = ng + ng + nd;
@@ -2273,6 +2487,45 @@ static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, c
     free(ex); free(exp); free(ridx); free(rval); free(tmp); free(scratch);
 }
 
+/* sylph: the GGUF twin of moe_xf_run -- same batching by cache capacity, the
+ * experts handed to gq_moe_run as the three raw slices their slot holds. */
+static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, const int *idx, const float *val) {
+    Cfg *c = &m->c; int D = c->hidden, K = c->topk, F = c->inter;
+    int cap = m->cache[layer].cap;
+    int per = cap >= S * K ? S : 1;
+    int kper = cap >= K ? K : 1;
+    int n = per * kper;
+    GqExpert *ex = malloc(sizeof(GqExpert) * (size_t)n);
+    const GqExpert **exp = malloc(sizeof(GqExpert *) * (size_t)n);
+    int *ridx = malloc(sizeof(int) * (size_t)n); float *rval = falloc(n);
+    float *tmp = kper < K ? falloc(D) : NULL;
+    void *scratch = malloc(gq_moe_scratch_bytes(per, kper, D, F));
+    if (!ex || !exp || !ridx || !scratch) { fprintf(stderr, "OOM moe_gq_run\n"); exit(1); }
+    int timed = tm_on() && S == 1;
+    for (int s0 = 0; s0 < S; s0 += per) {
+        for (int k0 = 0; k0 < K; k0 += kper) {
+            double t0 = timed ? tm_now() : 0;
+            for (int s = 0; s < per; s++) for (int k = 0; k < kper; k++) {
+                int src = (s0 + s) * K + (k0 + k), dst = s * kper + k;
+                ridx[dst] = idx[src]; rval[dst] = val[src]; exp[dst] = NULL;
+                if (idx[src] < 0) continue;
+                Slot *e; expert_get(m, layer, idx[src], &e);
+                ex[dst].g = e->kq; ex[dst].u = e->kq + e->kbytes[0]; ex[dst].d = e->kq + e->kbytes[0] + e->kbytes[1];
+                ex[dst].tg = e->ktype[0]; ex[dst].tu = e->ktype[1]; ex[dst].td = e->ktype[2];
+                exp[dst] = &ex[dst];
+            }
+            double t1 = timed ? tm_now() : 0;
+            if (kper == K) gq_moe_run(out + (int64_t)s0 * D, x + (int64_t)s0 * D, per, K, D, F, ridx, rval, exp, scratch);
+            else {
+                gq_moe_run(tmp, x + (int64_t)s0 * D, 1, 1, D, F, ridx, rval, exp, scratch);
+                float *os = out + (int64_t)s0 * D; for (int d = 0; d < D; d++) os[d] += tmp[d];
+            }
+            if (timed) { double t2 = tm_now(); g_xf_load += t1 - t0; g_xf_run += t2 - t1; }
+        }
+    }
+    free(ex); free(exp); free(ridx); free(rval); free(tmp); free(scratch);
+}
+
 /* ---------- CACHE_ROUTE: residency-aware top-K fill (docs/CACHE_ROUTE.md) ----------
  * The GLM engine's max-rank lever (arXiv:2412.00099) with one more level: an
  * expert already in the VRAM tier outranks one that is only in the RAM cache,
@@ -2383,9 +2636,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
     float *sh = falloc(I), *shu = falloc(I), *shd = falloc(D);  /* shared expert scratch */
     int use_qt = qt_ready();
-    int use_xf = !use_qt && xf_mode(m);
-    int *xidx = use_xf ? malloc(sizeof(int) * (size_t)S * K) : NULL;
-    float *xval = use_xf ? falloc((int64_t)S * K) : NULL;
+    int use_gq = !use_qt && m->is_gguf;         /* sylph: raw K-quant experts, gq_moe_run */
+    int use_xf = !use_qt && !use_gq && xf_mode(m);
+    int *xidx = (use_xf || use_gq) ? malloc(sizeof(int) * (size_t)S * K) : NULL;
+    float *xval = (use_xf || use_gq) ? falloc((int64_t)S * K) : NULL;
     for (int s = 0; s < S; s++) {
         float *pr = logits + (int64_t)s*E;
         if (m->momentum_logits && m->pilot_smooth > 0.f) {
@@ -2445,7 +2699,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
         }
         const float *xs = x + (int64_t)s*D;
-        if (use_xf) {
+        if (use_xf || use_gq) {
             for (int kk = 0; kk < K; kk++) { xidx[s*K+kk] = idx[kk]; xval[s*K+kk] = val[kk]; }
         } else if (use_qt) {
             /* CUDA expert tier: run the resident experts as async groups on
@@ -2516,7 +2770,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
         }
     }
-    if (use_xf) { moe_xf_run(m, layer, x, S, out, xidx, xval); free(xidx); free(xval); }
+    if (use_gq) { moe_gq_run(m, layer, x, S, out, xidx, xval); free(xidx); free(xval); }
+    else if (use_xf) { moe_xf_run(m, layer, x, S, out, xidx, xval); free(xidx); free(xval); }
     /* The CUDA tier keeps its per-token shared block above because it overlaps
      * resident GPU experts.  CPU prefill instead traverses each shared matrix
      * once per bounded chunk. */
@@ -3310,17 +3565,30 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
     ensure_kv(m);
     m->kv_len = 0;
     double nll = 0; int scored = 0;
+    /* sylph FR-31: PPL_DUMP=<file> writes one line per scored position --
+     * `pos \t target \t logprob \t <logprob tail>` with the tail exactly as the
+     * serve protocol's logprobs channel prints it (coli_logprob_tail), so the
+     * equivalence harness compares the same numbers a client would see. */
+    FILE *dump = NULL; const char *dpath = getenv("PPL_DUMP");
+    if (dpath && *dpath) {
+        dump = fopen(dpath, "w");
+        if (!dump) fprintf(stderr, "[ppl] cannot open %s for the logprob dump\n", dpath);
+        else fprintf(dump, "# sylph ppl-dump v1 model=%s vocab=%d scored=%d topk=5\n", getenv("SNAP") ? getenv("SNAP") : "?", c->vocab, nfull - np);
+    }
     float *logit = step(m, full, np, 0);
     for (int i = np; i < nfull; i++) {
         float mx = logit[0]; for (int v = 1; v < c->vocab; v++) if (logit[v] > mx) mx = logit[v];
         double Z = 0; for (int v = 0; v < c->vocab; v++) Z += exp((double)logit[v] - mx);
-        nll += -((double)logit[full[i]] - mx - log(Z));
+        double lp = (double)logit[full[i]] - mx - log(Z);
+        nll += -lp;
+        if (dump) { char tail[512]; coli_logprob_tail(tail, sizeof tail, logit, c->vocab, full[i], 5); fprintf(dump, "%d\t%d\t%.7g\t%s\n", i, full[i], lp, tail); }
         scored++;
         free(logit); logit = NULL;
         if (i == nfull - 1) break;
         logit = step(m, &full[i], 1, i);
     }
     if (logit) free(logit);
+    if (dump) { fclose(dump); fprintf(stderr, "[ppl] wrote %d positions -> %s\n", scored, dpath); }
     *nll_out = nll / scored;
     return scored;
 }
@@ -3844,6 +4112,13 @@ int main(int argc, char **argv) {
         const char *tokpath = getenv("TOK");
         if (tokpath && *tokpath) load_tokenizer(tokpath);
         else if (argc > 4 && argv[4] && *argv[4]) load_tokenizer(argv[4]);
+        else if (ts_is_gguf_path(snap)) {
+            /* sylph: the GGUF carries the tokenizer (tokenizer.ggml.*); a
+             * tokenizer.json next to the file, via TOK=, is preferred above */
+            GgufSet G; memset(&G, 0, sizeof G);
+            if (gguf_open_set(&G, snap, NULL) == 0) { load_tokenizer_gguf(&G); gguf_close(&G); }
+            else fprintf(stderr, "[tok] %s\n", G.err);
+        }
         else { char tpb[2048]; snprintf(tpb,sizeof tpb,"%s/tokenizer.json",snap); load_tokenizer(tpb); }
     }
 
@@ -3896,7 +4171,10 @@ int main(int argc, char **argv) {
      * fmt=4, int8 come fmt=1. Sbagliare qui era #1331 -- budget riservato,
      * planned=1, e zero promozioni per tutta la vita del processo. */
     int expert_is_int4 = 1, expert_mixed = 0;
-    {
+    if (m.is_gguf) {
+        expert_is_int4 = 0;
+        fprintf(stderr, "[qwen36] expert format on disk: GGUF ggml blocks as stored (CPU gq_moe_run; the VRAM expert tier does not take them yet)\n");
+    } else {
         char probe[256];
         snprintf(probe, sizeof(probe),
                  "model.layers.%d.mlp.experts.0.merged_weight", m.active_of[0]);
@@ -3908,7 +4186,7 @@ int main(int argc, char **argv) {
     }
     /* Una riga, sempre: e' l'unico modo di verificare il probe dall'esterno
      * (CI sul container tiny int8, #1331) senza una scheda. */
-    fprintf(stderr, "[qwen36] expert format on disk: %s\n",
+    if (!m.is_gguf) fprintf(stderr, "[qwen36] expert format on disk: %s\n",
             expert_mixed ? "int4 gate/up + int8 down (mixed; CPU path, no VRAM tier yet)"
                          : expert_is_int4 ? "int4 packed (tier fmt=4)" : "int8 (tier fmt=1)");
     g_expert_is_int4 = expert_is_int4;
@@ -3931,7 +4209,9 @@ int main(int argc, char **argv) {
     }
     if (expert_mixed && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1')
         fprintf(stderr, "[qwen36] COLI_CUDA=1 ignored: the VRAM expert tier does not take the mixed layout yet (one format per expert)\n");
-    if (!expert_mixed &&
+    if (m.is_gguf && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1')
+        fprintf(stderr, "[qwen36] COLI_CUDA=1 ignored: the VRAM expert tier does not take GGUF K-quant experts yet (sylph phase 5); CPU path\n");
+    if (!expert_mixed && !m.is_gguf &&
         qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
                 m.c.expert_gs, expert_is_int4)) {
         fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");
