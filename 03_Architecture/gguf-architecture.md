@@ -360,8 +360,10 @@ c --> "08_Documents/equivalence/<date>-<file>.md"
   The sylph dump reuses `tf_nll` for the sum and a per-position tail for the detail.
 - **Noise floor**: llama.cpp vs itself at two thread counts and (if available) CPU vs
   CUDA; thresholds = 3× floor; recorded in the report.
-- **CI subset**: E0 on synthetic blocks; E1/E2 on the tiny oracle model with the
-  container path as reference (no external binary).
+- **CI subset**: E0 on synthetic blocks; E1 on the tiny model with the transformers
+  forward pass (torch in CI, as upstream's tiny-oracle job) as reference, compared through
+  the `PPL_DUMP` format of `07_Tests/SystemTest/lossless_oracle.md`. *Amended 2026-10-06:*
+  the container cannot be the reference, `convert_qwen36.py` quantizes experts to int8 at best.
 - **Entry point**: `make -C 06_Code/c equivalence MODEL=<gguf> LLAMA=<llama.cpp bin dir> [OLLAMA=http://host:11434 TAG=…]`.
 
 ## 11. Testing strategy

@@ -47,7 +47,7 @@ Pre-conditions (met 2026-10-05): architecture reviewed; `07_Tests/IntegrationTes
 
 ## Phase 3 — assembly (`src.h`, `qwen35_names.h`, `gguf_xform.h`, `ts_cfg`, tokenizer)
 
-Pre-conditions: `07_Tests/IntegrationTest/src_facade.md`, `07_Tests/SystemTest/lossless_oracle.md` written.
+Pre-conditions (met 2026-10-06): `07_Tests/IntegrationTest/src_facade.md` (+ runner, torch-free fixture generator, tokenizer corpus) and `07_Tests/SystemTest/lossless_oracle.md` written.
 
 - [ ] `src.h` façade; safetensors arm delegates verbatim to `st.h`
 - [ ] `qwen35_names.h` (table of ARCH §6.1)
@@ -55,11 +55,15 @@ Pre-conditions: `07_Tests/IntegrationTest/src_facade.md`, `07_Tests/SystemTest/l
 - [ ] `ts_cfg` from `qwen35moe.*` keys + shapes (ARCH §6.2); `validate_cfg` reused
 - [ ] tokenizer array constructor (`pre = qwen35`), equality test vs `tokenizer.json` path and vs `llama-tokenize`
 - [ ] `model_init_range` / `load_tq` / `load_expert_merged` through the façade (container path byte-identical)
-- [ ] logprob dump (`PPL_DUMP=<file>` on the `PPL=1` path, serve logprob-tail format)
-- [ ] `tools/st2gguf.py` (tiny oracle → F32/F16/Q8_0 `qwen35moe` GGUF, applying the converter transforms)
+- [ ] logprob dump (`PPL_DUMP=<file>` on the `PPL=1` path; format fixed in `lossless_oracle.md`: header line + `pos\ttarget\tlogprob\t<coli_logprob_tail>`)
+- [ ] `07_Tests/SystemTest/make_tiny_ref_logprobs.py` (torch, same format) and `compare_logprobs.py` (stdlib: top-1, mean/max |ΔNLL|, TF-NLL consistency)
+- [ ] `tools/st2gguf.py` per the contract in `src_facade.md` (stdlib; F32/F16/BF16/Q8_0; converter transforms; placeholder tokenizer; `qwen36_tensor_kinds` as the name contract)
 - [ ] `coli`/`family_registry`: GGUF source → family; `resource_plan` byte accounting
-- [ ] `tests/test_gguf_load.c`, `tests/test_tok_gguf.c`
-- [ ] **System test: tiny Qwen3.6 oracle from an F32 GGUF reproduces `ref_qwen36.json`**; container oracle unchanged
+- [ ] `tests/test_gguf_load.c` (no-arg suite + `<gguf> <hf_dir> [--tol f16]` cross-check) and `tests/test_tok_gguf.c` (`<gguf> <tokenizer.json> [corpus] [--llama-tokenize]`) per `src_facade.md`
+- [ ] `SNAP=<file.gguf>` selects the GGUF source in `qwen36.c`; startup `[GGUF]` line
+- [ ] `gguf-oracle` job in `.github/workflows/check.yml` (upstream's tiny-oracle recipe + st2gguf + GGUF runs + E1 subset)
+- [ ] **System test `lossless_oracle.md`**: F32 GGUF token-exact 16/16 at cap 1/2/8 against upstream's torch-built `ref_full.json`; container run unchanged; E1 subset within the calibrated thresholds
+- [ ] `07_Tests/IntegrationTest/run_src_facade.py` passes (cases 0–4, 6, 7, 8; 5 with network)
 
 ## Phase 4 — streaming + equivalence harness
 
