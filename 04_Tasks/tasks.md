@@ -35,7 +35,7 @@ Pre-conditions (met 2026-10-05): architecture reviewed; `07_Tests/IntegrationTes
 - [x] `gq_deq_row` reference path without FP contraction (GCC `optimize("fp-contract=off")` / `clang fp contract(off)` pragmas); ggml's expression order; E0 golden bit-exact on all 17 fixtures under gcc 13 (-march=native, x86-64-v3, scalar) and clang. Finding: the K-quant products (f16 × 6-bit × 4-bit) are exact in f32, so contraction could not have changed the values — the guard is insurance
 - [x] `tests/test_gq_kernels` CLI: no-arg suite (`all passed`), `deq <TYPE> <bin> <numel>` (exit 2 `unsupported type`, exit 3 `size mismatch`), `moe-digest` (FNV-1a, thread-independent); fixtures found relative to the binary
 - [x] eight `synth_*` golden pairs + manifest subset copied to `tests/fixtures/gq_e0/` (`make check` E0 subset, FR-34)
-- [x] `gq_deq_row` for every type; `gq_dot_row` scalar reference; AVX2 (bit-identical, 8 lanes = element & 7); NEON (two float32x4, same lane order; verified by the macOS arm64 CI job, not locally)
+- [x] `gq_deq_row` for every type; `gq_dot_row` scalar reference; AVX2 (bit-identical, 8 lanes = element & 7); NEON (two float32x4, same lane order; verified by the macOS arm64 CI job, run 10 for commit 06211c2 — all three jobs green, Windows/MinGW included)
 - [ ] AVX-512 f32 path deliberately absent (as `expert_ffn.h`: 16 lanes would change the fma order); VNNI only with the int8-activation twin (phase 5)
 - [x] `gq_q8_0_split`/`gq_q8_0_join` (lossless, round-trip tested) and `matmul_q_gs(gs=32)` on the split within 1e-6 of the double dot and of `gq_dot_q8_0`
 - [x] `gq_matmul` (OMP over rows; `Q6_K`/`Q8_0`/any supported type), `gq_embed_row`; unsupported types refused (-1)
