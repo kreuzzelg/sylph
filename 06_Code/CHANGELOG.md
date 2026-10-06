@@ -7,6 +7,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **GGUF kernels (`c/gq.h`, sylph phase 2).** ggml block types F32/F16/BF16/Q4_0/Q8_0/Q4_K/Q5_K/Q6_K on the CPU: exact dequantization (bit-for-bit llama.cpp's gguf-py decode, pinned by golden fixtures in `tests/fixtures/gq_e0/`), f32-activation row dots with a scalar reference reproduced bit-for-bit by the AVX2 and NEON paths, dense `gq_matmul` (lm_head `Q6_K`/`Q8_0`) and `gq_embed_row`, the lossless `Q8_0` → int8-plane + per-32-scale split that feeds `gsgemv.h`'s `matmul_q_gs` unchanged, and `gq_moe_run`, the K-quant twin of `expert_ffn.h`'s layer runner (rank-ordered sum, thread-count independent). `tests/test_gq_kernels.c`; `make bench-gq` measures NFR-7.
 - **GGUF, phase 1 (reader only)** — `c/gguf.h` indexes a GGUF v3 file or split set
   (headers only, bounded and overflow-checked like `st.h`), `c/ggufinfo.py` is the
   stdlib reader behind `coli gguf inspect <path>` and `coli doctor`, which now

@@ -30,18 +30,20 @@ that phase's implementation.
 
 Pre-conditions (met 2026-10-05): architecture reviewed; `07_Tests/IntegrationTest/gq_kernels.md` (+ runner, 17 golden fixtures) and `07_Tests/SystemTest/kernel_throughput.md` written.
 
-- [ ] type table, `gq_row_size`, `gq_supported` (F32, F16, BF16, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K)
+- [x] type table, `gq_row_bytes`, `gq_supported` (F32, F16, BF16, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K) — `c/gq.h`, 2026-10-06
 - [x] E0 oracle: gguf-py golden vectors in `07_Tests/IntegrationTest/fixtures/e0/` (real Qwen3.6 rows + synthetic edge blocks), cross-checked 16/16 bit-exact against upstream's `tools/gguf_dequant.py` — no new `gq_ref.py` needed
-- [ ] `gq_deq_row_T` reference path compiled without FP contraction (`-ffp-contract=off` for the unit / function attribute); sign-of-zero and expression order as ggml (gq_kernels.md §"What E0 pins")
-- [ ] `tests/test_gq_kernels` CLI: no-arg suite (`all passed`), `deq <TYPE> <bin> <numel>` (exit 2 `unsupported type`, exit 3 `size mismatch`), `moe-digest` (FNV-1a, thread-independent)
-- [ ] copy the eight `synth_*` golden pairs to `tests/fixtures/gq_e0/` for the `make check` E0 subset (FR-34)
-- [ ] `gq_deq_row_T` for every type; `gq_dot_row_T` scalar; AVX2; AVX-512/VNNI; NEON
-- [ ] `gq_q8_0_split` (Q8_0 → int8 plane + f32/32 scales) and its test against `gsgemv.h`'s `matmul_q_gs`
-- [ ] `gq_matmul` (dense; `Q6_K`/`Q8_0` lm_head), `gq_embed_row`
-- [ ] `gq_moe_run` (K-quant twin of `xf_moe_run`), fused gate+up, rank-ordered reduction
-- [ ] `gq_selftest` at startup; `tests/test_gq_kernels.c`
-- [ ] `tests/bench_gq.c` + `make bench-gq` per `07_Tests/SystemTest/kernel_throughput.md`; NFR-7 measurement on the dev container and the owner's host → `08_Documents/kernels/`
-- [ ] `07_Tests/IntegrationTest/run_gq_kernels.py` passes (cases 0–2, 5, 6; 3–4 with numpy)
+- [x] `gq_deq_row` reference path without FP contraction (GCC `optimize("fp-contract=off")` / `clang fp contract(off)` pragmas); ggml's expression order; E0 golden bit-exact on all 17 fixtures under gcc 13 (-march=native, x86-64-v3, scalar) and clang. Finding: the K-quant products (f16 × 6-bit × 4-bit) are exact in f32, so contraction could not have changed the values — the guard is insurance
+- [x] `tests/test_gq_kernels` CLI: no-arg suite (`all passed`), `deq <TYPE> <bin> <numel>` (exit 2 `unsupported type`, exit 3 `size mismatch`), `moe-digest` (FNV-1a, thread-independent); fixtures found relative to the binary
+- [x] eight `synth_*` golden pairs + manifest subset copied to `tests/fixtures/gq_e0/` (`make check` E0 subset, FR-34)
+- [x] `gq_deq_row` for every type; `gq_dot_row` scalar reference; AVX2 (bit-identical, 8 lanes = element & 7); NEON (two float32x4, same lane order; verified by the macOS arm64 CI job, not locally)
+- [ ] AVX-512 f32 path deliberately absent (as `expert_ffn.h`: 16 lanes would change the fma order); VNNI only with the int8-activation twin (phase 5)
+- [x] `gq_q8_0_split`/`gq_q8_0_join` (lossless, round-trip tested) and `matmul_q_gs(gs=32)` on the split within 1e-6 of the double dot and of `gq_dot_q8_0`
+- [x] `gq_matmul` (OMP over rows; `Q6_K`/`Q8_0`/any supported type), `gq_embed_row`; unsupported types refused (-1)
+- [x] `gq_moe_run` (`GqExpert{g,u,d,tg,tu,td}`, same work split and scratch discipline as `xf_moe_run`, rank-ordered sum); equals the per-token loop; digest identical under 1/2/4 threads
+- [x] `gq_selftest`; `tests/test_gq_kernels.c` (auto-discovered by the Makefile's test rule scan)
+- [x] `tests/bench_gq.c` + `make bench-gq` per `07_Tests/SystemTest/kernel_throughput.md`; **dev container: NFR-7 met** (`Q4_K` 1.27–1.30×, `Q5_K` 1.27–1.35×, `Q6_K` 1.04–1.15× per byte; layer 1.17–1.45× at S=1, two runs) → `08_Documents/kernels/2026-10-06-dev-container.md`
+- [ ] **Owner runs** `make -C 06_Code/c bench-gq MODEL=<Qwen3.6 GGUF>` on the RTX 3070 host (CPU side) and commits the table as `08_Documents/kernels/<date>-<host>.md`
+- [x] `07_Tests/IntegrationTest/run_gq_kernels.py` passes: 0 failures, all 6 cases incl. the live gguf-py and upstream-oracle checks (2026-10-06)
 
 ## Phase 3 — assembly (`src.h`, `qwen35_names.h`, `gguf_xform.h`, `ts_cfg`, tokenizer)
 

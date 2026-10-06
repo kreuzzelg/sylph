@@ -51,7 +51,7 @@ def case0_fixtures_intact(manifest):
 
 def case1_unit_suite():
     print("case 1: tests/test_gq_kernels self-contained suite (E0 synthetic, SIMD == scalar, split, runner == GEMVs)")
-    r = run([EXE])
+    r = run([EXE], cwd=C)
     tail = (r.stdout.decode(errors="replace").strip().splitlines() or [""])[-1]
     check(r.returncode == 0, f"exit 0, last line: {tail!r}")
 

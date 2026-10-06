@@ -62,3 +62,4 @@ iteration (first-touch, the streaming case). Output is one Markdown table.
 | Date | Result |
 |---|---|
 | 2026-10-05 | protocol written; `tests/bench_gq.c` and `make bench-gq` are phase-2 deliverables; to run after `gq_kernels.md` passes |
+| 2026-10-06 | **dev container (host 1): target met.** Report `../../08_Documents/kernels/2026-10-06-dev-container.md`. Row A `Q4_K` 1.27–1.30, `Q5_K` 1.27–1.35, `Q6_K` 1.04–1.15 (ns per weight byte vs planar int4, two runs); row E `gq_moe_run` 1.17–1.45 (S=1 hot), 1.41 (S=32). First version measured 1.70 / 1.77: the fix was four independent accumulators (the serial fma chain was the limit), a vectorized scale decode and the min term folded once per block from precomputed per-32 activation sums (`gq_xsum32`). Owner's host (host 2) pending. |

@@ -1420,6 +1420,20 @@ tests/test_st_mirror$(EXE): tests/test_st_mirror.c st.h json.h compat.h
 tests/test_gguf$(EXE): tests/test_gguf.c gguf.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# ggml block kernels for GGUF weights (sylph phase 2). E0 golden fixtures in
+# tests/fixtures/gq_e0/ (llama.cpp gguf-py decode of synthetic blocks); the
+# integration runner 07_Tests/IntegrationTest/run_gq_kernels.py adds real rows.
+tests/test_gq_kernels$(EXE): tests/test_gq_kernels.c gq.h gguf.h gsgemv.h sse41_kernels.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# NFR-7 kernel throughput (07_Tests/SystemTest/kernel_throughput.md):
+#   make bench-gq [MODEL=/path/to/model.gguf]
+tests/bench_gq$(EXE): tests/bench_gq.c gq.h expert_ffn.h gsgemv.h sse41_kernels.h gguf.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+bench-gq: tests/bench_gq$(EXE)
+	./tests/bench_gq$(EXE) $(if $(MODEL),--model "$(MODEL)")
+.PHONY: bench-gq
+
 tests/test_st_overlay$(EXE): tests/test_st_overlay.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

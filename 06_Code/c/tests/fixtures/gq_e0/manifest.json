@@ -1,0 +1,158 @@
+{
+ "oracle": "llama.cpp gguf-py gguf.quants.dequantize (reference for ggml dequantize_row_*)",
+ "origin": "copied verbatim from 07_Tests/IntegrationTest/fixtures/e0/ (sylph); regenerate there with make_e0_golden.py",
+ "fixtures": [
+  {
+   "name": "synth_bf16",
+   "type": "BF16",
+   "type_id": 30,
+   "numel": 1032,
+   "raw_bytes": 2064,
+   "source": {
+    "kind": "synthetic",
+    "seed": 20261005,
+    "note": "random blocks, finite f16 scales, 6 edge blocks appended"
+   },
+   "sha256_bin": "4416fba83758662c2e150109b0152fe0f217edafd78998936d231e3754c8977b",
+   "sha256_f32": "82e1303ea70d844b6002d54fbed21b13cca889110f88c58f5cc4bcbfb164db58",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "synth_f16",
+   "type": "F16",
+   "type_id": 1,
+   "numel": 1032,
+   "raw_bytes": 2064,
+   "source": {
+    "kind": "synthetic",
+    "seed": 20261005,
+    "note": "random blocks, finite f16 scales, 6 edge blocks appended"
+   },
+   "sha256_bin": "b5765ff747cd9b68d4ee967a52f20fc86869144a12028546adb30f288b7bb32e",
+   "sha256_f32": "7ccaffffff7361afb0340511a2faf1c0a83fa8c57f138da7d9e1a458c9efd6fd",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "synth_f32",
+   "type": "F32",
+   "type_id": 0,
+   "numel": 1032,
+   "raw_bytes": 4128,
+   "source": {
+    "kind": "synthetic",
+    "seed": 20261005,
+    "note": "random blocks, finite f16 scales, 6 edge blocks appended"
+   },
+   "sha256_bin": "8fa28976c910fb46bfb922a268aaf28b2a4d670c2e42ba3cf63d1a0ba6e266dd",
+   "sha256_f32": "8fa28976c910fb46bfb922a268aaf28b2a4d670c2e42ba3cf63d1a0ba6e266dd",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "synth_q4_0",
+   "type": "Q4_0",
+   "type_id": 2,
+   "numel": 1216,
+   "raw_bytes": 684,
+   "source": {
+    "kind": "synthetic",
+    "seed": 20261005,
+    "note": "random blocks, finite f16 scales, 6 edge blocks appended"
+   },
+   "sha256_bin": "00ea93f2713f17ff9850714e5d95e4849adb8e161821e5ee076a0ba73ea888cb",
+   "sha256_f32": "906b9b15dfa434f3d2d1058d137a8f44bf2095f1c4b2c84c6a6fa68ecd4469b7",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "synth_q4_k",
+   "type": "Q4_K",
+   "type_id": 12,
+   "numel": 2560,
+   "raw_bytes": 1440,
+   "source": {
+    "kind": "synthetic",
+    "seed": 20261005,
+    "note": "random blocks, finite f16 scales, 6 edge blocks appended"
+   },
+   "sha256_bin": "a51c8ebe53e7e0f141864e13a8d44eacefaa4492411ba415f152ce537d8a92dd",
+   "sha256_f32": "db148c57de4d7542de6ec689c76cc47f84e72941bc7f389adaf454528ee9467a",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "synth_q5_k",
+   "type": "Q5_K",
+   "type_id": 13,
+   "numel": 2560,
+   "raw_bytes": 1760,
+   "source": {
+    "kind": "synthetic",
+    "seed": 20261005,
+    "note": "random blocks, finite f16 scales, 6 edge blocks appended"
+   },
+   "sha256_bin": "4fc385da61af9b26ae5a44459d0f130603e6f1cd021337005f23b79e8acde2e2",
+   "sha256_f32": "2b9648b8b6a3f81c6fdc74ca0afa06317b9066eac663abcba40e334d474dc95e",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "synth_q6_k",
+   "type": "Q6_K",
+   "type_id": 14,
+   "numel": 2560,
+   "raw_bytes": 2100,
+   "source": {
+    "kind": "synthetic",
+    "seed": 20261005,
+    "note": "random blocks, finite f16 scales, 6 edge blocks appended"
+   },
+   "sha256_bin": "baa54952324412310aa92174131fd41c0159fb61d7083accd5e85f4c87a31134",
+   "sha256_f32": "67ce6e954e2588bc666d78052dbdf82be80884ea0513eab62820cfe1f6b7d42c",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  },
+  {
+   "name": "synth_q8_0",
+   "type": "Q8_0",
+   "type_id": 8,
+   "numel": 1216,
+   "raw_bytes": 1292,
+   "source": {
+    "kind": "synthetic",
+    "seed": 20261005,
+    "note": "random blocks, finite f16 scales, 6 edge blocks appended"
+   },
+   "sha256_bin": "a6b7b00d4ea1e91d7ccc00beb9e088dba50b8cc823aac9a96d8e67debc023689",
+   "sha256_f32": "d53ed144c9a0a16590060dee6d7cc0b3bea4dc36f2db55e9300867e2380f1b3c",
+   "generator": {
+    "gguf": "0.19.0",
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+   }
+  }
+ ]
+}

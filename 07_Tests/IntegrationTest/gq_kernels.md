@@ -94,3 +94,4 @@ lands, the runner reports `RESULT: FAIL (module not built …)` after case 0.
 | Date | Result |
 |---|---|
 | 2026-10-05 | document + runner + 17 golden fixtures written; oracles cross-checked (16/16 bit-exact); case 0 passes; build of `tests/test_gq_kernels` expected to fail until phase 2 |
+| 2026-10-06 | **pass** — `gq.h` implemented; `RESULT: ok (0 failures)`, all six cases including the live gguf-py and upstream-oracle checks; the unit suite also passes built for x86-64-v3, as pure scalar (`-mno-avx2 -mno-fma`) and with clang. Harness fix during implementation: the runner now launches the binary from `06_Code/c` and the binary finds its fixtures relative to its own path (cwd was unspecified). Observation: the K-quant decode products are exact in f32 (f16 × 6-bit × 4-bit), so the fp-contract guard is insurance, not a live hazard. NEON path verified only by the macOS CI job. |

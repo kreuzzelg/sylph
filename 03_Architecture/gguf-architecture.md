@@ -381,7 +381,7 @@ blocks), with upstream's module as the second, independent decoder (16/16 bit-ex
 2026-10-05). The planned `tools/gq_ref.py` is dropped. The C reference decode must keep
 ggml's expression order and must not be FP-contracted (`-ffp-contract=off`), otherwise
 the sign of zero and the last bit differ from the golden. Contract of the test binary:
-`07_Tests/IntegrationTest/gq_kernels.md`.
+`07_Tests/IntegrationTest/gq_kernels.md`. Names as implemented in `c/gq.h` (2026-10-06): `gq_row_bytes` (not `gq_row_size`), `gq_deq_row(type, …)` and `gq_dot_row(type, …)` dispatching on the type id (no per-type `_T` suffix in the public entry points), `gq_dot_row_xs` + `gq_xsum32` for the per-token activation sums the K-quant min terms need, `GqExpert{g,u,d,tg,tu,td}` for `gq_moe_run`. The dot numerics follow `expert_ffn.h`'s rule (8 lanes = element & 7, fma, fixed 8→1 tree) with four independent accumulators per row; NFR-7 result in `08_Documents/kernels/`.
 
 ## 12. Phased plan (details and status in `../04_Tasks/tasks.md`)
 
