@@ -29,7 +29,7 @@ done
 COLI_DENSE_I8=0 SNAP=qwen36_tiny_f16.gguf  ./qwen36 2 8 qwen36_tiny/ref_full.json        # reported
 COLI_DENSE_I8=0 SNAP=qwen36_tiny_q8_0.gguf ./qwen36 2 8 qwen36_tiny/ref_full.json        # reported
 PPL=1 PPL_DUMP=dump_f32.tsv COLI_DENSE_I8=0 SNAP=qwen36_tiny_f32.gguf ./qwen36 8 8 qwen36_tiny/ref_full.json
-python3 07_Tests/SystemTest/compare_logprobs.py qwen36_tiny/ref_logprobs.tsv dump_f32.tsv  # E1 subset
+python3 07_Tests/SystemTest/compare_logprobs.py qwen36_tiny/ref_logprobs.tsv dump_f32.tsv --mean 1e-6 --max 1e-5  # E1 subset, calibrated thresholds
 ```
 
 `SNAP` pointing at a `.gguf` file (or a directory holding one GGUF / a split set)
@@ -61,13 +61,23 @@ within 1e-6. The reference script writes the same format from torch.
    the layout: `[GGUF] qwen35moe · 8 blocks (2 attention) · experts F32 … per expert ·
    dense F32 …`.
 3. **E1 subset (FR-34).** `compare_logprobs.py`: top-1 identical at every scored
-   position; mean |ΔNLL| ≤ 1e-4 nat and max |ΔNLL| ≤ 1e-3 nat between the F32 GGUF
-   dump and the torch reference (proposal: f32 engine vs f32 torch on a tiny model;
-   the first run records the observed values and the thresholds are set at 3× them,
-   spec §4.3). The sum of the dump's log-probs reproduces the printed TF-NLL.
+   position; mean |ΔNLL| ≤ 1e-6 nat and max |ΔNLL| ≤ 1e-5 nat between the F32 GGUF
+   dump and the torch reference. The sum of the dump's log-probs reproduces the
+   printed TF-NLL. *Calibration (2026-10-06, CI run 13):* the proposal was 1e-4 / 1e-3
+   with the rule "3× the observed values" (spec §4.3); the first run observed mean
+   6.25e-8 and max 1.0e-6, and the max is exactly one unit of the dumps' 7-significant-
+   digit format (`%.7g` on log-probs around −5), so the floor is the print format, not
+   the arithmetic. 3× that would make the gate three print ulps wide; the thresholds
+   are set at 10× the format unit instead (mean 1e-6, max 1e-5); the smallest real
+   precision loss in the type set, Q8_0 experts, moves the same kind of fixture by
+   mean ≈ 5e-2 nat (measured on the `src_facade.md` fixture, F32 vs Q8_0 GGUF), four
+   orders of magnitude above the gate. The script's defaults stay at the generic E1
+   values; the job passes the calibrated ones explicitly.
 4. **Reported, not required.** F16 and Q8_0 GGUF: matching tokens and ΔNLL vs the
    reference, next to the int8 container's (`qwen36_tiny_c`) — the Q8_0 GGUF is
-   expected within 3× of the container's ΔNLL (both are 8-bit experts).
+   expected within 3× of the container's ΔNLL (both are 8-bit experts). The ΔNLL
+   dumps for these three were added to the job after run 13 (which reported tokens
+   only); run 14 fills them in.
 5. **Tokenizer-less reference mode.** The GGUF written without `--tokenizer` loads
    and runs the reference-id mode (no `tokenizer.json` on disk); text mode refuses
    with the usual `[enc] no tokenizer` message.
@@ -89,3 +99,4 @@ and architecture §10 were amended on 2026-10-06 accordingly.
 | Date | Result |
 |---|---|
 | 2026-10-06 | written; `tools/st2gguf.py`, the GGUF source in `qwen36.c`, `PPL_DUMP`, `make_tiny_ref_logprobs.py`, `compare_logprobs.py` and the `gguf-oracle` CI job are phase-3 deliverables. Later the same day: all of them implemented; the job is in `check.yml`, its first run decides this row. torch is not installable in the development container (download.pytorch.org is egress-blocked; the PyPI wheel downloads but is CUDA-linked and untested), so the first execution is the CI job, then the owner's machine. |
+| 2026-10-06 (CI run 13, commit 2375ec1) | **Passes.** Container unchanged and F32 GGUF: `Matching tokens: 16/16` at cap 1, 2 and 8 (all six runs). Façade cross-check on the torch-built snapshot: 317 tensors / slices, 629 520 values bit-exact (F32) and within one f16 ulp (F16). E1 subset: 16 positions, same targets, top-1 identical everywhere, mean \|ΔNLL\| 6.25e-8, max 1.0e-6 (one print ulp); TF-NLL 5.319704 on both sides (ppl 204.32); the dump reproduces the printed TF-NLL. Reported: F16 GGUF 16/16, Q8_0 GGUF 16/16 with `COLI_DENSE_I8=0` and `=1`; the int8 container 16/16. Thresholds calibrated to 1e-6 / 1e-5 (criterion 3). The same run's Windows job failed on `tests/test_gguf_load.c` (a local variable named `far`, an empty macro in the Windows headers) — renamed, no behaviour change. Summary: `08_Documents/equivalence/2026-10-06-tiny-oracle-ci.md`. |

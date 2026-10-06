@@ -106,14 +106,14 @@ static void suite(void) {
         free(hf8); free(gg8); free(b8); free(hc); free(gc); free(bc); }
     }
     /* norm offset and A_log */
-    { int bad = 0, far = 0;
+    { int bad = 0, nfar = 0;
       for (int i = 0; i < 4096; i++) {
           float w = bf16r(1.f + frand() * 0.1f), st = (1.f + w); float x = st; gx_norm_unplus1(&x, 1); bad += x != w;
           float al = frand() * 2.f, a = -expf(al), y = a; gx_alog_from_a(&y, 1);
-          far += fabsf(al - y) > 4.f * ldexpf(1.f, -24);
+          nfar += fabsf(al - y) > 4.f * ldexpf(1.f, -24);
       }
       CHECK(bad == 0, "%d of 4096 bf16 norm weights do not survive 1+w -> w", bad);
-      CHECK(far == 0, "%d of 4096 A_log values farther than 4*2^-24 after -exp -> log(-a)", far);
+      CHECK(nfar == 0, "%d of 4096 A_log values farther than 4*2^-24 after -exp -> log(-a)", nfar);
       float pos = 0.5f; CHECK(gx_alog_from_a(&pos, 1) == 1, "a non-negative ssm_a entry is reported"); }
     CHECK(!gq_supported(GGML_TYPE_Q4_1) && !gq_supported(GGML_TYPE_Q2_K) && !gq_supported(GGML_TYPE_IQ4_NL), "types outside the v1 set are unsupported");
     CHECK(gq_selftest() == 0, "gq_selftest");

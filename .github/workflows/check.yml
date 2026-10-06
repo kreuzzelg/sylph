@@ -66,18 +66,28 @@ jobs:
             COLI_DENSE_I8=0 SNAP=qwen36_tiny_f32.gguf ./qwen36 "$cap" 8 qwen36_tiny/ref_full.json
             echo "::endgroup::"
           done
-      - name: Reported, not required -- F16 and Q8_0 GGUF
+      - name: Reported, not required -- F16 and Q8_0 GGUF and the int8 container, tokens and ΔNLL
         run: |
           cd 06_Code/c
           COLI_DENSE_I8=0 SNAP=qwen36_tiny_f16.gguf  ./qwen36 2 8 qwen36_tiny/ref_full.json || true
           COLI_DENSE_I8=0 SNAP=qwen36_tiny_q8_0.gguf ./qwen36 2 8 qwen36_tiny/ref_full.json || true
           COLI_DENSE_I8=1 SNAP=qwen36_tiny_q8_0.gguf ./qwen36 2 8 qwen36_tiny/ref_full.json || true
-      - name: E1 subset -- PPL_DUMP of the F32 GGUF vs the torch log-probs
+          for v in f16 q8_0; do
+            echo "::group::ΔNLL $v GGUF vs torch"
+            PPL=1 PPL_DUMP=dump_$v.tsv COLI_DENSE_I8=0 SNAP=qwen36_tiny_$v.gguf ./qwen36 8 8 qwen36_tiny/ref_full.json || true
+            python3 ../../07_Tests/SystemTest/compare_logprobs.py qwen36_tiny/ref_logprobs.tsv dump_$v.tsv || true
+            echo "::endgroup::"
+          done
+          echo "::group::ΔNLL int8 container vs torch"
+          PPL=1 PPL_DUMP=dump_c.tsv COLI_DENSE_I8=0 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_full.json || true
+          python3 ../../07_Tests/SystemTest/compare_logprobs.py qwen36_tiny/ref_logprobs.tsv dump_c.tsv || true
+          echo "::endgroup::"
+      - name: E1 subset -- PPL_DUMP of the F32 GGUF vs the torch log-probs (thresholds calibrated on run 13, lossless_oracle.md)
         run: |
           cd 06_Code/c
           PPL=1 PPL_DUMP=dump_f32.tsv COLI_DENSE_I8=0 SNAP=qwen36_tiny_f32.gguf ./qwen36 8 8 qwen36_tiny/ref_full.json | tee ppl.log
           nll=$(grep -oP 'TF-NLL: \K[0-9.]+' ppl.log)
-          python3 ../../07_Tests/SystemTest/compare_logprobs.py qwen36_tiny/ref_logprobs.tsv dump_f32.tsv --tf-nll "$nll"
+          python3 ../../07_Tests/SystemTest/compare_logprobs.py qwen36_tiny/ref_logprobs.tsv dump_f32.tsv --mean 1e-6 --max 1e-5 --tf-nll "$nll"
 
   macos:
     runs-on: macos-latest
