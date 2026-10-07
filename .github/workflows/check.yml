@@ -7,6 +7,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:   # manual start from the Actions tab or the API, e.g. to re-measure the oracle without a push
 
 env:
   # As upstream: several tests read UTF-8 sources and fixtures with read_text()
