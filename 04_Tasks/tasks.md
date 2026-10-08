@@ -63,7 +63,7 @@ Pre-conditions (met 2026-10-06): `07_Tests/IntegrationTest/src_facade.md` (+ run
 - [x] `SNAP=<file.gguf>` (or a directory of parts) selects the GGUF source; startup `[GGUF] qwen35moe · N blocks · …` line
 - [x] `gguf-oracle` job in `.github/workflows/check.yml` (upstream's tiny-oracle recipe + st2gguf + GGUF runs + E1 subset) — green on its first run (run 13, commit 2375ec1, 2026-10-06); ΔNLL dumps for F16/Q8_0/container added to the reported step afterwards
 - [x] **System test `lossless_oracle.md`**: F32 GGUF token-exact 16/16 at cap 1/2/8 against upstream's torch-built `ref_full.json`; container run unchanged 16/16; façade cross-check 317 tensors bit-exact; E1 subset mean |ΔNLL| 6.25e-8, max 1.0e-6 (one print ulp), thresholds calibrated to 1e-6 / 1e-5 — CI run 13, 2026-10-06; summary `08_Documents/equivalence/2026-10-06-tiny-oracle-ci.md`
-- [x] CI green on Linux, macOS and Windows for phase 3: run 13 was red on Windows only (`far` is an empty macro in the Windows headers; local variable in `tests/test_gguf_load.c` renamed); run 14 (commit 52fc566, 2026-10-06) green on all four jobs, Windows `make check` included
+- [x] CI green on Linux, macOS and Windows for phase 3: run 13 was red on Windows only (`far` is an empty macro in the Windows headers; local variable in `tests/test_gguf_load.c` renamed); run 14 (commit 52fc566, 2026-10-06) green on all four jobs, Windows `make check` included; run 16 (commit e91e57f, 2026-10-08, repo public) green again with the `_xq8_0` measurement — criterion 4 of `lossless_oracle.md` holds (1.77e-4 vs the container's 2.35e-4)
 - [x] `07_Tests/IntegrationTest/run_src_facade.py` passes: `RESULT: ok (0 failures)`, all 8 cases including the network case (2026-10-06)
 
 ## Phase 4 — streaming + equivalence harness

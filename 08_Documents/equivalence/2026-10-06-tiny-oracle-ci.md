@@ -112,6 +112,7 @@ three sources against the same torch reference:
 | GGUF F32 (the gate) | 5.319704 | 0 | 0 | identical | 16/16 |
 | GGUF F16 | 5.319702 | 4.18e-5 | 9.5e-5 | identical | 16/16 |
 | int8 container (`convert_qwen36.py --ebits 8`) | 5.319812 | 2.35e-4 | 5.8e-4 | identical | 16/16 |
+| GGUF Q8_0, experts only (`_xq8_0`, run 16) | 5.319787 | 1.77e-4 | 3.93e-4 | identical | 16/16 |
 | GGUF Q8_0, dense and experts | 5.319592 | 2.68e-3 | 1.07e-2 | identical | 16/16 |
 
 The `FAIL` lines these three print in the log are against `compare_logprobs.py`'s
@@ -131,12 +132,21 @@ fixture (engine vs engine, F32 GGUF as the reference, three `st2gguf.py` variant
 | dense Q8_0, experts F32 | 4.7e-2 | 2.8e-1 |
 | dense and experts Q8_0 | 4.9e-2 | 2.9e-1 |
 
-Dense Q8_0 carries ~90 % of the all-Q8_0 difference on that fixture; projected onto the
-CI fixture, experts-only Q8_0 lands near the container's 2.35e-4. That is a projection,
-so the job now also writes `qwen36_tiny_xq8_0.gguf` (`--type f32 --expert-type q8_0`)
-and reports its ΔNLL against torch from run 15 on; criterion 4 in `lossless_oracle.md`
-names that file as the one the 3× expectation applies to. Nothing here is a defect:
-Q8_0 is a lossy format, and its loss on random tiny weights is in the expected range.
+Dense Q8_0 carries ~90 % of the all-Q8_0 difference on that fixture. The job therefore
+also writes `qwen36_tiny_xq8_0.gguf` (`--type f32 --expert-type q8_0`) and reports its
+ΔNLL against torch; criterion 4 in `lossless_oracle.md` names that file as the one the
+3× expectation applies to. **Measured in run 16 (attempt 2, 2026-10-08): experts-only
+Q8_0 mean 1.77e-4 / max 3.93e-4 nat, TF-NLL 5.319787, top-1 identical, 16/16 tokens** —
+0.75× the int8 container's mean, so criterion 4 holds with room to spare. That the GGUF
+experts come out slightly *closer* to torch than the container's is expected: Q8_0 keeps
+one scale per 32 weights, the container one per row. Nothing here is a defect: Q8_0 is
+a lossy format, and its loss on random tiny weights is in the expected range.
+
+Runs 15 and 16 attempt 1 (2026-10-06/07) could not start a single job — no runner, no
+step, two seconds — because the private repository's monthly Actions quota was
+exhausted (macOS minutes count 10×, Windows 2×; eight full runs in one day). The owner
+made the repository public on 2026-10-08; the same commit then ran unchanged, and every
+number above that run 14 had already measured came out identical.
 
 ## Same run, other jobs
 
