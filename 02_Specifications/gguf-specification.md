@@ -140,7 +140,7 @@ Everything in this section was verified against real files on 2026-10-05
 | ID | Requirement | Prio | Phase |
 |---|---|---|---|
 | FR-27 | Expert load = three slice reads into the slot; the slot keeps the **raw K-quant blocks** (no unpack); LRU, pin, pilot prefetch, `.coli_usage`, Brain/Atlas unchanged (identity is `(layer, eid)`). | MUST | 4 |
-| FR-28 | `DIRECT`, mirror, split dirs, uring where upstream's qwen36 engine has them; per-slice 4 KiB windows for O_DIRECT. | SHOULD | 4 |
+| FR-28 | `DIRECT`, mirror, split dirs, uring where upstream's qwen36 engine has them; per-slice 4 KiB windows for O_DIRECT. *Verified 2026-10-08: the `qwen36` engine has none of them (they are `colibri.c`/`glm53.c`/`kimi_k3.c` features), so this requirement is met vacuously in v1; the knobs must be ignored identically for both sources (`07_Tests/IntegrationTest/expert_streaming.md`).* | SHOULD | 4 |
 | FR-29 | Sidecars (`.coli_usage`, KV/prefix state) in `<dir>/.coli-<stem>/` for GGUF models. | MUST | 4 |
 | FR-30 | Startup line names the source, type mix, bytes per expert, dense bytes, and which tensors run on which backend. | MUST | 4 |
 

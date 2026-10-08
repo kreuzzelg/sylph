@@ -387,6 +387,30 @@ the sign of zero and the last bit differ from the golden. Contract of the test b
 
 **Amendment 2026-10-06 (phase 3 as implemented).** `ts_cfg` lives in `qwen36.c` as `cfg_from_gguf(Model*)` (it fills the engine's `Cfg`, so it is engine code; `src.h` stays engine-agnostic and receives the head geometry it needs for the un-permutations). The GGUF slot flavour is `Slot{kq, ktype[3], kbytes[3]}` sized for the largest expert of any block (`ffn_down_exps` alternates `Q5_K`/`Q6_K`), run by `moe_gq_run`, the twin of `moe_xf_run`. Dense GGUF matrices: `Q8_0` → `QW{q, sc, gs = 32}` for `matmul_q_gs`; `Q4_K/Q5_K/Q6_K/Q4_0` → `QW{kq, ktype}` for `gq_matmul`; F32/F16/BF16 take the container's int8-at-load path; with `COLI_DENSE_I8=0`, or when a permuted `Q8_0` matrix cannot move whole blocks (tiny fixtures), the exact f32 dequantization is used (never a re-quantization). The embedding table is dequantized to f32 at load as the container path does (phase 4 switches to `gq_embed_row`). `SNAP=<file.gguf>` or a directory of parts selects the source; the tokenizer comes from the metadata via `load_tokenizer_gguf` (a `tokenizer.json` via `TOK=` is preferred when given). A1 is resolved as "keep `dn_alog`": the GGUF `ssm_a` is turned back into `A_log` at load (≤ 4·2⁻²⁴ absolute), `deltanet()` is untouched.
 
+**Amendment 2026-10-08 (phase-4 tests written; findings).** (1) `qwen36.c` has none of
+the `DIRECT`/`COLI_MODEL_MIRROR`/`URING`/`COLI_MODEL_DIRS` machinery of `colibri.c`
+(`grep` empty); experts are read with `pread` + `posix_fadvise(DONTNEED)`, and the GGUF
+arm inherits exactly that. §8's "O_DIRECT windows per slice" is therefore **not** a
+phase-4 item: FR-28 is satisfied vacuously, the knobs are ignored identically on both
+sources (`expert_streaming.md` case 9), and a mirror/split feature for this engine
+would be upstream work first. (2) The engine writes no sidecar (`route_trace.h` is not
+included; `kv_prefix.h` is in-memory), and `coli`'s `.coli_kv`/`.coli_ssd` belong to the
+GLM engine; FR-29 becomes a **path rule**: `<dir>/.coli-<stem>/` from `ts_sidecar_dir`
+(`src.h`) and `family_registry.sidecar_dir`, created only when something is written,
+printed by `coli info` and in the startup line. (3) The FR-30 startup line and a
+`GGUF reads:` statistics line (slices = 3 × misses, MB, MB/token, parts touched) are the
+machine-readable form the tests parse; the format is fixed in `expert_streaming.md`.
+(4) `token_embd` moves to `gq_embed_row` on demand with `COLI_GGUF_EMBED=0` as the A/B
+knob (bit-identical dumps required). (5) `tools/st2gguf.py --split N` writes the
+`gguf-split` layout so split sets are tested on the tiny fixture. (6) The equivalence
+harness lives in `07_Tests/SystemTest/equivalence/` (stdlib), reached by
+`make -C 06_Code/c equivalence …` as the oracle scripts already are; its interchange
+formats (`ppl-dump v1`, `full-logprob v1`, `e2-chunks v1`, `e3-gen v1`) and the
+`llama-server` `/completion` `n_probs` route (token ids + log-probs, preferred over
+`llama-cli`'s text) are fixed in `equivalence.md`; the engine gains `PPL_DUMP_FULL` for
+exact KL and `test_tok_gguf --encode` for the tokenizer gate. (7) `convert_qwen36.py`
+imports torch, so the streaming test's container cases run in the `gguf-oracle` job.
+
 ## 12. Phased plan (details and status in `../04_Tasks/tasks.md`)
 
 | Phase | Deliverables | Exit |

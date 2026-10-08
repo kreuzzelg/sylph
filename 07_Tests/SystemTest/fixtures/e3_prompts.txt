@@ -1,0 +1,36 @@
+# E3 generation prompts (equivalence.md). One prompt per line; '#' lines are comments.
+# 32 prompts: English and German prose, instructions, code, maths, lists, a chat-template
+# turn, multilingual snippets. Raw prompts (no template) unless the line starts with "chat:".
+The history of the Roman Empire begins with
+In 1969, the first humans landed on the Moon. The mission was called
+Write a short poem about a hummingbird in autumn.
+Explain in two sentences why the sky is blue.
+Die Geschichte der Stadt Köln beginnt mit den Römern, die
+Erkläre einem Kind, warum Eis auf Wasser schwimmt.
+def fibonacci(n):
+    """Return the n-th Fibonacci number."""
+#include <stdio.h>
+int main(void) {
+SELECT name, COUNT(*) FROM orders JOIN customers ON
+The derivative of x^3 * sin(x) with respect to x is
+Solve for x: 3x + 7 = 25. Step by step:
+List five European capitals and one fact about each:
+The quick brown fox jumps over the lazy dog. The quick brown fox
+Translate into French: "The library closes at nine in the evening."
+Once upon a time, in a small village by the sea, there lived
+Summarize the plot of Romeo and Juliet in three sentences.
+The main difference between TCP and UDP is that
+A recipe for a simple tomato soup: Ingredients:
+Il Colibrì è un uccello molto piccolo che
+日本の首都は東京で、人口は
+Что такое квантовая запутанность? Простыми словами:
+In JSON, a configuration for a web server might look like {"port":
+The periodic table groups elements by
+Dear Ms. Carter, thank you for your letter of 3 March. Regarding
+Q: What is the capital of Australia? A:
+Why do leaves change colour in autumn? Because
+Compare the merits of static and dynamic typing in programming languages.
+The train leaves Munich at 08:15 and arrives in Vienna at 12:20. The journey takes
+chat: Hello! Can you help me plan a three-day trip to Lisbon?
+chat: Schreibe eine kurze Funktion in Python, die prüft, ob eine Zahl eine Primzahl ist.
+chat: What are the three laws of thermodynamics? Keep it brief.
