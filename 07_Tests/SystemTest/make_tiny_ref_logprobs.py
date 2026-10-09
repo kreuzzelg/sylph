@@ -27,14 +27,14 @@ def main(argv):
     if len(argv) < 2:
         sys.exit(__doc__)
     model_dir, ref_path = argv[0], argv[1]
-    out = None; topk = 5; windows = 0; wlen = 512; seed = 7; full = 1
+    out = None; topk = 5; windows = 0; wlen = 512; seed = 7; n_full = 1   # n_full: windows that also get a full-logprob file
     for i, a in enumerate(argv):
         if a == "--out": out = argv[i + 1]
         if a == "--topk": topk = int(argv[i + 1])
         if a == "--windows": windows = int(argv[i + 1])
         if a == "--window-len": wlen = int(argv[i + 1])
         if a == "--seed": seed = int(argv[i + 1])
-        if a == "--full": full = int(argv[i + 1])
+        if a == "--full": n_full = int(argv[i + 1])
     out = out or str(Path(model_dir) / "ref_logprobs.tsv")
     try:
         import torch
@@ -79,7 +79,7 @@ def main(argv):
         for k in range(windows):
             seq = [rng.randrange(V) for _ in range(wlen)]
             (wdir / f"win_{k}.ids").write_text("\n".join(map(str, seq)) + "\n")
-            dump(seq, wlen // 2 + 1, wdir / f"win_{k}.tsv", wdir / f"win_{k}.full" if k < full else None)
+            dump(seq, wlen // 2 + 1, wdir / f"win_{k}.tsv", wdir / f"win_{k}.full" if k < n_full else None)
 
 
 if __name__ == "__main__":
