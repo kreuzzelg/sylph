@@ -612,16 +612,8 @@ def _engine_checks(engine_path, gpu_indices, gpus, linkage, engine_error=None):
 def gguf_sidecar_dir(model):
     """Where .coli_usage / .coli_kv live for a GGUF model: <dir>/.coli-<stem>/ (ARCHITECTURE.md §9.3),
     so two GGUF models in one directory never share usage history or KV state."""
-    model = Path(model)
-    if model.is_dir():
-        parts = sorted(model.glob("*.gguf"))
-        first = parts[0] if parts else model / "model.gguf"
-        base = model
-    else:
-        first, base = model, model.parent
-    m = ggufinfo.SPLIT_RE.match(first.name)
-    stem = m.group(1) if m else first.stem
-    return base / f".coli-{stem}"
+    from family_registry import sidecar_dir   # one rule for the engine, coli and doctor (sylph FR-29)
+    return Path(sidecar_dir(model))
 
 
 def _gguf_deep(parts, mirror_dir):
@@ -777,7 +769,20 @@ def _run_doctor_gguf(model, ram_gb, context, gpu_indices, vram_gb, *, engine_pat
                                  f"resident dense set {dense / GB:.1f} GB · {summary['typical_expert_bytes'] / 1e6:.1f} MB per expert",
                                  available_bytes=available_memory, dense_bytes=dense,
                                  typical_expert_bytes=summary["typical_expert_bytes"]))
-        checks.append(_check("placement.plan", "skip", "GGUF placement planning arrives with phase 3"))
+        # sylph phase 3/4: resource_plan plans GGUF sources (expert slices -> slots per layer)
+        try:
+            plan = build_plan(model, ram_gb, context, [], 0, available_memory=available_memory,
+                              available_disk=available_disk, gpus=[], kv_slots=1)
+            ram = plan["tiers"]["ram"]
+            if plan["warnings"]:
+                checks.append(_check("placement.plan", "warn", "; ".join(plan["warnings"]),
+                                     cache_slots_per_layer=ram.get("cache_slots_per_layer")))
+            else:
+                checks.append(_check("placement.plan", "pass",
+                                     f"CPU placement: {ram.get('cache_slots_per_layer')} expert slots per layer",
+                                     cache_slots_per_layer=ram.get("cache_slots_per_layer")))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            checks.append(_check("placement.plan", "skip", f"placement not planned: {error}"))
     else:
         for ident in ("storage.disk", "memory.ram", "placement.plan"):
             checks.append(_check(ident, "skip", "requires a valid GGUF model"))

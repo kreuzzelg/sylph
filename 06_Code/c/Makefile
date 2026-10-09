@@ -1441,6 +1441,17 @@ bench-gq: tests/bench_gq$(EXE)
 	./tests/bench_gq$(EXE) $(if $(MODEL),--model "$(MODEL)")
 .PHONY: bench-gq
 
+# Equivalence harness E1-E3 vs llama.cpp / Ollama on the same GGUF
+# (07_Tests/SystemTest/equivalence.md):
+#   make equivalence MODEL=<gguf> LLAMA=<llama.cpp bin dir> [OLLAMA=http://host:11434 TAG=<tag>]
+#        [TEXT=wiki.test.raw] [CHUNKS=16] [CAP=<n>] [LEVELS=E1,E2,E3] [OUT=<dir>] [KL_CHUNKS=1]
+equivalence: qwen36$(EXE) tests/test_tok_gguf$(EXE)
+	$(PYTHON) ../../07_Tests/SystemTest/equivalence/run_equivalence.py --model "$(MODEL)" --llama "$(LLAMA)" \
+	  $(if $(OLLAMA),--ollama "$(OLLAMA)") $(if $(TAG),--tag "$(TAG)") $(if $(TEXT),--text "$(TEXT)") \
+	  $(if $(CHUNKS),--chunks $(CHUNKS)) $(if $(CAP),--cap $(CAP)) $(if $(LEVELS),--levels $(LEVELS)) \
+	  $(if $(OUT),--out "$(OUT)") $(if $(KL_CHUNKS),--kl-chunks $(KL_CHUNKS)) $(if $(THREADS),--threads $(THREADS))
+.PHONY: equivalence
+
 tests/test_st_overlay$(EXE): tests/test_st_overlay.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

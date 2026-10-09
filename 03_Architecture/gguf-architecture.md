@@ -411,6 +411,18 @@ formats (`ppl-dump v1`, `full-logprob v1`, `e2-chunks v1`, `e3-gen v1`) and the
 exact KL and `test_tok_gguf --encode` for the tokenizer gate. (7) `convert_qwen36.py`
 imports torch, so the streaming test's container cases run in the `gguf-oracle` job.
 
+**Amendment 2026-10-09 (phase 4 as implemented).** Names: `ts_sidecar_dir`,
+`ts_read_rows_any` (raw rows of any supported dense type, for `token_embd`),
+`ts_parts_touched`, the counters `rd_slices`/`rd_bytes`/`touched[]` in `TensorSource`;
+`gguf_embd_on_demand()` and `gguf_reads_line()` in `qwen36.c`; `Model{embd_raw, embd_type}`
+(`embed == NULL` when the rows are decoded per token). The FR-30 line is composed by
+`ts_describe(ts, buf, cap, embd_mode, out_kernel, slot_bytes)`. The harness lives in
+`07_Tests/SystemTest/equivalence/` and `make -C 06_Code/c equivalence` calls it; its
+interchange formats are in `equivalence/formats.md`. The ppl-dump tail is the engine's
+` <lp> <k> <id> <lp> …` (unordered); the first comparer parsed `<id>:<lp>` and its top-1
+check was vacuous — fixed, and the comparer now refuses dumps without tails. E1/E2
+windows follow llama.cpp exactly: 255 scored targets (257…511) per 512-id window.
+
 ## 12. Phased plan (details and status in `../04_Tasks/tasks.md`)
 
 | Phase | Deliverables | Exit |

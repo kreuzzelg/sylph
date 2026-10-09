@@ -117,11 +117,16 @@ def ref_run(snap, cap, ref, env=None, binary=None):
 
 
 def ppl_run(snap, cap, ref, dump, env=None):
+    """Returns (result, dump body without the header line, output). The header names
+    the SNAP path, which differs between the single file and the parts."""
     e = {"SNAP": snap, "COLI_DENSE_I8": "0", "PPL": "1", "PPL_DUMP": dump}
     if env:
         e.update(env)
     r = run([QWEN36, cap, 8, ref], env=e, cwd=C)
-    return r, (Path(dump).read_bytes() if Path(dump).exists() else None), r.stdout + r.stderr
+    body = None
+    if Path(dump).exists():
+        b = Path(dump).read_bytes(); body = b.split(b"\n", 1)[1] if b.startswith(b"#") else b
+    return r, body, r.stdout + r.stderr
 
 
 def serve_session(snap, prompts, tok=None, env=None):
@@ -216,7 +221,7 @@ def case0(tmp):
         try:
             ps = ggufinfo.open_set(parts[0]); s = ggufinfo.summarize(ps)
             single = ggufinfo.summarize(ggufinfo.open_set(fx["f32"]))
-            check(len(ps) == 3 and s["n_tensors"] == single["n_tensors"], f"ggufinfo: 3 parts, {s['n_tensors']} tensors as the single file")
+            check(len(ps) == 3 and s["tensors"] == single["tensors"], f"ggufinfo: 3 parts, {s['tensors']} tensors as the single file")
         except Exception as ex:  # noqa: BLE001
             check(False, f"ggufinfo on the split set: {ex}")
     (tmp / "empty_mirror").mkdir(exist_ok=True)
@@ -281,8 +286,7 @@ def case4(fx, tmp, ids_f32):
     print("case 4: split set loads from the directory and from any part")
     if "parts" not in fx or ids_f32 is None:
         check(False, "split fixture missing (case 0)"); return
-    dref = tmp / "d_single.tsv"; ppl_run(fx["f32"], 8, fx["ref"], dref)
-    base = dref.read_bytes() if dref.exists() else None
+    _, base, _ = ppl_run(fx["f32"], 8, fx["ref"], tmp / "d_single.tsv")
     for snap in (fx["split_dir"], fx["parts"][0], fx["parts"][1]):
         r, out, ids, _ = ref_run(snap, 1, fx["ref"])
         sl = startup_line(out)
@@ -327,7 +331,7 @@ def case6(fx):
     if "f32" not in fx:
         return
     s = ggufinfo.summarize(ggufinfo.open_set(fx["f32"]))
-    exp_bytes = s.get("expert_bytes")  # bytes per expert, as ggufinfo reports
+    exp_bytes = s.get("typical_expert_bytes")  # bytes per expert (three slices), as ggufinfo reports
     for cap in (1, 8):
         r, out, _, hit = ref_run(fx["f32"], cap, fx["ref"])
         rd = gguf_reads(out)

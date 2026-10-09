@@ -74,10 +74,27 @@ static Enc encode_line(const char *s) {
 }
 
 int main(int argc, char **argv) {
-    const char *gguf = NULL, *json = NULL, *corpus = NULL, *llama = NULL;
+    const char *gguf = NULL, *json = NULL, *corpus = NULL, *llama = NULL, *encode = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--llama-tokenize") && i + 1 < argc) llama = argv[++i];
+        else if (!strcmp(argv[i], "--encode") && i + 1 < argc) encode = argv[++i];
         else if (!gguf) gguf = argv[i]; else if (!json) json = argv[i]; else corpus = argv[i];
+    }
+    if (encode) {
+        /* sylph FR-32 tokenizer gate: `test_tok_gguf <gguf> --encode <text>` prints the ids
+         * of the whole file (one per line) with the GGUF's tokenizer, so the equivalence
+         * harness can compare them with `llama-tokenize --ids` on the same bytes. */
+        if (!gguf) { fprintf(stderr, "usage: test_tok_gguf <gguf> --encode <text file>\n"); return 2; }
+        FILE *f = fopen(encode, "rb"); if (!f) { fprintf(stderr, "cannot open %s\n", encode); return 1; }
+        fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+        char *text = malloc((size_t)n + 1); if (!text || fread(text, 1, (size_t)n, f) != (size_t)n) { fprintf(stderr, "cannot read %s\n", encode); return 1; }
+        text[n] = 0; fclose(f);
+        GgufSet G; gguf_open_set_or_die(&G, gguf, NULL);
+        load_tokenizer_gguf(&G);
+        if (!g_tok) { fprintf(stderr, "FAIL: GGUF tokenizer did not load\n"); return 1; }
+        int *ids = NULL, nid = 0; encode_text(text, &ids, &nid);
+        for (int i = 0; i < nid; i++) printf("%d\n", ids[i]);
+        return 0;
     }
     char tmp_json[64] = "", tmp_gguf[64] = "";
     Lines L = { NULL, 0 };

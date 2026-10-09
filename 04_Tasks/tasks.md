@@ -71,16 +71,17 @@ Pre-conditions (met 2026-10-06): `07_Tests/IntegrationTest/src_facade.md` (+ run
 Pre-conditions (met 2026-10-08): `07_Tests/IntegrationTest/expert_streaming.md` (+ runner), `07_Tests/SystemTest/equivalence.md` (+ `fixtures/e3_prompts.txt`), `real_model.md` written. Finding while writing them: `qwen36.c` has **no** `DIRECT`/mirror/`URING`/split-dir machinery and writes no sidecar of its own (those live in `colibri.c`, `route_trace.h` etc.), so FR-28 is vacuous for v1 and FR-29 is a path rule (`sidecar_dir`), not a migration. `tools/convert_qwen36.py` needs torch; the container comparisons of the streaming test run in the `gguf-oracle` job.
 
 - [x] `Slot.kq` + 3-slice loads; `moe()` dispatch by slot flavour; pilot/LRU/pin unchanged — landed in phase 3; pinned by `expert_streaming.md` cases 1–3 (pass on the phase-3 binary, 2026-10-08)
-- [ ] FR-28 knobs ignored identically on both sources (case 9, passes); record the finding in the architecture (done 2026-10-08) — no O_DIRECT/mirror work in `qwen36` for v1
-- [ ] sidecar rule (FR-29): `ts_sidecar_dir` in `src.h`, `family_registry.sidecar_dir`, `coli info` field; nothing written beside a `.gguf` (case 7)
-- [ ] `tools/st2gguf.py --split N` (llama.cpp `gguf-split` layout); engine loads from the directory or any part; missing part refused by name (cases 0, 4)
-- [ ] startup `[GGUF]` line per the FR-30 format of `expert_streaming.md`; `GGUF reads:` statistics line (slices = 3 × misses, MB, MB/token, parts touched) (cases 5, 6); CUDA tier refusal note (FR-36, case 10, passes)
-- [ ] `gq_embed_row` for `token_embd` (on demand), `COLI_GGUF_EMBED=0` A/B knob, documented in `docs/ENVIRONMENT.md` (case 8)
-- [ ] harness `07_Tests/SystemTest/equivalence/` (`run_equivalence.py`, `ref_llama.py`, `ref_ollama.py`, `sylph_runner.py`, `compare.py`, `formats.md`): tokenizer gate, noise floor, E1 (ΔNLL, exact + truncated KL, top-1/5), E2 (PPL pair, sign test), E3 (prefix to the first near-tie), deliberate-difference runs (FR-35), report `.md` + `.json`; `make -C 06_Code/c equivalence MODEL=… LLAMA=… [OLLAMA=… TAG=…]`
-- [ ] engine: `PPL_DUMP_FULL=<file>` (full log-softmax per scored position, `full-logprob v1`); `tests/test_tok_gguf <gguf> --encode <text>`
-- [ ] CI subset (FR-34): `run_equivalence.py --ci` in the `gguf-oracle` job — E1/E2/E3 on the tiny torch model incl. exact KL, report produced and parsed; plus `run_expert_streaming.py` in that job (container present there)
-- [ ] **Owner runs**: tokenizer equality, E1–E3 on the real GGUF (CPU), A/B vs Ollama and vs gs64 container; report in `08_Documents/equivalence/`
-- [ ] `docs/gguf.md`, ENVIRONMENT/SETTINGS/CHANGELOG
+- [x] FR-28 knobs ignored identically on both sources (case 9 passes, 2026-10-09); finding recorded in the architecture — no O_DIRECT/mirror work in `qwen36` for v1
+- [x] sidecar rule (FR-29): `ts_sidecar_dir` in `src.h`, `family_registry.sidecar_dir`, `coli info` field; nothing written beside a `.gguf` (case 7) — 2026-10-09
+- [x] `tools/st2gguf.py --split N` (llama.cpp `gguf-split` layout, via `make_gguf_fixture.write_split_set`); engine loads from the directory or any part; missing part refused by name (cases 0, 4) — 2026-10-09
+- [x] startup `[GGUF]` line per the FR-30 format of `expert_streaming.md`; `GGUF reads:` statistics line (slices = 3 × misses, MB, MB/token, parts touched; per turn in serve mode) (cases 5, 6); CUDA tier refusal note (FR-36, case 10) — 2026-10-09
+- [x] `gq_embed_row` for `token_embd` (on demand, `ts_read_rows_any`), `COLI_GGUF_EMBED=0` A/B knob, documented in `docs/ENVIRONMENT.md`; dumps bit-identical (case 8) — 2026-10-09
+- [x] harness `07_Tests/SystemTest/equivalence/` (`run_equivalence.py`, `ref_llama.py`, `ref_ollama.py`, `sylph_runner.py`, `compare.py`, `formats.md`): tokenizer gate, noise floor, E1 (ΔNLL, exact + coarsened KL, top-1/5), E2 (PPL pair, sign test), E3 (prefix to the first near-tie), deliberate-difference runs (FR-35), report `.md` + `.json`; `make -C 06_Code/c equivalence MODEL=… LLAMA=… [OLLAMA=… TAG=…]` — written 2026-10-09; validated locally sylph-vs-sylph (same file: all zeros; F16 candidate: E1 fails on KL as it should; Q8_0 candidate: E1/E2 fail); the llama.cpp/Ollama arms run first on the owner's machine (no binaries here)
+- [x] engine: `PPL_DUMP_FULL=<file>` (full log-softmax per scored position, `full-logprob v1`; rows verified to sum to 1 and to match the dump at the target); `tests/test_tok_gguf <gguf> --encode <text>` — 2026-10-09
+- [x] CI subset (FR-34): `run_equivalence.py --ci` in the `gguf-oracle` job — E1/E2/E3 on the tiny torch model incl. exact KL, report produced and parsed; plus `run_expert_streaming.py` in that job (container present there) — wired 2026-10-09, first run pending
+- [ ] **Owner runs**: tokenizer equality, E1–E3 on the real GGUF (CPU), A/B vs Ollama and vs gs64 container; report in `08_Documents/equivalence/` — `07_Tests/SystemTest/equivalence.md` cases 1–8 and `real_model.md`; needs the Ollama tag/blob (spec §9 a)
+- [x] harness fix found while building it: the comparer parsed the log-prob tail as `id:lp`, the engine prints ` <lp> <k> <id> <lp> …` (unordered); the top-1 check of runs 13–16 was vacuous (ΔNLL unaffected) — `compare_logprobs.py`, `make_tiny_ref_logprobs.py` and `lossless_oracle.md` corrected 2026-10-09
+- [x] `docs/gguf.md` (user page), `docs/ENVIRONMENT.md` (`SNAP=<gguf>`, `COLI_GGUF_EMBED`, `PPL_DUMP`, `PPL_DUMP_FULL`), `CHANGELOG.md` — 2026-10-09
 
 ## Phase 5 — GPU (RTX 3070)
 

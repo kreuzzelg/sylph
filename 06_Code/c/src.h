@@ -44,7 +44,19 @@ typedef struct {
     /* geometry for the value-head un-permutations (GGUF only; from ts_cfg) */
     int vh, vk, vdim, kdim, convk;
     int n_layers, nextn;      /* trunk blocks and skipped NextN blocks */
+    int n_attn;               /* attention blocks (set by cfg_from_gguf; for the startup line) */
+    /* FR-30 statistics: every expert slice read goes through ts_read_expert_slice */
+    uint64_t rd_slices, rd_bytes;
+    uint8_t  touched[GGUF_MAX_SPLITS];   /* parts that served at least one slice */
 } TensorSource;
+
+/* FR-29: where sidecars of this model would live. GGUF: <dir>/.coli-<stem>/ (never beside
+ * the .gguf); container: the model directory itself, as every engine does today. The
+ * directory is not created here -- only whoever writes a sidecar creates it. */
+static void ts_sidecar_dir(const TensorSource *ts, char *out, size_t cap) {
+    if (ts->gguf) snprintf(out, cap, "%.1800s/.coli-%.250s/", ts->dir, ts->stem);
+    else snprintf(out, cap, "%.2000s", ts->path);
+}
 
 /* A .gguf file (single or split part), or a directory that holds *.gguf and no
  * config.json (a container directory always has one). */
@@ -278,21 +290,54 @@ static int ts_expert(TensorSource *ts, int layer, int eid, TsExpert *e) {
 }
 static void ts_read_expert_slice(TensorSource *ts, const TsExpert *e, int which, uint8_t *dst) {
     ts_pread(ts, e->file[which], e->off[which], dst, e->bytes[which], which == 0 ? "ffn_gate_exps slice" : which == 1 ? "ffn_up_exps slice" : "ffn_down_exps slice");
+    /* one pread per slice (FR-27); the counters are what the "GGUF reads:" line prints */
+    __atomic_add_fetch(&ts->rd_slices, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&ts->rd_bytes, (uint64_t)e->bytes[which], __ATOMIC_RELAXED);
+    if (e->file[which] >= 0 && e->file[which] < GGUF_MAX_SPLITS) ts->touched[e->file[which]] = 1;
+}
+static int ts_parts_touched(const TensorSource *ts) { int n = 0; for (int i = 0; i < ts->G.nfiles && i < GGUF_MAX_SPLITS; i++) n += ts->touched[i] != 0; return n; }
+
+/* Raw rows of a dense 2-D tensor of ANY supported type (F32/F16/BF16 included), no
+ * un-transform: for tables the engine decodes row by row (token_embd via gq_embed_row).
+ * -1 when the tensor is permuted or an expert slice (the caller dequantizes instead). */
+static int ts_read_rows_any(TensorSource *ts, const char *hf, int I, int O, uint8_t **dst, size_t *nbytes, int *type) {
+    if (!ts->gguf) return -1;
+    TsTensor t;
+    if (ts_find(ts, hf, &t)) ts_refuse_missing(ts, hf);
+    if (!gq_supported(t.type) || t.expert >= 0 || ts_perm_needed(t.xform) || t.xform == QN_X_NORM_PLUS1) return -1;
+    if (t.gt->ne[0] != I || (t.gt->n_dims > 1 ? t.gt->ne[1] : 1) != O) { fprintf(stderr, "[GGUF] %s: shape {%lld,%lld}, config implies {%d,%d} -- refusing\n", t.gname, (long long)t.gt->ne[0], (long long)(t.gt->n_dims > 1 ? t.gt->ne[1] : 1), I, O); exit(1); }
+    size_t n = gq_row_bytes(t.type, I) * (size_t)O;
+    *dst = malloc(n); if (!*dst) { fprintf(stderr, "OOM reading %s\n", hf); exit(1); }
+    ts_pread(ts, t.gt->file, t.gt->off, *dst, n, t.gname);
+    *nbytes = n; *type = t.type; return 0;
 }
 static size_t ts_expert_bytes(const TsExpert *e) { return e->bytes[0] + e->bytes[1] + e->bytes[2]; }
 
-/* ---- description for the startup line ------------------------------------------------------ */
-static void ts_describe(TensorSource *ts, char *buf, size_t cap) {
+/* ---- the startup line (FR-30, format fixed in 07_Tests/IntegrationTest/expert_streaming.md) --
+ *   [GGUF] <arch> · <B> blocks (<A> attention) · <P> part(s) · experts <tg>/<tu>/<td> <x> MB each × <E> × <B> = <y> GB
+ *          · dense <type list> <z> GB · token_embd <type> <mode> · output <type> <kernel> · experts on CPU (gq_moe_run)
+ *          · sidecars <dir>/.coli-<stem>/
+ * `embd_mode` and `out_kernel` are the engine's decisions (it knows its env and kernels);
+ * everything else is read off the index. */
+static void ts_describe(TensorSource *ts, char *buf, size_t cap, const char *embd_mode, const char *out_kernel, size_t slot_bytes) {
     if (!ts->gguf) { snprintf(buf, cap, "safetensors container %.900s", ts->path); return; }
-    int cnt[GGML_TYPE_COUNT] = {0}; int64_t dense = 0, experts = 0;
+    int cnt[GGML_TYPE_COUNT] = {0}; int64_t dense = 0, experts = 0, n_exp = 0;
     for (int64_t i = 0; i < ts->G.nt; i++) {
         GgufTensor *t = &ts->G.t[i]; const char *n = gguf_tensor_name(&ts->G, t);
-        if (t->type >= 0 && t->type < GGML_TYPE_COUNT) cnt[t->type]++;
-        if (strstr(n, "_exps.")) experts += t->nbytes > 0 ? t->nbytes : 0; else dense += t->nbytes > 0 ? t->nbytes : 0;
+        if (strstr(n, "_exps.")) { experts += t->nbytes > 0 ? t->nbytes : 0; if (t->n_dims == 3 && !n_exp) n_exp = t->ne[2]; }
+        else { dense += t->nbytes > 0 ? t->nbytes : 0; if (t->type >= 0 && t->type < GGML_TYPE_COUNT) cnt[t->type]++; }
     }
-    int w = snprintf(buf, cap, "[GGUF] qwen35moe · %d blocks%s · %d part%s · experts %.2f GB · dense %.2f GB · types", ts->n_layers,
-                     ts->nextn ? " (+NextN skipped)" : "", ts->G.nfiles, ts->G.nfiles == 1 ? "" : "s", experts / 1073741824.0, dense / 1073741824.0);
+    TsExpert e; const char *tg = "?", *tu = "?", *td = "?";
+    if (ts->n_layers > 0 && ts_expert(ts, 0, 0, &e) == 0) { tg = gguf_type_name(e.type[0]); tu = gguf_type_name(e.type[1]); td = gguf_type_name(e.type[2]); }
+    GgufTensor *emb = gguf_find(&ts->G, "token_embd.weight"), *outw = gguf_find(&ts->G, "output.weight");
+    const char *arch = gguf_kv_str(&ts->G, "general.architecture");
+    char side[2304]; ts_sidecar_dir(ts, side, sizeof side);
+    int w = snprintf(buf, cap, "[GGUF] %s · %d blocks (%d attention)%s · %d part%s · experts %s/%s/%s %.2f MB each × %lld × %d = %.2f GB · dense",
+                     arch ? arch : "?", ts->n_layers, ts->n_attn, ts->nextn ? " (+NextN skipped)" : "", ts->G.nfiles, ts->G.nfiles == 1 ? "" : "s",
+                     tg, tu, td, slot_bytes / 1048576.0, (long long)n_exp, ts->n_layers, experts / 1073741824.0);
     for (int t = 0; t < GGML_TYPE_COUNT && w < (int)cap; t++) if (cnt[t]) w += snprintf(buf + w, cap - (size_t)w, " %s×%d", gguf_type_name(t), cnt[t]);
+    if (w < (int)cap) w += snprintf(buf + w, cap - (size_t)w, " %.2f GB · token_embd %s %s · output %s %s · experts on CPU (gq_moe_run) · sidecars %s",
+                                    dense / 1073741824.0, emb ? gguf_type_name(emb->type) : "?", embd_mode, outw ? gguf_type_name(outw->type) : "?", out_kernel, side);
 }
 
 #endif /* COLI_SRC_H */

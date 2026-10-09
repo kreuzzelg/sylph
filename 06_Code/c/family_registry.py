@@ -1588,6 +1588,31 @@ def _gguf_config(model):
     return cfg
 
 
+def sidecar_dir(model_path):
+    """Where sidecars of a model live (sylph FR-29). A GGUF file, a part of a split set
+    or a directory of parts -> <dir>/.coli-<stem>/ (the stem without `.gguf` and without
+    the `-0000k-of-0000N` suffix); a container directory -> the directory itself, as every
+    engine does today. Nothing is created here; only a writer creates it."""
+    import re as _re
+    model = Path(model_path).expanduser().resolve()
+    try:
+        import ggufinfo
+        is_gguf = ggufinfo.is_gguf_source(str(model))
+    except ImportError:
+        is_gguf = False
+    if not is_gguf:
+        return str(model)
+    if model.is_dir():
+        parts = sorted(q.name for q in model.iterdir() if q.suffix.lower() == ".gguf")
+        base = parts[0] if parts else "model.gguf"
+        directory = model
+    else:
+        base, directory = model.name, model.parent
+    stem = base[:-5] if base.lower().endswith(".gguf") else base
+    stem = _re.sub(r"-\d{5}-of-\d{5}$", "", stem)
+    return str(directory / f".coli-{stem}") + os.sep
+
+
 def resolve_model(model_dir):
     model = Path(model_dir).expanduser().resolve()
     try:

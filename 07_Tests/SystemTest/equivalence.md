@@ -69,8 +69,9 @@ Files:
    of §4.1 (mean ≤ 3×floor, top-1 ≥ 99.5 %, KL ≤ 1e-3; |ΔPPL| ≤ 0.3 %) stays the
    starting point and is replaced by the calibrated values.
 2. **E1 (logits, teacher-forced)** on the reference's ids: sylph `PPL=1 PPL_DUMP` per
-   window (`prompt_ids` = first 256 ids, `full_ids` = all 512; `tf_nll` scores 256…511
-   exactly as `llama-perplexity` scores the second half); llama.cpp from the kld file.
+   window (`prompt_ids` = first **257** ids, `full_ids` = all 512; `tf_nll` scores targets
+   257…511 — 255 positions, exactly the ones `llama-perplexity` scores: its logits at
+   indices 256…510 predict tokens 257…511); llama.cpp from the kld file.
    Pass: mean |ΔNLL| and max |ΔNLL| within threshold, top-1 agreement ≥ 99.5 % (or
    ≥ 1 − 3 × floor's disagreement rate, whichever is looser), exact KL on the
    `KL_CHUNKS` windows ≤ 1e-3 nat, truncated KL reported for all.
@@ -100,7 +101,7 @@ Files:
 | 0 | **CI subset (FR-34)** — `run_equivalence.py --ci --model qwen36_tiny_f32.gguf --torch-ref qwen36_tiny` in the `gguf-oracle` job | E1 on `ref_full.json` (16 positions) and E2 on four synthetic 512-id windows (seeded ids from the 320 vocabulary; torch writes `ppl-dump` and `full-logprob` for them); comparer runs the full E1/E2 path incl. exact KL; thresholds = the `lossless_oracle.md` gate (mean 1e-6 / max 1e-5; |ΔPPL|/PPL ≤ 1e-6; KL ≤ 1e-9); `report.md`/`report.json` produced and parsed back; E3 against the torch greedy ids of `ref_full.json` (16 tokens, margin from torch) = 16/16. Green on every push. |
 | 1 | Tokenizer gate on the real file | `TEXT` (≈ 300 k ids) and the 32 prompts: identical ids sylph vs `llama-tokenize`; `add_bos false` both. |
 | 2 | Noise floor | floor_E1 and floor_E2 measured and printed; thresholds derived; CUDA sample if available. |
-| 3 | **E1** | per criteria above over 16 × 256 positions; exact KL on chunk 0. |
+| 3 | **E1** | per criteria above over 16 × 255 positions; exact KL on chunk 0. |
 | 4 | **E2** | |ΔPPL| within threshold; sign test p > 0.05; both PPLs and the per-chunk table in the report. The owner's #1370 numbers (gs64 7.325, mixed 7.281, int8 7.153 on this protocol) are quoted beside them for R1/R2. |
 | 5 | **E3** | ≥ 31/32 prompts token-identical to 128 tokens or to a justified near-tie against llama-server; Ollama text-identical to the same points (ids where `top_logprobs` is offered). |
 | 6 | Deliberate differences | `COLI_DENSE_I8=1` run reported with its ΔNLL/ΔPPL (expected worse than default; must not change the default's verdict). |
@@ -116,7 +117,7 @@ start from.
 
 ## Cost estimate (owner's machine, CPU)
 
-E1/E2: 16 windows × 512 tokens = 4 096 sylph positions (256 prefill + 256 single-token
+E1/E2: 16 windows × 512 tokens = 4 080 sylph positions (257 prefill + 255 single-token
 steps per window) plus one `llama-perplexity` pass per floor sample. At the decode
 rates of #1370 this is minutes per engine, not hours; with `CAP` ≥ 64 the expert
 cache hit rate on wikitext is high enough that disk is not the bottleneck. E3: 3 engines
@@ -140,3 +141,4 @@ make -C 06_Code/c equivalence MODEL=… LLAMA=… OLLAMA=… TAG=… TEXT=… CH
 | Date | Result |
 |---|---|
 | 2026-10-08 | document and `fixtures/e3_prompts.txt` written; the harness (`equivalence/`), `PPL_DUMP_FULL`, `test_tok_gguf --encode`, the `make equivalence` target and the CI case are phase-4 deliverables. Open: spec §9 (a) — the owner names the Ollama tag/blob. |
+| 2026-10-09 | harness implemented (`equivalence/run_equivalence.py`, `ref_llama.py`, `ref_ollama.py`, `sylph_runner.py`, `compare.py`, `formats.md`), `PPL_DUMP_FULL`, `--encode`, `make equivalence`, CI case wired into the `gguf-oracle` job (first run pending). Validated locally without references by a sylph-made pseudo reference (`--ci` mode): same file → E1/E2/E3 pass with mean/max 0 and KL 0; F16 candidate → E1 fails on exact KL (5e-9 > 1e-9) while ΔNLL stays under the gate; all-Q8_0 candidate → E1/E2 fail (mean 7.5e-2). Correction found while writing the comparer: the engine's log-prob tail is ` <lp> <k> <id> <lp> …`, not `<id>:<lp>`; see `lossless_oracle.md`. The kld-file parser of `ref_llama.py` is written from the layout of `tools/perplexity/perplexity.cpp` and **self-checks** against the printed PPL on the owner's machine; it has not run against a real file here (no llama.cpp binary in the container). |

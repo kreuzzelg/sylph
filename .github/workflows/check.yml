@@ -49,7 +49,7 @@ jobs:
           python3 tools/st2gguf.py qwen36_tiny --out qwen36_tiny_f16.gguf --type f16
           python3 tools/st2gguf.py qwen36_tiny --out qwen36_tiny_q8_0.gguf --type q8_0 --expert-type q8_0
           python3 tools/st2gguf.py qwen36_tiny --out qwen36_tiny_xq8_0.gguf --type f32 --expert-type q8_0
-          python3 ../../07_Tests/SystemTest/make_tiny_ref_logprobs.py qwen36_tiny qwen36_tiny/ref_full.json
+          python3 ../../07_Tests/SystemTest/make_tiny_ref_logprobs.py qwen36_tiny qwen36_tiny/ref_full.json --windows 4 --full 1
       - name: Build the engine and the façade test
         run: make -C 06_Code/c qwen36 tests/test_gguf_load tests/test_tok_gguf
       - name: Façade cross-check against the torch-built snapshot (F32 bit-exact, F16 one ulp)
@@ -90,6 +90,14 @@ jobs:
           PPL=1 PPL_DUMP=dump_f32.tsv COLI_DENSE_I8=0 SNAP=qwen36_tiny_f32.gguf ./qwen36 8 8 qwen36_tiny/ref_full.json | tee ppl.log
           nll=$(grep -oP 'TF-NLL: \K[0-9.]+' ppl.log)
           python3 ../../07_Tests/SystemTest/compare_logprobs.py qwen36_tiny/ref_logprobs.tsv dump_f32.tsv --mean 1e-6 --max 1e-5 --tf-nll "$nll"
+      - name: Equivalence harness, CI subset (FR-34) -- E1/E2 incl. exact KL and E3 on the tiny model vs torch, report produced
+        run: |
+          cd 06_Code/c
+          python3 ../../07_Tests/SystemTest/equivalence/run_equivalence.py --ci --model qwen36_tiny_f32.gguf --torch-ref qwen36_tiny --out equiv_ci
+          python3 ../../07_Tests/SystemTest/equivalence/compare.py --check equiv_ci/report.json
+          cat equiv_ci/report.md
+      - name: Expert streaming integration test (container present here)
+        run: python3 07_Tests/IntegrationTest/run_expert_streaming.py
 
   macos:
     runs-on: macos-latest

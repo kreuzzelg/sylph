@@ -813,6 +813,7 @@ typedef struct {
     TensorSource src;       /* sylph: where the weights come from (S for the container, GGUF otherwise) */
     int is_gguf;
     size_t gguf_slot_bytes; /* largest expert (three slices) over all blocks */
+    uint8_t *embd_raw; int embd_type;   /* GGUF: token_embd as stored, decoded per token by gq_embed_row (embed == NULL then) */
     int quant_bits;
     float *embed, *final_norm;
     QW lm_head;
@@ -1241,6 +1242,9 @@ static void pack_int4_g64_planar(const float *w, uint8_t *q4, float *sg, int O, 
 static uint64_t g_qwen_matmul_d_calls;
 #endif
 static int dense_i8_on(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_DENSE_I8"); v=!(e&&*e=='0'); } return v; }
+/* sylph: COLI_GGUF_EMBED=0 keeps the phase-3 f32 embedding table (A/B knob); default
+ * decodes token_embd row by row with gq_embed_row (2 GB less RSS on the real file). */
+static int gguf_embd_on_demand(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_GGUF_EMBED"); v=!(e&&*e=='0'); } return v; }
 /* COLI_KV_PREFIX=0: never reuse a previous turn's state. Kept as an escape
  * hatch and as the B arm of the A/B that shows reuse changes nothing but
  * the time. */
@@ -1623,8 +1627,19 @@ static void cfg_from_gguf(Model *m) {
                  i, (long long)e.cols[0], (long long)e.rows[0], (long long)e.cols[1], (long long)e.rows[1], (long long)e.cols[2], (long long)e.rows[2], c->hidden, c->inter);
         if (ts_expert_bytes(&e) > m->gguf_slot_bytes) m->gguf_slot_bytes = ts_expert_bytes(&e);
     }
-    char line[1024]; ts_describe(ts, line, sizeof line);
-    fprintf(stderr, "%s · %.2f MB per expert slot\n", line, m->gguf_slot_bytes / 1048576.0);
+    ts->n_attn = c->n_active;
+    /* what the engine will do with token_embd and output (FR-30): the embedding is decoded
+     * per token unless COLI_GGUF_EMBED=0 asks for the phase-3 f32 table; the lm_head kernel
+     * follows load_tq's GGUF branch (K-quants -> gq_matmul, Q8_0 -> the lossless split on
+     * matmul_q_gs, f32/f16/bf16 -> the container's int8-at-load or f32 matmul_d). */
+    const char *embd_mode = gguf_embd_on_demand() ? "on demand" : "f32 at load";
+    const char *out_kernel = "matmul_d";
+    { GgufTensor *ow = gguf_find(G, "output.weight");
+      if (ow && (ow->type == GQ_Q4_K || ow->type == GQ_Q5_K || ow->type == GQ_Q6_K || ow->type == GQ_Q4_0)) out_kernel = "gq_matmul";
+      else if (ow && ow->type == GQ_Q8_0 && c->hidden % 32 == 0) out_kernel = "matmul_q_gs";
+      else if (dense_i8_on()) out_kernel = "matmul_q (int8 at load)"; }
+    char line[4096]; ts_describe(ts, line, sizeof line, embd_mode, out_kernel, m->gguf_slot_bytes);
+    fprintf(stderr, "%s\n", line);
     if (nextn) fprintf(stderr, "[GGUF] skipping %lld NextN (MTP) block%s (blk.%d..); the engine predicts one token per step\n", (long long)nextn, nextn > 1 ? "s" : "", c->n_layers);
     fprintf(stderr, "[meta] from GGUF: q_heads=%d kv_heads=%d head_dim=%d q_head_dim=%d o_in=%d rotary_dim=%d n_experts=%d topk=%d inter=%d shared_inter=%d attn_output_gate=%d n_active=%d | DeltaNet vheads=%d kheads=%d kdim=%d vdim=%d convk=%d conv_dim=%d\n",
             c->q_heads, c->kv_heads, c->head_dim, c->q_head_dim, c->o_in, c->rotary_dim, c->n_experts, c->topk, c->inter, c->shared_inter,
@@ -1742,7 +1757,12 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     int quantize_dense = load_boundaries && dense_i8_on();
     int qcount = 0; double qfreed = 0;
     if (load_boundaries) {
-        m->embed = load_t_n(m, "model.embed_tokens.weight", (int64_t)c->vocab * c->hidden);
+        m->embed = NULL; m->embd_raw = NULL; m->embd_type = -1;
+        if (m->is_gguf && gguf_embd_on_demand()) {
+            size_t nb = 0;
+            if (ts_read_rows_any(&m->src, "model.embed_tokens.weight", c->hidden, c->vocab, &m->embd_raw, &nb, &m->embd_type) != 0) m->embd_raw = NULL;
+        }
+        if (!m->embd_raw) m->embed = load_t_n(m, "model.embed_tokens.weight", (int64_t)c->vocab * c->hidden);
         load_tq(m, "lm_head.weight", c->hidden, c->vocab, quantize_dense, "lmhead", &m->lm_head);
         if (m->lm_head.q) { qcount++; qfreed += (double)c->hidden * c->vocab * sizeof(float); }
         m->final_norm = load_t_n(m, "model.norm.weight", c->hidden);
@@ -3175,7 +3195,8 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
                     ids[s], c->vocab - 1);
             exit(1);
         }
-        memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
+        if (m->embd_raw) gq_embed_row(m->embd_type, m->embd_raw, ids[s], x + (int64_t)s*D, D);   /* GGUF: decode the row as stored */
+        else memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
     }
     layers_forward_range(m, x, S, pos_base, 0, c->n_layers, 1, lf);
     /* Recorded HERE, where the tokens actually entered the state, rather than
@@ -3553,6 +3574,20 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     }
 }
 
+/* FR-30 statistics for a GGUF source: slices = 3 x expert misses (one pread per slice),
+ * MB = bytes of those slices, per generated/scored token, parts touched. Deltas since the
+ * previous call (serve prints one line per turn), everything since start otherwise. */
+static void gguf_reads_line(Model *m, FILE *f, int tokens, int delta) {
+    static uint64_t p_sl = 0, p_by = 0;
+    if (!m->is_gguf) return;
+    uint64_t sl = __atomic_load_n(&m->src.rd_slices, __ATOMIC_RELAXED), by = __atomic_load_n(&m->src.rd_bytes, __ATOMIC_RELAXED);
+    uint64_t dsl = delta ? sl - p_sl : sl, dby = delta ? by - p_by : by;
+    p_sl = sl; p_by = by;
+    int parts = ts_parts_touched(&m->src);
+    fprintf(f, "GGUF reads: %llu slices · %.2f MB · %.3f MB/token · %d part%s touched\n", (unsigned long long)dsl, dby / 1e6,
+            tokens > 0 ? dby / 1e6 / tokens : 0.0, parts, parts == 1 ? "" : "s");
+}
+
 static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out) {
     Cfg *c = &m->c;
     if (nfull > QWEN36_ATTN_MAX_CTX) {
@@ -3575,6 +3610,16 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
         if (!dump) fprintf(stderr, "[ppl] cannot open %s for the logprob dump\n", dpath);
         else fprintf(dump, "# sylph ppl-dump v1 model=%s vocab=%d scored=%d topk=5\n", getenv("SNAP") ? getenv("SNAP") : "?", c->vocab, nfull - np);
     }
+    /* sylph FR-33 (exact KL): PPL_DUMP_FULL=<file> writes the whole log-softmax of every
+     * scored position as little-endian f32 (`full-logprob v1`, equivalence.md): one text
+     * header line, then vocab x 4 bytes per position. 254 MB per 256 positions on the
+     * real model, so the harness asks for it on one window only. */
+    FILE *full_out = NULL; const char *fpath = getenv("PPL_DUMP_FULL"); float *lpv = NULL;
+    if (fpath && *fpath) {
+        full_out = fopen(fpath, "wb");
+        if (!full_out) fprintf(stderr, "[ppl] cannot open %s for the full log-prob dump\n", fpath);
+        else { fprintf(full_out, "# sylph full-logprob v1 vocab=%d positions=%d\n", c->vocab, nfull - np); lpv = falloc(c->vocab); }
+    }
     float *logit = step(m, full, np, 0);
     for (int i = np; i < nfull; i++) {
         float mx = logit[0]; for (int v = 1; v < c->vocab; v++) if (logit[v] > mx) mx = logit[v];
@@ -3582,6 +3627,7 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
         double lp = (double)logit[full[i]] - mx - log(Z);
         nll += -lp;
         if (dump) { char tail[512]; coli_logprob_tail(tail, sizeof tail, logit, c->vocab, full[i], 5); fprintf(dump, "%d\t%d\t%.7g\t%s\n", i, full[i], lp, tail); }
+        if (full_out) { double lz = mx + log(Z); for (int v = 0; v < c->vocab; v++) lpv[v] = (float)((double)logit[v] - lz); fwrite(lpv, sizeof(float), (size_t)c->vocab, full_out); }
         scored++;
         free(logit); logit = NULL;
         if (i == nfull - 1) break;
@@ -3589,6 +3635,7 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
     }
     if (logit) free(logit);
     if (dump) { fclose(dump); fprintf(stderr, "[ppl] wrote %d positions -> %s\n", scored, dpath); }
+    if (full_out) { fclose(full_out); free(lpv); fprintf(stderr, "[ppl] wrote %d full log-prob rows -> %s\n", scored, fpath); }
     *nll_out = nll / scored;
     return scored;
 }
@@ -3954,6 +4001,7 @@ static void serve_one(Model *m, ServeReq *q){
     printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n",q->id,gen,
            dt>0?gen/dt:0.0,0.0,rss_gb(),np,limited);
     fflush(stdout);
+    gguf_reads_line(m, stderr, gen, 1);     /* sylph FR-30: this turn's slice reads */
 }
 
 static void serve_loop(Model *m){
@@ -4289,6 +4337,7 @@ int main(int argc, char **argv) {
         printf("Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
                (unsigned long long)m.hits, (unsigned long long)m.miss);
         route_footer(stdout, &m);
+        gguf_reads_line(&m, stdout, scored, 0);
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
         free(buf); free(arena); return 0;
     }
@@ -4355,6 +4404,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);
     route_footer(stderr, &m);
+    gguf_reads_line(&m, stderr, n_new, 0);
     fprintf(stderr, "Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
     free(buf); free(arena);
     /* Oracle mode is a gate, not a report: a mismatch must fail the caller.

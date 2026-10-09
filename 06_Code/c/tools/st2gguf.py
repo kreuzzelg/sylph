@@ -37,7 +37,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from make_gguf_fixture import GgufWriter, U32, I32, F32 as KV_F32, BOOL, STR, ARR  # noqa: E402
+from make_gguf_fixture import GgufWriter, U32, I32, F32 as KV_F32, BOOL, STR, ARR, write_split_set  # noqa: E402
 import qwen36_tensor_kinds as kinds  # noqa: E402
 
 T_F32, T_F16, T_Q8_0, T_BF16 = 0, 1, 8, 30
@@ -236,6 +236,7 @@ def main(argv=None):
     ap.add_argument("hf_dir"); ap.add_argument("--out", required=True)
     ap.add_argument("--type", default="f32", choices=sorted(TYPE_IDS)); ap.add_argument("--expert-type", default=None, choices=sorted(TYPE_IDS))
     ap.add_argument("--tokenizer", default=None); ap.add_argument("--name", default=None); ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--split", type=int, default=0, help="write N parts <stem>-0000k-of-0000N.gguf as llama.cpp's gguf-split does (expert_streaming.md)")
     a = ap.parse_args(argv)
     g = load_config(a.hf_dir)
     snap = Snapshot(a.hf_dir)
@@ -345,6 +346,28 @@ def main(argv=None):
     print(f"{a.out}: qwen35moe, {g['n_layers']} blocks ({g['layer_types'].count('full_attention')} attention), {g['n_experts']} experts, "
           f"{sum(c for c, _ in stats.values())} tensors, {total / 1e6:.2f} MB, dense {dense_t}, experts {exp_t}, tokenizer {'from ' + a.tokenizer if a.tokenizer else 'placeholder'}")
     if a.dry_run: return 0
+    if a.split and a.split > 1:
+        # gguf-split layout: part 1 carries the model metadata, parts > 1 only the split.*
+        # keys (write_split_set adds them); tensors in file order, payload bytes balanced,
+        # every part holds at least one tensor and no tensor straddles parts.
+        n = min(a.split, len(w.tensors))
+        total = sum(len(t[3]) for t in w.tensors)
+        groups, cur, acc = [], [], 0
+        for i, t in enumerate(w.tensors):
+            remaining_parts = n - len(groups)
+            cur.append(t); acc += len(t[3])
+            left = len(w.tensors) - i - 1
+            if remaining_parts > 1 and (acc >= total / n or left == remaining_parts - 1):
+                groups.append(cur); cur, acc = [], 0
+        if cur: groups.append(cur)
+        while len(groups) < n:                      # pathological: more parts than bytes allow
+            big = max(range(len(groups)), key=lambda k: len(groups[k]))
+            groups.append([groups[big].pop()])
+        out = Path(a.out); stem = out.name[:-5] if out.name.lower().endswith(".gguf") else out.name
+        parts = [(w.kv if k == 0 else [], [tuple(t[:4]) for t in grp]) for k, grp in enumerate(groups)]
+        paths = write_split_set(str(out.parent), stem, parts, alignment=w.alignment)
+        print(f"  split: {len(paths)} parts, {[Path(q).name for q in paths]}")
+        return 0
     w.write(a.out)
     return 0
 

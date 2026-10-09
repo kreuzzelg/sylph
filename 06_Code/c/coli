@@ -74,7 +74,8 @@ except ModuleNotFoundError:
 
 from family_registry import (FamilyConfigError, UnknownFamilyError, all_families,
                              display_for, family_by_id, family_for_config, resolve_model,
-                             tuning_replay_prompt)
+                             tuning_replay_prompt,
+                             sidecar_dir)
 
 _TUNE_ROTATION_PROMPT = (
     "A service has high median throughput but poor tail latency. Explain how "
@@ -1187,6 +1188,9 @@ def cmd_info(a):
         import ggufinfo
         parts = ggufinfo.open_set(a.model, os.environ.get("COLI_MODEL_DIRS", ""))
         print(ggufinfo.format_inspect(parts, ggufinfo.summarize(parts)))
+        # sylph FR-29: sidecars of a GGUF model never sit beside the .gguf
+        side = sidecar_dir(a.model)
+        print(f"   {C.gray}{'sidecars':<10}{C.r} {side} {'' if os.path.isdir(side) else '(none yet)'}")
         return
     banner("info", model=a.model)
     if not a.model:

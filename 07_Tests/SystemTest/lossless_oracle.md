@@ -47,8 +47,13 @@ With `PPL=1`, `PPL_DUMP=<file>` makes `tf_nll` write, after the usual `TF-NLL:` 
 one line per scored position `pos` (0-based index into `full_ids`, the positions
 `tf_nll` scores), `logprob_target` in nats with 7 significant digits, and `tail` the
 text `coli_logprob_tail` produces for the serve protocol's `logprobs=k` channel
-(` <lp> <id>:<lp> <id>:<lp> …`, top-k ids and their log-probs) — so the dump and the
-serve channel can never disagree. `−Σ logprob_target / N` equals the printed TF-NLL
+(` <lp> <k> <id> <lp> <id> <lp> …`: the target's log-prob, k, then the k best ids with
+their log-probs in **no particular order**) — so the dump and the serve channel can never
+disagree. *Corrected 2026-10-09: the first version of this paragraph and of
+`make_tiny_ref_logprobs.py` spelled the tail `<id>:<lp>`; `compare_logprobs.py` parsed
+that spelling, found no pairs in the engine's dumps, and its "top-1 identical" check was
+vacuous in runs 13–16 (the ΔNLL numbers were unaffected). Both now use the engine's
+format and the comparer refuses dumps without tails.* `−Σ logprob_target / N` equals the printed TF-NLL
 within 1e-6. The reference script writes the same format from torch.
 
 ## Pass criteria
