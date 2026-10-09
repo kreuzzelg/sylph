@@ -55,6 +55,7 @@ specification serves:
   detection (present only in bartowski's file; see §9).
 - Other engines: GLM-5.2 (`glm-dsa`) keeps its phase-0 design and follows once the
   Qwen3.6 path is measured; the reader and kernels are architecture-agnostic.
+  *Phase 6 (2026-10-09): GLM-5.2 enters scope through `colibri.c`'s GGUF arm per the v1 design; its tests are `07_Tests/IntegrationTest/glm_assembly.md`, `07_Tests/SystemTest/glm_lossless_oracle.md`, `glm_real_model.md`. The public quantizations are surveyed (`ud_survey.md`) before any type outside the set is added.*
 - Parity with Ollama's *server* features (API, templates, sampling); only the
   **model function** is compared.
 
@@ -132,6 +133,7 @@ Everything in this section was verified against real files on 2026-10-05
 | FR-22 | Rotary: `rope.dimension_count` = 64 of 256 dims (partial factor 0.25); `rope.dimension_sections` (mrope for vision) is ignored for text, exactly as the container path does. | MUST | 3 |
 | FR-23 | Layer kinds from `full_attention_interval` (every 4th block is attention) **and** confirmed by tensor presence (`attn_q` vs `attn_qkv`); mismatch refuses. | MUST | 3 |
 | FR-24 | MTP/NextN (`blk.<block_count−1>.nextn.*`, bartowski files only): detected and reported; loading is MAY (the engine has no MTP for Qwen3.6 today). | MAY | 6 |
+| | *Note 2026-10-09 (phase-6 tests):* if the head is loaded, the contract is **lossless greedy decoding** (the trunk verifies every drafted token) with the acceptance statistics printed and the precision guard of the v1 design (`eh_proj` ≥ 8 bpw unless `MTP=1`); the serve path streams accepted tokens with the trunk's log-probs. Otherwise the line says `present, not used` (`07_Tests/IntegrationTest/qwen36_mtp.md`). | | |
 | FR-25 | Lossless **oracle gate**: `tools/make_qwen36_oracle.py`'s tiny model written as an **F32 GGUF** reproduces `ref_qwen36.json` exactly as the container does. | MUST | 3 |
 | FR-26 | `coli` resolves the family from `general.architecture` (`qwen35moe` → `qwen36`, `glm-dsa` → `glm`), refuses others by name; `coli doctor/info/plan` read GGUF sources. | MUST | 3 |
 

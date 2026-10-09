@@ -467,6 +467,23 @@ not a reference). The `Q8_0` dense matrices exist as the lossless split only wit
 dense-int8 path on; with `COLI_DENSE_I8=0` they are f32 and nothing is offered to the
 placer (the phase-4 harness default) — the system test runs the CUDA arm with the default.
 
+**Amendment 2026-10-09 (phase-6 tests written; design fixed by them).** (1) GLM-5.2 follows
+the v1 design (`git show 5184f3d8:03_Architecture/gguf-architecture.md` §6.1, §7, §8) in
+`colibri.c`: `glm_names.h`, `Cfg` from `glm-dsa.*`, the absorbed MLA split rebuilt into the
+engine's `kv_b` (`glm_kv_b_from_split`, k part widened and transposed per head, v part a view;
+`attn_kv_b` used directly when present), `idx_type[]` from the explicit array or from tensor
+presence (`glm_idx_types`), the NextN precision predicate (`glm_mtp_bits_ok`), `ESlot` views
+onto raw blocks (`QT.fmt = 16 + type`, the phase-5 device format ids reused on the host side,
+`qt_is_ggml` dispatching to `gq.h`). `tools/st2gguf.py` gains `--arch glm-dsa` with
+`glm_tensor_kinds.py` and writes the split as llama.cpp does, so the oracle exercises the
+reconciliation. (2) The Qwen NextN head, if used, is a lossless speculative decoder (trunk
+verifies); its block is a full-attention layer with routed experts in the same LRU cache
+(identity `(n_layers, eid)`). (3) "More types" is decided from the headers-only survey of the
+public quantizations (`08_Documents/survey/`), not assumed. (4) Upstream sync is a tool with a
+read-only check and a dry merge in a temporary clone; `upstream/main` is 932 commits ahead.
+(5) The GLM real-model run is gated on the owner's decision and on a host that holds the
+chosen quant (467 GB / 21 GB dense at `UD-Q4_K_XL`).
+
 ## 12. Phased plan (details and status in `../04_Tasks/tasks.md`)
 
 | Phase | Deliverables | Exit |

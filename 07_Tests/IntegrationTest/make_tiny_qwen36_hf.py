@@ -11,7 +11,7 @@ PLUMBING (two sources, one engine, identical tensors), the torch-built fixture
 in SystemTest/lossless_oracle.md pins the MATH.
 
     python3 07_Tests/IntegrationTest/make_tiny_qwen36_hf.py <out_dir> [--seed N] [--dtype f32|bf16]
-                                                          [--hidden H] [--inter I] [--layers L] [--experts E]
+                                                          [--hidden H] [--inter I] [--layers L] [--experts E] [--mtp]
 
 The geometry overrides exist for cuda_tier_kquant.md: K-quant experts need hidden and
 inter to be multiples of 256 (`--hidden 256 --inter 256`); every other test uses the preset.
@@ -73,6 +73,33 @@ def tensor_shapes(g):
         shapes[p + "mlp.shared_expert_gate.weight"] = [1, H]
     shapes["model.norm.weight"] = [H]
     shapes["lm_head.weight"] = [V, H]
+    if g.get("mtp"):
+        # The NextN / MTP head as transformers' Qwen3-Next saves it (qwen36_mtp.md): one
+        # full-attention block under mtp.layers.0.* plus the fusion fc and its three norms.
+        # llama.cpp stores them as blk.<n_layers>.* and blk.<n_layers>.nextn.{eh_proj, enorm,
+        # hnorm, shared_head_norm}; bartowski's Qwen3.6 file carries exactly that block.
+        shapes["mtp.fc.weight"] = [H, 2 * H]
+        shapes["mtp.pre_fc_norm_embedding.weight"] = [H]
+        shapes["mtp.pre_fc_norm_hidden.weight"] = [H]
+        shapes["mtp.norm.weight"] = [H]
+        p = "mtp.layers.0."
+        shapes[p + "input_layernorm.weight"] = [H]
+        shapes[p + "post_attention_layernorm.weight"] = [H]
+        shapes[p + "self_attn.q_proj.weight"] = [g["q_heads"] * g["head_dim"] * 2, H]
+        shapes[p + "self_attn.k_proj.weight"] = [g["kv_heads"] * g["head_dim"], H]
+        shapes[p + "self_attn.v_proj.weight"] = [g["kv_heads"] * g["head_dim"], H]
+        shapes[p + "self_attn.o_proj.weight"] = [H, g["q_heads"] * g["head_dim"]]
+        shapes[p + "self_attn.q_norm.weight"] = [g["head_dim"]]
+        shapes[p + "self_attn.k_norm.weight"] = [g["head_dim"]]
+        shapes[p + "mlp.gate.weight"] = [g["n_experts"], H]
+        for e in range(g["n_experts"]):
+            shapes[p + f"mlp.experts.{e}.gate_proj.weight"] = [g["inter"], H]
+            shapes[p + f"mlp.experts.{e}.up_proj.weight"] = [g["inter"], H]
+            shapes[p + f"mlp.experts.{e}.down_proj.weight"] = [H, g["inter"]]
+        shapes[p + "mlp.shared_expert.gate_proj.weight"] = [g["shared_inter"], H]
+        shapes[p + "mlp.shared_expert.up_proj.weight"] = [g["shared_inter"], H]
+        shapes[p + "mlp.shared_expert.down_proj.weight"] = [H, g["shared_inter"]]
+        shapes[p + "mlp.shared_expert_gate.weight"] = [1, H]
     return shapes
 
 
@@ -146,6 +173,7 @@ def config(g, dtype):
         "rope_parameters": {"rope_type": "default", "rope_theta": g["theta"], "partial_rotary_factor": g["rope_dim"] / g["head_dim"]},
         "max_position_embeddings": 512, "hidden_act": "silu", "tie_word_embeddings": False, "use_cache": True,
         "pad_token_id": 0, "bos_token_id": 1, "eos_token_id": g["vocab"] - 1,
+        "mtp_num_hidden_layers": 1 if g.get("mtp") else 0,
         "transformers_version": "synthetic (07_Tests/IntegrationTest/make_tiny_qwen36_hf.py)",
     }
 
@@ -162,6 +190,8 @@ def main(argv):
         # inter to be multiples of 256; the default preset stays as phase 3 pinned it)
         if a in ("--hidden", "--inter", "--layers", "--experts"):
             g[{"--hidden": "hidden", "--inter": "inter", "--layers": "n_layers", "--experts": "n_experts"}[a]] = int(argv[i + 1])
+        if a == "--mtp":
+            g["mtp"] = 1   # one NextN block (qwen36_mtp.md)
     rng = random.Random(seed)
     out.mkdir(parents=True, exist_ok=True)
     tensors = []

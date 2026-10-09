@@ -99,9 +99,13 @@ Pre-conditions (met 2026-10-09): `07_Tests/IntegrationTest/cuda_tier_kquant.md` 
 
 ## Phase 6 — breadth
 
-- [ ] GLM-5.2 (`glm-dsa`) assembly per the v1 design (MLA split, indexer, NextN)
-- [ ] MTP/NextN for `qwen35moe` (bartowski files)
-- [ ] more types if a reference file needs them; `UD-*` dynamic quants survey
+Pre-conditions (met 2026-10-09): `07_Tests/IntegrationTest/glm_assembly.md` (+ runner, `make_tiny_glm_hf.py`, `tests/test_gguf_load_glm.c`), `qwen36_mtp.md` (+ runner, `make_tiny_qwen36_hf.py --mtp`), `07_Tests/SystemTest/glm_lossless_oracle.md`, `glm_real_model.md`, `ud_survey.md` (+ runner, first report in `08_Documents/survey/`), `upstream_sync.md` (+ runner) written. Findings while writing them: (1) the GLM-5.2 engine is `colibri.c` (`glm-dsa → glm`), which already has MTP draft/verify and the DSA indexer for its container; the v1 design (commit 5184f3d8) is the GLM plan, phases 1–5 built every generic piece it needs. (2) `UD-Q4_K_XL` is 467 GB with a 21 GB `Q8_0` dense set: the real-model test is blocked on the owner's decision (spec §9 d) and on the survey's smaller quants. (3) unsloth and bartowski publish I-quant files (`IQ1_M`…`IQ4_XS`, `MXFP4_MOE`) beside the K-quants: the survey decides "more types". (4) `upstream/main` is 932 commits ahead (v2.0.0): the sync is a real merge, hence a tool with a dry run. (5) The Qwen MTP head is MAY; the test fixes the only acceptable contract (lossless under greedy) and the fallback wording if the head is not used.
+
+- [ ] GLM-5.2 (`glm-dsa`) assembly per the v1 design: `glm_names.h`, `st2gguf --arch glm-dsa` (+ `glm_tensor_kinds.py`, absorbed MLA split, `--kv-b fused|split|none`, `--mtp-type`, `--gating-func`, `--expert-groups` for the refusal fixtures), `Cfg` from `glm-dsa.*`, `glm_kv_b_from_split`, `glm_idx_types`, `glm_mtp_bits_ok`, `ESlot` on raw blocks (`qt_is_ggml`), `[GGUF] glm-dsa` line, registry/CLI arms — `glm_assembly.md`, `glm_lossless_oracle.md` (CI step)
+- [ ] MTP/NextN for `qwen35moe` (bartowski files): names, `st2gguf` `mtp` arm, loader with the precision guard, lossless draft/verify, `[MTP]` statistics — or the recorded decision not to use the head — `qwen36_mtp.md`
+- [ ] more types if a reference file needs them: decided from `08_Documents/survey/` (`ud_survey.md` case 5)
+- [ ] upstream sync tooling `tools/upstream_sync.py` (`--check/--trial/--apply`), procedure in `docs/gguf.md` — `upstream_sync.md`; the apply itself is housekeeping below
+- [ ] **Owner decisions**: GLM-5.2 on the roadmap and on which host/quant (spec §9 d); whether the Qwen MTP head is used (§9 c)
 
 ## Housekeeping
 
