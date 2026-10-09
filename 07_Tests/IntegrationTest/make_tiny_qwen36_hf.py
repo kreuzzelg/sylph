@@ -11,6 +11,10 @@ PLUMBING (two sources, one engine, identical tensors), the torch-built fixture
 in SystemTest/lossless_oracle.md pins the MATH.
 
     python3 07_Tests/IntegrationTest/make_tiny_qwen36_hf.py <out_dir> [--seed N] [--dtype f32|bf16]
+                                                          [--hidden H] [--inter I] [--layers L] [--experts E]
+
+The geometry overrides exist for cuda_tier_kquant.md: K-quant experts need hidden and
+inter to be multiples of 256 (`--hidden 256 --inter 256`); every other test uses the preset.
 
 Standard library only.
 """
@@ -150,10 +154,14 @@ def main(argv):
     if len(argv) < 1:
         sys.exit(__doc__)
     out = Path(argv[0]); seed = 20261006; dtype = "f32"
+    g = dict(GEOMETRY)
     for i, a in enumerate(argv):
         if a == "--seed": seed = int(argv[i + 1])
         if a == "--dtype": dtype = argv[i + 1]
-    g = dict(GEOMETRY)
+        # geometry overrides (cuda_tier_kquant.md: K-quant experts need hidden and
+        # inter to be multiples of 256; the default preset stays as phase 3 pinned it)
+        if a in ("--hidden", "--inter", "--layers", "--experts"):
+            g[{"--hidden": "hidden", "--inter": "inter", "--layers": "n_layers", "--experts": "n_experts"}[a]] = int(argv[i + 1])
     rng = random.Random(seed)
     out.mkdir(parents=True, exist_ok=True)
     tensors = []

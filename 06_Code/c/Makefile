@@ -1452,6 +1452,18 @@ equivalence: qwen36$(EXE) tests/test_tok_gguf$(EXE)
 	  $(if $(OUT),--out "$(OUT)") $(if $(KL_CHUNKS),--kl-chunks $(KL_CHUNKS)) $(if $(THREADS),--threads $(THREADS))
 .PHONY: equivalence
 
+# Kernel oracle for the raw ggml block formats on the device (cuda_tier_kquant.md
+# part B, owner's card): every GEMV bit-identical to gq_dot_row_ref, the fused
+# expert within the layer tolerance, refusals by shape. gq.h is compiled as C
+# into tests/gq_ref.o (the mxfp4_ref.c arrangement) so the oracle is the
+# engine's own code, not a C++ re-statement of it.
+cuda-test-gq: tests/test_gq_cuda.cu tests/gq_ref.c backend_cuda.cu backend_cuda.h backend_gpu_compat.h gq.h
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	$(CC) $(filter-out -Xclang -fopenmp,$(CFLAGS)) -fno-openmp -fPIC -c tests/gq_ref.c -o tests/gq_ref.o
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_gq_cuda.cu $(if $(filter 1,$(HIP)),-x none) tests/gq_ref.o -o gq_cuda_test$(EXE) $(GPU_TEST_LIBS)
+	./gq_cuda_test$(EXE)
+.PHONY: cuda-test-gq
+
 tests/test_st_overlay$(EXE): tests/test_st_overlay.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -2041,6 +2053,22 @@ tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c g
 # dnout / attnproj / shexp offered, placed and served from VRAM (fake backend).
 tests/test_qwen36_trunk_dense$(EXE): tests/test_qwen36_trunk_dense.c gsgemv.h qgemv.h sse41_kernels.h tests/qwen36_fake_cuda.h qwen36.c expert_ffn.h qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# sylph phase 5 (07_Tests/IntegrationTest/cuda_tier_kquant.md): the CUDA tier on raw
+# ggml blocks. Three host-side tests run without a GPU: the block-format truth
+# table, the tier fed with GGUF slots on the fake backend, and the whole engine
+# with the fake backend linked (same CLI as qwen36; run_cuda_tier_kquant.py
+# compares it with ./qwen36). The kernel oracle on silicon is cuda-test-gq.
+tests/test_cuda_block_fmt_guard$(EXE): tests/test_cuda_block_fmt_guard.c backend_cuda.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_qwen36_tier_kq$(EXE): tests/test_qwen36_tier_kq.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h gq.h gguf.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+tests/test_qwen36_tier_kq_engine$(EXE): tests/test_qwen36_tier_kq_engine.c qwen36.c src.h gq.h gguf.h gguf_xform.h qwen35_names.h gsgemv.h qgemv.h sse41_kernels.h tests/qwen36_fake_cuda.h expert_ffn.h qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+phase5-tests: tests/test_cuda_block_fmt_guard$(EXE) tests/test_qwen36_tier_kq$(EXE) tests/test_qwen36_tier_kq_engine$(EXE)
+	./tests/test_cuda_block_fmt_guard$(EXE)
+	./tests/test_qwen36_tier_kq$(EXE)
+.PHONY: phase5-tests
 
 # #1391: il decode path deve offrire gli esperti int8 al tier, non solo il warmstart
 tests/test_qwen36_tier_int8_decode$(EXE): tests/test_qwen36_tier_int8_decode.c gsgemv.h qgemv.h sse41_kernels.h tests/qwen36_fake_cuda.h qwen36.c expert_ffn.h qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h

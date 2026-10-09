@@ -403,8 +403,12 @@ def case10(fx, ids_f32):
     if "f32" not in fx or ids_f32 is None:
         return
     r, out, ids, _ = ref_run(fx["f32"], 8, fx["ref"], {"COLI_CUDA": "1"})
-    note = "the VRAM expert tier does not take GGUF K-quant experts yet"
-    check(r.ran and ids == ids_f32 and out.count(note) == 1, "note printed once, ids unchanged")
+    # phase 4 printed the "not yet" note; phase 5 replaces it with the build note on a
+    # CPU-only binary (cuda_tier_kquant.md, "Engine messages"). Either is one line, once.
+    notes = ("the VRAM expert tier does not take GGUF K-quant experts yet",
+             "COLI_CUDA=1 ignored: built without CUDA")
+    n = sum(out.count(t) for t in notes)
+    check(r.ran and ids == ids_f32 and n == 1, f"note printed once ({n}), ids unchanged")
 
 
 def case11(fx):

@@ -86,10 +86,16 @@ Pre-conditions (met 2026-10-08): `07_Tests/IntegrationTest/expert_streaming.md` 
 
 ## Phase 5 — GPU (RTX 3070)
 
-- [ ] tier: K-quant expert uploads + CUDA `Q4_K`/`Q5_K`/`Q6_K` GEMV; `Q8_0`-group dense upload
-- [ ] placement on 8 GB: dense set + expert budget; measured on the card
-- [ ] E1–E3 CPU vs CUDA; A/B vs Ollama on the same card
-- [ ] int8-activation twins (Q8_K-style) behind `IDOT`/`QWEN_EXPERT_ACT`, deltas recorded (spec §4.2)
+Pre-conditions (met 2026-10-09): `07_Tests/IntegrationTest/cuda_tier_kquant.md` (+ runner `run_cuda_tier_kquant.py`, C tests `tests/test_cuda_block_fmt_guard.c`, `tests/test_qwen36_tier_kq.c`, `tests/test_qwen36_tier_kq_engine.c`, device oracle `tests/test_gq_cuda.cu` + `tests/gq_ref.c`, Makefile rules `phase5-tests`, `cuda-test-gq`) and `07_Tests/SystemTest/gpu_rtx3070.md` written. Findings while writing them: (1) FR-37's "bit-for-bit" is fixed as **kernel-level identity with `gq_dot_row_ref`** plus the engine's summation order (routed experts in rank order with `fmaf`, shared expert afterwards); the device `expf` in the SiLU and the dense `Q8_0` split-vs-raw kernel are the two named, measured deviations (upstream's own "bit-identical" is a cosine of 1.0000001). (2) The tiny preset (hidden 64, inter 32) cannot hold 256-element K-quant blocks; `make_tiny_qwen36_hf.py` gained `--hidden/--inter/--layers/--experts`, the fixture for the fake-tier engine test is hidden 256 / inter 256. (3) `st2gguf.py` needs K-quant expert writers (`--expert-type q4_k|q5_k|q6_k`, `--down-type`). (4) The harness needs an E3 arm for `--deviation` (sylph vs sylph) for the CPU-vs-CUDA case.
+
+- [ ] `backend_cuda.h`: block formats `fmt = 16 + ggml type` (24/28/29/30), `coli_cuda_block_fmt_supported/_type/_elems`; `backend_cuda.cu`: upload of raw block tensors (`sc == NULL`, size/shape refusals), GEMV kernels bit-identical to `gq_dot_row_ref` for `Q8_0`/`Q4_K`/`Q5_K`/`Q6_K`, dispatch in `coli_cuda_matmul` and the expert group kernel; `weight_at` untouched — `test_cuda_block_fmt_guard`, `cuda-test-gq` (owner)
+- [ ] `qwen36_tier`: `qt_init_gguf` (slot footprints, refusal by type), `qt_note_kq[_planned|_block]` staging three raw slices, `qt_dense_init_kq`; `tier_offer_slot`/`tier_warmstart` offer `kq` slots; `moe()` adds the shared expert after `qt_take`; `gq_moe_run` tail and `qt_take` written with `fmaf` — `test_qwen36_tier_kq`
+- [ ] `qwen36.c` dense placement for GGUF: `qdw_bytes` (bytes as stored), `qdw_place` (raw K-quant upload; `Q8_0` split re-joined with `gq_q8_0_join`), `output` through the generic handle; startup line `experts on CUDA tier (<n> planned)`; FR-36 messages (`built without CUDA`, by-type note) — `run_cuda_tier_kquant.py` cases 3–5, 7
+- [ ] fake backend compute mode (`fake_block_compute`, counters, `last_sc`), `tests/test_qwen36_tier_kq_engine` in `make check`; `run_cuda_tier_kquant.py` in the `gguf-oracle` job
+- [ ] `tools/st2gguf.py --expert-type q4_k|q5_k|q6_k`, `--down-type`; `resource_plan._analyze_gguf` `trunk_gguf_bytes` → `tiers.vram.trunk_bytes`, `VRAM … trunk + … hot tier` line — case 6
+- [ ] harness: E3 arm for `--deviation` (sylph vs sylph-deviation); `docs/qwen36-cuda-tier.md` and `docs/gguf.md` GPU rows, `docs/ENVIRONMENT.md`, `CHANGELOG.md`
+- [ ] int8-activation twin (FR-14, §4.2): `QWEN_EXPERT_ACT=i8` on the GGUF path (opt-in; default f32), `Q8_K`-style per-256 activation blocks, VNNI/`maddubs` dot; unit case in `test_gq_kernels`; deltas via `--deviation QWEN_EXPERT_ACT=i8` — `gpu_rtx3070.md` G5
+- [ ] **Owner runs** (`gpu_rtx3070.md`): G0 kernel oracle, G1 plan on 8 GB, G2 startup/placement, G3 E1–E3 CPU vs CUDA, G4 A/B vs Ollama on the card, G5 twin deltas, G6 container tier unchanged; report in `08_Documents/benchmarks/`
 
 ## Phase 6 — breadth
 

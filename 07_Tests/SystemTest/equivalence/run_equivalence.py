@@ -4,7 +4,7 @@
 Owner's machine (real model, real references):
     python3 run_equivalence.py --model <gguf> --llama <llama.cpp bin dir> [--ollama http://host:11434 --tag <tag>]
         [--text wiki.test.raw] [--chunks 16] [--cap N] [--levels E1,E2,E3] [--out <dir>] [--kl-chunks 1]
-        [--prompts 32] [--threads N] [--llama-cuda <bin dir>] [--deviation COLI_DENSE_I8=1] [--force]
+        [--prompts 32] [--threads N] [--llama-cuda <bin dir>] [--deviation COLI_DENSE_I8=1 | COLI_CUDA=1 | QWEN_EXPERT_ACT=i8] [--force]
 
 CI subset (FR-34; tiny torch-built model, the transformers forward pass as the reference):
     python3 run_equivalence.py --ci --model qwen36_tiny_f32.gguf --torch-ref qwen36_tiny --out equiv_ci
@@ -244,6 +244,21 @@ def run_real(a):
             srv.close()
         (out / "e3_sylph.jsonl").write_text("\n".join(json.dumps(g) for g in gens_s) + "\n")
         R["E3"] = {}
+        # deviation arm (FR-35; gpu_rtx3070.md G3/G5): sylph with the deviation's environment
+        # against the default sylph run above, prefix to the first near-tie as for the references
+        for dev in a.deviation or []:
+            k_, v_ = dev.split("=", 1)
+            gens_d = []; srv = sr.Serve(model, cap=a.cap, env={k_: v_}, threads=a.threads)
+            try:
+                for i, p in enumerate(prompts):
+                    text = CHAT_TEMPLATE.format(p["text"]) if p["chat"] else p["text"]
+                    g = srv.generate(text, a.n_predict); g["prompt"] = i; g["engine"] = f"sylph {dev}"; gens_d.append(g)
+                    log(f"sylph {dev} E3 prompt {i}: {len(g['ids'])} ids")
+            finally:
+                srv.close()
+            (out / f"e3_sylph_{dev.replace('=', '_')}.jsonl").write_text("\n".join(json.dumps(g) for g in gens_d) + "\n")
+            e3d = compare.e3_compare(gens_s, gens_d); e3d["pass"] = e3d["n_ok"] >= math.ceil(0.95 * e3d["n"])
+            R.setdefault("deviations", {}).setdefault(dev, {})["e3"] = e3d
         # llama-server (ids + margins), fallback llama-cli (text)
         gens_l = []
         try:

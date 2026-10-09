@@ -423,6 +423,30 @@ interchange formats are in `equivalence/formats.md`. The ppl-dump tail is the en
 check was vacuous — fixed, and the comparer now refuses dumps without tails. E1/E2
 windows follow llama.cpp exactly: 255 scored targets (257…511) per 512-id window.
 
+**Amendment 2026-10-09 (phase-5 tests written; design fixed by them).** (1) The tier takes raw
+ggml blocks as **device formats `fmt = 16 + ggml type id`** (`Q8_0` 24, `Q4_K` 28, `Q5_K` 29,
+`Q6_K` 30) with their own kernel branch — never through `weight_at`, whose predicate stays as it
+is; `coli_cuda_block_fmt_supported/_type/_elems` are the host-checkable gates
+(`tests/test_cuda_block_fmt_guard.c`). An upload carries no scale array (`sc == NULL`) and is
+refused when `I` is not a whole number of blocks. (2) `qt_init_gguf(nl, ne, D, Ih, cap, topk,
+slot_bytes[3], types_present)` prices an expert as the sum of the three slice footprints and
+refuses by type (FR-36); `qt_note_kq[_planned|_block](layer, eid, kq, ktype[3], kbytes[3])`
+stages the three raw slices; `tier_offer_slot` offers `kq` slots first; `qt_dense_init_kq`
+places GGUF dense matrices (a `Q8_0` split is re-joined with `gq_q8_0_join`, decision A3
+stands on the CPU). (3) **FR-37 read precisely:** every block GEMV on the device is bit-identical
+to `gq_dot_row_ref` (hence to the CPU expert path), and the engine sums routed experts in rank
+order with `fmaf` on both paths and adds the shared expert afterwards; the device `expf` in the
+SiLU and the dense `Q8_0` split-vs-raw kernel are the two named deviations, measured as
+sylph-CPU vs sylph-CUDA in `gpu_rtx3070.md` (bounds 1e-5 / 1e-4, beside llama.cpp's own
+CPU-vs-CUDA floor). On the fake backend (host `expf`, trunk on the CPU) the dumps are
+byte-identical, which is what `make check` demands. (4) The planner gains `trunk_gguf_bytes`
+(stored bytes of `output`, `attn_qkv`+`attn_gate`, `ssm_out`, `attn_q/k/v/output`,
+`ffn_*_shexp`), treated as the container's `trunk_int8_bytes`. (5) Fixtures: the tiny preset
+cannot hold 256-element blocks; `make_tiny_qwen36_hf.py --hidden 256 --inter 256` and
+`st2gguf --expert-type q4_k|q5_k|q6_k --down-type` produce the K-quant fixture. (6) The int8-
+activation twin (FR-14) is opt-in on the GGUF path (`QWEN_EXPERT_ACT=i8`, default f32); the
+container keeps upstream's default.
+
 ## 12. Phased plan (details and status in `../04_Tasks/tasks.md`)
 
 | Phase | Deliverables | Exit |

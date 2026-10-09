@@ -160,6 +160,7 @@ Everything in this section was verified against real files on 2026-10-05
 |---|---|---|---|
 | FR-36 | CPU-only is the v1 path; the CUDA tier (`qwen36_tier`) refuses K-quant experts explicitly and the run continues on CPU. | MUST | 4 |
 | FR-37 | CUDA kernels for `Q4_K`/`Q5_K`/`Q6_K` experts and `Q8_0`/`Q6_K` dense matrices in the tier; placement by the existing auto-placer; bit-for-bit equal to the CPU path for the same inputs (as upstream's tier contract). | SHOULD | 5 |
+| | *Note 2026-10-09 (phase-5 tests):* "bit-for-bit" is fixed as kernel-level identity with `gq_dot_row_ref` (the CPU expert path is identical to it) plus the same summation order in the engine; the device `expf` in the SiLU and the dense `Q8_0` split-vs-raw kernel are named deviations measured per §4.2 (`07_Tests/SystemTest/gpu_rtx3070.md` G3). Upstream's own "bit-identical" is a cosine of 1.0000001. | | |
 | FR-38 | Measured against Ollama on the same card and file (Ollama's own CPU/GPU expert split) per §8.5. | SHOULD | 5 |
 
 ## 6. Non-functional requirements

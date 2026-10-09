@@ -200,7 +200,10 @@ def write_report(out_dir, R):
     if dv:
         L += ["## Deliberate differences (FR-35)", ""]
         for name, d in dv.items():
-            L.append(f"- `{name}`: E1 mean {fmt(d.get('e1_mean'))} / max {fmt(d.get('e1_max'))}, E2 PPL {fmt(d.get('ppl'))} ({fmt(d.get('e2_rel'))} rel)")
+            line = f"- `{name}`: E1 mean {fmt(d.get('e1_mean'))} / max {fmt(d.get('e1_max'))}, E2 PPL {fmt(d.get('ppl'))} ({fmt(d.get('e2_rel'))} rel)"
+            if d.get("e3"):
+                line += f", E3 vs default sylph {d['e3']['n_ok']}/{d['e3']['n']} prompts to the first near-tie"
+            L.append(line)
         L.append("")
     L += ["## Verdict", ""]
     for lvl in ("E1", "E2", "E3"):
