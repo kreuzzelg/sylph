@@ -23,9 +23,7 @@
 #include <string.h>
 #include <math.h>
 #define COLIBRI_NO_MAIN
-#define main colibri_main_unused
 #include "../colibri.c"
-#undef main
 
 static int fails = 0;
 #define CHECK(cond, ...) do { if (!(cond)) { fails++; printf("FAIL: " __VA_ARGS__); printf("\n"); } } while (0)
@@ -80,9 +78,10 @@ static void suite(void) {
       float *kv = malloc(n * sizeof(float)), *kb = malloc((size_t)H * KVL * NOPE * sizeof(float)), *vb = malloc((size_t)H * V * KVL * sizeof(float)), *out = malloc(n * sizeof(float));
       for (size_t i = 0; i < n; i++) kv[i] = frand();
       split_kv_b(kv, H, NOPE, V, KVL, kb, vb);
-      CHECK(glm_kv_b_from_split(out, kb, vb, H, NOPE, V, KVL) == 0, "glm_kv_b_from_split accepts the geometry");
+      int64_t kb_ne[3] = {NOPE, KVL, H}, vb_ne[3] = {KVL, V, H};   /* the stored dims: attn_k_b {nope, kvl, H}, attn_v_b {kvl, v, H} */
+      CHECK(glm_kv_b_from_split(out, kb, kb_ne, vb, vb_ne, H, NOPE, V, KVL) == 0, "glm_kv_b_from_split accepts the geometry");
       CHECK(memcmp(out, kv, n * sizeof(float)) == 0, "kv_b rebuilt from attn_k_b/attn_v_b is bit-exact");
-      CHECK(glm_kv_b_from_split(out, kb, vb, H, NOPE + 1, V, KVL) != 0, "a geometry mismatch is refused");
+      CHECK(glm_kv_b_from_split(out, kb, kb_ne, vb, vb_ne, H, NOPE + 1, V, KVL) != 0, "a geometry mismatch is refused");
       free(kv); free(kb); free(vb); free(out); }
 
     /* 3. idx_type[] derivation: explicit array wins, else tensor presence; both agree on a consistent file */

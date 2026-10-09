@@ -785,7 +785,7 @@ endif
 endif
 .build-config: ;
 
-colibri$(EXE): colibri.c sse41_kernels.h exact_dot.h oracle.h pin_pool.h cli_args.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h kv_fp8.h kv_tq.h abl.h backend_cuda.h backend_metal.h backend_vulkan.h decode_batch.h edge_adapters.h edge_runtime.h edge_tok_internal.h schema_gbnf.h segment_adapter_internal.h segment_adapters.h segment_runtime.h tier.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+colibri$(EXE): colibri.c src.h glm_names.h qwen35_names.h gq.h gq_i8.h gguf.h gguf_xform.h sse41_kernels.h exact_dot.h oracle.h pin_pool.h cli_args.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h kv_fp8.h kv_tq.h abl.h backend_cuda.h backend_metal.h backend_vulkan.h decode_batch.h edge_adapters.h edge_runtime.h edge_tok_internal.h schema_gbnf.h segment_adapter_internal.h segment_adapters.h segment_runtime.h tier.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o colibri$(EXE) $(LDFLAGS)
 
 # Vulkan backend object (plain C + vulkan headers) and its SPIR-V shaders.
@@ -1258,6 +1258,8 @@ tests/test_qwen36_tokenizer$(EXE): tests/test_qwen36_tokenizer.c gsgemv.h qgemv.
 # tokenizer, both through qwen36.c (07_Tests/IntegrationTest/src_facade.md).
 tests/test_gguf_load$(EXE): tests/test_gguf_load.c qwen36.c src.h gq.h gq_i8.h gguf.h gguf_xform.h qwen35_names.h gsgemv.h qgemv.h sse41_kernels.h expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+tests/test_gguf_load_glm$(EXE): tests/test_gguf_load_glm.c colibri.c src.h gq.h gq_i8.h gguf.h gguf_xform.h qwen35_names.h glm_names.h st.h json.h tok.h compat.h quant.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
 tests/test_tok_gguf$(EXE): tests/test_tok_gguf.c qwen36.c src.h gguf.h gsgemv.h qgemv.h sse41_kernels.h expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
@@ -2065,6 +2067,9 @@ tests/test_qwen36_tier_kq$(EXE): tests/test_qwen36_tier_kq.c tests/qwen36_fake_c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 tests/test_qwen36_tier_kq_engine$(EXE): tests/test_qwen36_tier_kq_engine.c qwen36.c src.h gq.h gq_i8.h gguf.h gguf_xform.h qwen35_names.h gsgemv.h qgemv.h sse41_kernels.h tests/qwen36_fake_cuda.h expert_ffn.h qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+phase6-tests: tests/test_gguf_load_glm$(EXE) colibri$(EXE) qwen36$(EXE)
+	./tests/test_gguf_load_glm$(EXE)
+.PHONY: phase6-tests
 phase5-tests: tests/test_cuda_block_fmt_guard$(EXE) tests/test_qwen36_tier_kq$(EXE) tests/test_qwen36_tier_kq_engine$(EXE)
 	./tests/test_cuda_block_fmt_guard$(EXE)
 	./tests/test_qwen36_tier_kq$(EXE)

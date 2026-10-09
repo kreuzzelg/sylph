@@ -220,7 +220,11 @@ Everything in this section was verified against real files on 2026-10-05
 
 Open questions for the owner: (a) the exact Ollama tag/blob to treat as the reference;
 (b) agreement on the §4.3 calibration approach; (c) whether MTP (bartowski) matters for
-the comparison (Ollama does not use it either); (d) whether GLM-5.2 stays on the roadmap.
+the comparison (Ollama does not use it either) — *phase 6 (2026-10-09) implements the
+Qwen head as "detected and reported, not used" (`07_Tests/IntegrationTest/qwen36_mtp.md`)
+until decided; the GLM engine uses its NextN block as upstream does*; (d) whether GLM-5.2
+stays on the roadmap — *phase 6 delivers the `glm-dsa` arm of `colibri.c`
+(`glm_assembly.md`); the real-model run still needs the host/quant decision*.
 
 ## Sources
 

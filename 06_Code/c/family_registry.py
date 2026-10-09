@@ -1581,6 +1581,36 @@ def _gguf_config(model):
             max_position_embeddings=g("context_length"), attn_output_gate=True, norm_topk_prob=False,
             mtp_num_hidden_layers=nextn,
             eos_token_id=kv.get("tokenizer.ggml.eos_token_id"), bos_token_id=kv.get("tokenizer.ggml.bos_token_id"))
+    elif arch == "glm-dsa":
+        # sylph phase 6 (glm_assembly.md case 7): the config.json keys colibri.c's Cfg and the
+        # planner's _glm_geometry read, from the glm-dsa.* keys (architecture v1 §7.1).
+        def g(key, default=None):
+            return kv.get(f"glm-dsa.{key}", default)
+        blocks = int(g("block_count") or 0)
+        nextn = int(g("nextn_predict_layers", 0) or 0)
+        layers = blocks - nextn
+        vocab = len(tokens) if isinstance(tokens, list) else g("vocab_size")
+        rope = g("rope.dimension_count")
+        key_mla = g("attention.key_length_mla")
+        indexer = [t for t in ggufinfo.all_tensors(parts) if ggufinfo.INDEXER_RE.match(t.name)]
+        stops = [kv.get(k) for k in ("tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id") if isinstance(kv.get(k), int)]
+        cfg.update(
+            hidden_size=g("embedding_length"), num_hidden_layers=layers, vocab_size=vocab,
+            num_attention_heads=g("attention.head_count"), num_key_value_heads=g("attention.head_count_kv", g("attention.head_count")),
+            n_routed_experts=g("expert_count"), num_experts_per_tok=g("expert_used_count"), n_shared_experts=g("expert_shared_count", 0),
+            moe_intermediate_size=g("expert_feed_forward_length"), intermediate_size=g("feed_forward_length"),
+            first_k_dense_replace=g("leading_dense_block_count", 0),
+            q_lora_rank=g("attention.q_lora_rank", 0), kv_lora_rank=g("attention.kv_lora_rank"),
+            qk_rope_head_dim=rope, qk_nope_head_dim=(key_mla - rope) if isinstance(key_mla, int) and isinstance(rope, int) else None,
+            v_head_dim=g("attention.value_length_mla"),
+            n_group=g("expert_group_count", 1), topk_group=g("expert_group_used_count", 1),
+            norm_topk_prob=bool(g("expert_weights_norm", False)), routed_scaling_factor=g("expert_weights_scale", 1.0),
+            scoring_func="sigmoid" if g("expert_gating_func", 2) == 2 else "softmax",
+            index_topk=g("attention.indexer.top_k", 0), index_n_heads=g("attention.indexer.head_count", 0), index_head_dim=g("attention.indexer.key_length", 0),
+            _colibri_indexer_present=bool(indexer),
+            rms_norm_eps=g("attention.layer_norm_rms_epsilon"), rope_theta=g("rope.freq_base"),
+            max_position_embeddings=g("context_length"), num_nextn_predict_layers=nextn,
+            eos_token_id=stops if len(stops) > 1 else (stops[0] if stops else None), bos_token_id=kv.get("tokenizer.ggml.bos_token_id"))
     else:
         block_count = kv.get(f"{arch}.block_count")
         cfg.update(hidden_size=kv.get(f"{arch}.embedding_length"), num_hidden_layers=block_count,

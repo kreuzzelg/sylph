@@ -60,13 +60,23 @@ GLOBAL_KINDS = frozenset(("embed_tokens.weight", "norm.weight", "lm_head.weight"
 # Whole subtrees the text engine does not implement. Skipped deliberately,
 # counted, and reported -- never silently.
 SKIP_PREFIXES = (
-    ("mtp.", "mtp", "multi-token-prediction head (mtp_num_hidden_layers); "
-                    "the engine predicts one token per step and never reads it"),
     ("model.visual.", "visual", "vision tower; the engine is text-only"),
     ("visual.", "visual", "vision tower; the engine is text-only"),
 )
 
 _LAYER = re.compile(r"^layers\.(\d+)\.(.+)$")
+
+# The NextN (MTP) head, mtp_num_hidden_layers = 1 (sylph phase 6, qwen36_mtp.md): the
+# fusion fc and its three norms, plus ONE full-attention block "mtp.layers.0.<kind>".
+# llama.cpp stores it as blk.<n_layers>.nextn.* + blk.<n_layers>.*; st2gguf converts it
+# unless --no-mtp. Classified, never skipped by accident.
+MTP_HEAD_KINDS = frozenset((
+    "fc.weight",
+    "pre_fc_norm_embedding.weight",
+    "pre_fc_norm_hidden.weight",
+    "norm.weight",
+))
+_MTP_LAYER = re.compile(r"^mtp\.layers\.(\d+)\.(.+)$")
 
 
 class UnknownTensor(KeyError):
@@ -85,7 +95,9 @@ def classify(name, prefix):
     """Return one of
          ("global", kind)            embed / final norm / lm_head
          ("layer", index, kind)      a tensor of transformer layer <index>
-         ("skip", group)             mtp / visual, deliberately not converted
+         ("mtp", kind)               the NextN head ("fc.weight", the norms) or its block
+                                     ("layers.0.<layer kind>")
+         ("skip", group)             visual, deliberately not converted
        or raise UnknownTensor.
 
     ``kind`` for a layer is the suffix after ``layers.<i>.``; for the
@@ -95,6 +107,14 @@ def classify(name, prefix):
     for skip_prefix, group, _why in SKIP_PREFIXES:
         if name.startswith(skip_prefix):
             return ("skip", group)
+    if name.startswith("mtp."):
+        rest = name[4:]
+        if rest in MTP_HEAD_KINDS:
+            return ("mtp", rest)
+        m = _MTP_LAYER.match(name)
+        if m and (m.group(2) in LAYER_KINDS or _EXPERT_SEPARATE.match(m.group(2))):
+            return ("mtp", f"layers.{int(m.group(1))}.{m.group(2)}")
+        raise UnknownTensor(name)
     if name == "lm_head.weight" or name == prefix + "lm_head.weight":
         return ("global", "lm_head.weight")
     if name.startswith(prefix):

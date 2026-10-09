@@ -100,6 +100,43 @@ jobs:
         run: python3 07_Tests/IntegrationTest/run_expert_streaming.py
       - name: CUDA tier on raw ggml blocks, fake backend (phase 5, cuda_tier_kquant.md part A)
         run: python3 07_Tests/IntegrationTest/run_cuda_tier_kquant.py --no-build
+      - name: Qwen NextN block converted, detected, reported (phase 6, qwen36_mtp.md)
+        run: python3 07_Tests/IntegrationTest/run_qwen36_mtp.py --no-build
+      - name: GLM-5.2 tiny oracle -- container unchanged, F32 GGUF identical to it, torch tolerance (phase 6, glm_lossless_oracle.md)
+        run: |
+          cd 06_Code/c
+          make colibri tests/test_gguf_load_glm
+          python3 tools/make_glm_oracle.py
+          python3 tools/st2gguf.py glm_tiny --arch glm-dsa --out glm_tiny_f32.gguf --type f32
+          python3 tools/st2gguf.py glm_tiny --arch glm-dsa --out glm_tiny_fused.gguf --type f32 --kv-b fused
+          python3 tools/st2gguf.py glm_tiny --arch glm-dsa --out glm_tiny_q8_0.gguf --type q8_0 --expert-type q8_0
+          ./tests/test_gguf_load_glm
+          ./tests/test_gguf_load_glm glm_tiny_f32.gguf glm_tiny
+          ./tests/test_gguf_load_glm glm_tiny_q8_0.gguf glm_tiny --tol q8
+          for src in ./glm_tiny glm_tiny_f32.gguf; do
+            tag=$(basename "$src")
+            echo "::group::teacher forcing $src"
+            SNAP=$src REF=ref_glm.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 64 16 16 2>&1 | tee "tf_$tag.log"
+            echo "::endgroup::"
+            echo "::group::greedy $src"
+            SNAP=$src REF=ref_glm.json COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 64 16 16 2>&1 | tee "gen_$tag.log"
+            echo "::endgroup::"
+          done
+          # GGUF == container: the same engine on the same numbers prints the same ids
+          diff <(grep 'GLM C engine' gen_glm_tiny.log) <(grep 'GLM C engine' gen_glm_tiny_f32.gguf.log)
+          diff <(grep -c 'ORACLE\] mismatch' tf_glm_tiny.log) <(grep -c 'ORACLE\] mismatch' tf_glm_tiny_f32.gguf.log)
+          for cap in 1 2 8; do
+            SNAP=glm_tiny_f32.gguf REF=ref_glm.json COLI_TEMP=0 ./colibri $cap 16 16 2>/dev/null | grep 'GLM C engine' | diff - <(grep 'GLM C engine' gen_glm_tiny.log)
+          done
+          SNAP=glm_tiny_fused.gguf REF=ref_glm.json COLI_TEMP=0 ./colibri 8 16 16 2>&1 | tee gen_fused.log | grep 'GLM C engine' | diff - <(grep 'GLM C engine' gen_glm_tiny.log)
+          grep -q 'kv_b from attn_kv_b' gen_fused.log
+          grep -q 'kv_b from attn_k_b/attn_v_b' gen_glm_tiny_f32.gguf.log
+          DSA=0 SNAP=glm_tiny_f32.gguf REF=ref_glm.json COLI_TEMP=0 ./colibri 8 16 16 2>/dev/null | grep 'GLM C engine' | diff - <(grep 'GLM C engine' gen_glm_tiny.log)
+          echo "::group::reported, not required -- Q8_0 GGUF vs torch"
+          SNAP=glm_tiny_q8_0.gguf REF=ref_glm.json COLI_TEMP=0 ./colibri 8 16 16 || true
+          echo "::endgroup::"
+      - name: GLM-5.2 assembly integration test (phase 6, glm_assembly.md)
+        run: python3 07_Tests/IntegrationTest/run_glm_assembly.py --no-build
 
   macos:
     runs-on: macos-latest

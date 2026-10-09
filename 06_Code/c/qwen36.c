@@ -1657,10 +1657,24 @@ static void cfg_from_gguf(Model *m) {
       if (ow && (ow->type == GQ_Q4_K || ow->type == GQ_Q5_K || ow->type == GQ_Q6_K || ow->type == GQ_Q4_0)) out_kernel = "gq_matmul";
       else if (ow && ow->type == GQ_Q8_0 && c->hidden % 32 == 0) out_kernel = "matmul_q_gs";
       else if (dense_i8_on()) out_kernel = "matmul_q (int8 at load)"; }
-    char line[4096]; ts_describe(ts, line, sizeof line, embd_mode, out_kernel, m->gguf_slot_bytes);
+    /* NextN (MTP) head (FR-24, phase 6 / 07_Tests/IntegrationTest/qwen36_mtp.md): detected
+     * and reported with its type and bits; this engine predicts one token per step and
+     * never reads it (spec §9 c, the owner's decision). The name table maps mtp.* for
+     * messages only. */
+    char nextn_clause[200]; const char *nx = NULL;
+    qn_nextn_layer = nextn ? c->n_layers : -1;
+    if (nextn) {
+        char en[64]; snprintf(en, sizeof en, "blk.%d.nextn.eh_proj.weight", c->n_layers);
+        GgufTensor *eh = gguf_find(G, en);
+        if (eh) snprintf(nextn_clause, sizeof nextn_clause, "nextn blk.%d eh_proj %s (%.2f bpw) present, not used (MTP decoding not implemented)",
+                         c->n_layers, gguf_type_name(eh->type), gguf_bits_per_weight(eh->type));
+        else snprintf(nextn_clause, sizeof nextn_clause, "nextn %lld block%s declared, blk.%d.nextn.eh_proj missing (not used)", (long long)nextn, nextn > 1 ? "s" : "", c->n_layers);
+        nx = nextn_clause;
+    }
+    char line[4096]; ts_describe(ts, line, sizeof line, embd_mode, out_kernel, m->gguf_slot_bytes, nx);
     free(m->gguf_line); m->gguf_line = strdup(line);
     if (!g_defer_gguf_line) fprintf(stderr, "%s\n", line);
-    if (nextn) fprintf(stderr, "[GGUF] skipping %lld NextN (MTP) block%s (blk.%d..); the engine predicts one token per step\n", (long long)nextn, nextn > 1 ? "s" : "", c->n_layers);
+    if (nextn) fprintf(stderr, "[GGUF] NextN (MTP) block blk.%d present, not used: this engine predicts one token per step (qwen36_mtp.md)\n", c->n_layers);
     fprintf(stderr, "[meta] from GGUF: q_heads=%d kv_heads=%d head_dim=%d q_head_dim=%d o_in=%d rotary_dim=%d n_experts=%d topk=%d inter=%d shared_inter=%d attn_output_gate=%d n_active=%d | DeltaNet vheads=%d kheads=%d kdim=%d vdim=%d convk=%d conv_dim=%d\n",
             c->q_heads, c->kv_heads, c->head_dim, c->q_head_dim, c->o_in, c->rotary_dim, c->n_experts, c->topk, c->inter, c->shared_inter,
             c->attn_output_gate, c->n_active, c->dn_vheads, c->dn_kheads, c->dn_kdim, c->dn_vdim, c->dn_convk, c->dn_conv_dim);

@@ -727,7 +727,9 @@ class GgufDoctorTest(unittest.TestCase):
         self.assertEqual(checks["storage.persistence"]["status"], "pass")
         self.assertTrue(checks["storage.persistence"]["details"]["path"].endswith(".coli-glm"))
         self.assertEqual(checks["memory.ram"]["status"], "pass")
-        self.assertEqual(checks["placement.plan"]["status"], "skip")
+        # sylph phase 6: the registry synthesizes a config from the glm-dsa.* keys, so the
+        # planner prices a GLM GGUF like a container (it skipped before the arm existed).
+        self.assertEqual(checks["placement.plan"]["status"], "pass")
         self.assertNotIn("model.gguf.payload", checks)          # only with --deep
         self.assertEqual(exit_code(report), 0)
         text = format_doctor(report)

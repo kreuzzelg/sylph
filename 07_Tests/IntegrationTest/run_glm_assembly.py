@@ -55,7 +55,7 @@ def make(target):
 
 
 def parse_ids(text):
-    m = re.search(r"C engine :\s*((?:\d+\s+)+)", text)
+    m = re.search(r"C engine\s*:\s*((?:\d+\s+)+)", text)   # colibri prints "GLM C engine      : <ids>"
     return [int(x) for x in m.group(1).split()] if m else None
 
 

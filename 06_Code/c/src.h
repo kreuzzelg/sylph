@@ -34,9 +34,13 @@
 #include "gq.h"
 #include "gguf_xform.h"
 #include "qwen35_names.h"
+#include "glm_names.h"
+
+enum { TS_ARCH_QWEN35MOE = 0, TS_ARCH_GLM_DSA = 1 };
 
 typedef struct {
     int gguf;                 /* 0 = safetensors container (st.h), 1 = GGUF */
+    int arch;                 /* TS_ARCH_*: which name table and which engine (set by ts_init_arch) */
     shards *S;                /* container arm: the engine's shards, owned by the caller */
     GgufSet G;                /* GGUF arm */
     char path[2048];          /* as given */
@@ -93,18 +97,25 @@ static void ts_split_path(TensorSource *ts) {
 
 /* Open the source. Container: st_init_multi(S, snap, extra_dirs), as before.
  * GGUF: gguf_open_set (exits on a malformed file, like st_init does). */
-static void ts_init(TensorSource *ts, shards *S, const char *snap, const char *extra_dirs) {
+static void ts_init_arch(TensorSource *ts, shards *S, const char *snap, const char *extra_dirs, int arch_id) {
     memset(ts, 0, sizeof *ts);
     snprintf(ts->path, sizeof ts->path, "%s", snap);
-    ts->S = S;
+    ts->S = S; ts->arch = arch_id;
     if (!ts_is_gguf_path(snap)) { st_init_multi(S, snap, extra_dirs); return; }
     ts->gguf = 1;
     gguf_open_set_or_die(&ts->G, snap, extra_dirs);
     ts_split_path(ts);
+    const char *want = arch_id == TS_ARCH_GLM_DSA ? "glm-dsa" : "qwen35moe";
     const char *arch = gguf_kv_str(&ts->G, "general.architecture");
-    if (!arch || strcmp(arch, "qwen35moe")) {
-        fprintf(stderr, "[GGUF] %s: general.architecture is '%s'; this engine reads qwen35moe (Qwen3.5/3.6 MoE) -- refusing\n", snap, arch ? arch : "(missing)"); exit(1);
+    if (!arch || strcmp(arch, want)) {
+        fprintf(stderr, "[GGUF] %s: general.architecture is '%s'; this engine reads %s (%s) -- refusing\n", snap, arch ? arch : "(missing)", want,
+                arch_id == TS_ARCH_GLM_DSA ? "GLM-5 / 5.2, engine colibri" : "Qwen3.5/3.6 MoE, engine qwen36"); exit(1);
     }
+}
+static void ts_init(TensorSource *ts, shards *S, const char *snap, const char *extra_dirs) { ts_init_arch(ts, S, snap, extra_dirs, TS_ARCH_QWEN35MOE); }
+/* the arch's name table: HF name -> GGUF name + transform (qwen35_names.h / glm_names.h) */
+static inline int ts_name_to_gguf(const TensorSource *ts, const char *hf, char *out, size_t cap, int *layer, int *expert) {
+    return ts->arch == TS_ARCH_GLM_DSA ? glm_to_gguf(hf, out, cap, layer, expert) : qn_to_gguf(hf, out, cap, layer, expert);
 }
 static void ts_close(TensorSource *ts) { if (ts->gguf) gguf_close(&ts->G); }
 
@@ -124,7 +135,7 @@ static int ts_find(TensorSource *ts, const char *hf, TsTensor *t) {
         if (!t->st) return -1;
         t->numel = t->st->numel; t->nbytes = t->st->nbytes; return 0;
     }
-    t->xform = qn_to_gguf(hf, t->gname, sizeof t->gname, &t->layer, &t->expert);
+    t->xform = ts_name_to_gguf(ts, hf, t->gname, sizeof t->gname, &t->layer, &t->expert);
     if (t->xform < 0) return -1;
     t->gt = gguf_find(&ts->G, t->gname);
     if (!t->gt) return -1;
@@ -156,8 +167,9 @@ static void ts_refuse_type(const char *hf, const TsTensor *t) {
             gguf_type_name(t->type), hf, t->gname); exit(1);
 }
 static void ts_refuse_missing(TensorSource *ts, const char *hf) {
-    char g[256]; int l, e; int x = ts->gguf ? qn_to_gguf(hf, g, sizeof g, &l, &e) : 0;
-    if (ts->gguf && x < 0) fprintf(stderr, "[GGUF] missing %s: the name is not in the qwen35moe table (qwen35_names.h)\n", hf);
+    char g[256]; int l, e; int x = ts->gguf ? ts_name_to_gguf(ts, hf, g, sizeof g, &l, &e) : 0;
+    if (ts->gguf && x < 0) fprintf(stderr, "[GGUF] missing %s: the name is not in the %s table (%s)\n", hf,
+                                   ts->arch == TS_ARCH_GLM_DSA ? "glm-dsa" : "qwen35moe", ts->arch == TS_ARCH_GLM_DSA ? "glm_names.h" : "qwen35_names.h");
     else if (ts->gguf) fprintf(stderr, "[GGUF] missing %s (GGUF %s)\n", hf, g);
     else fprintf(stderr, "missing %s\n", hf);
     exit(1);
@@ -315,11 +327,14 @@ static size_t ts_expert_bytes(const TsExpert *e) { return e->bytes[0] + e->bytes
 
 /* ---- the startup line (FR-30, format fixed in 07_Tests/IntegrationTest/expert_streaming.md) --
  *   [GGUF] <arch> · <B> blocks (<A> attention) · <P> part(s) · experts <tg>/<tu>/<td> <x> MB each × <E> × <B> = <y> GB
- *          · dense <type list> <z> GB · token_embd <type> <mode> · output <type> <kernel> · experts on CPU (gq_moe_run)
+ *          · dense <type list> <z> GB · token_embd <type> <mode> · output <type> <kernel>
+ *          [· nextn blk.<L> eh_proj <type> (<bpw> bpw) <present, not used (...)|…>] · experts on CPU (gq_moe_run)
  *          · sidecars <dir>/.coli-<stem>/
+ * `nextn_clause` (NULL = no NextN block) is the engine's statement about the MTP head
+ * (qwen36_mtp.md: the Qwen engine reports it and does not use it; colibri.c loads it).
  * `embd_mode` and `out_kernel` are the engine's decisions (it knows its env and kernels);
  * everything else is read off the index. */
-static void ts_describe(TensorSource *ts, char *buf, size_t cap, const char *embd_mode, const char *out_kernel, size_t slot_bytes) {
+static void ts_describe(TensorSource *ts, char *buf, size_t cap, const char *embd_mode, const char *out_kernel, size_t slot_bytes, const char *nextn_clause) {
     if (!ts->gguf) { snprintf(buf, cap, "safetensors container %.900s", ts->path); return; }
     int cnt[GGML_TYPE_COUNT] = {0}; int64_t dense = 0, experts = 0, n_exp = 0;
     for (int64_t i = 0; i < ts->G.nt; i++) {
@@ -332,12 +347,13 @@ static void ts_describe(TensorSource *ts, char *buf, size_t cap, const char *emb
     GgufTensor *emb = gguf_find(&ts->G, "token_embd.weight"), *outw = gguf_find(&ts->G, "output.weight");
     const char *arch = gguf_kv_str(&ts->G, "general.architecture");
     char side[2304]; ts_sidecar_dir(ts, side, sizeof side);
-    int w = snprintf(buf, cap, "[GGUF] %s · %d blocks (%d attention)%s · %d part%s · experts %s/%s/%s %.2f MB each × %lld × %d = %.2f GB · dense",
-                     arch ? arch : "?", ts->n_layers, ts->n_attn, ts->nextn ? " (+NextN skipped)" : "", ts->G.nfiles, ts->G.nfiles == 1 ? "" : "s",
+    int w = snprintf(buf, cap, "[GGUF] %s · %d blocks (%d attention) · %d part%s · experts %s/%s/%s %.2f MB each × %lld × %d = %.2f GB · dense",
+                     arch ? arch : "?", ts->n_layers, ts->n_attn, ts->G.nfiles, ts->G.nfiles == 1 ? "" : "s",
                      tg, tu, td, slot_bytes / 1048576.0, (long long)n_exp, ts->n_layers, experts / 1073741824.0);
     for (int t = 0; t < GGML_TYPE_COUNT && w < (int)cap; t++) if (cnt[t]) w += snprintf(buf + w, cap - (size_t)w, " %s×%d", gguf_type_name(t), cnt[t]);
-    if (w < (int)cap) w += snprintf(buf + w, cap - (size_t)w, " %.2f GB · token_embd %s %s · output %s %s · experts on CPU (gq_moe_run) · sidecars %s",
-                                    dense / 1073741824.0, emb ? gguf_type_name(emb->type) : "?", embd_mode, outw ? gguf_type_name(outw->type) : "?", out_kernel, side);
+    if (w < (int)cap) w += snprintf(buf + w, cap - (size_t)w, " %.2f GB · token_embd %s %s · output %s %s%s%s · experts on CPU (gq_moe_run) · sidecars %s",
+                                    dense / 1073741824.0, emb ? gguf_type_name(emb->type) : "?", embd_mode, outw ? gguf_type_name(outw->type) : "?", out_kernel,
+                                    nextn_clause ? " · " : "", nextn_clause ? nextn_clause : "", side);
 }
 
 #endif /* COLI_SRC_H */

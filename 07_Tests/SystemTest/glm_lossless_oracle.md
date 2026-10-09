@@ -15,7 +15,7 @@ the same numbers.
 
 | Input | How it is made |
 |---|---|
-| `glm_tiny/` (+ `ref_glm.json`) | `python3 tools/make_glm_oracle.py` (torch + transformers, `tools/requirements-glm53-tiny.txt`-class deps; hidden 128, moe 32, 5 blocks, 8 experts, MLA + DSA indexer; seeded) — f32 safetensors + `config.json` |
+| `glm_tiny/` (+ `ref_glm.json` beside it, in `c/`) | `python3 tools/make_glm_oracle.py` (torch + transformers, `tools/requirements-glm53-tiny.txt`-class deps; hidden 128, moe 32, 5 blocks, 8 experts, MLA + DSA indexer; seeded) — f32 safetensors + `config.json` |
 | `glm_tiny_f32.gguf` | `python3 tools/st2gguf.py glm_tiny --arch glm-dsa --out glm_tiny_f32.gguf --type f32` (absorbed MLA split written as llama.cpp does) |
 | `glm_tiny_q8_0.gguf`, `glm_tiny_xq8_0.gguf` | `--type q8_0 --expert-type q8_0`; `--type f32 --expert-type q8_0` (reported, not required) |
 | `glm_tiny_fmt4/` | `python3 tools/make_glm_oracle.py --fmt4` → the quantized container twin (hidden 256) with its own `ref_glm.json`; and `glm_tiny_fmt4_q4k.gguf` from the **dequantized** snapshot it writes (reported) |
@@ -29,10 +29,10 @@ python3 tools/make_glm_oracle.py
 python3 tools/st2gguf.py glm_tiny --arch glm-dsa --out glm_tiny_f32.gguf --type f32
 # container (upstream's recipe) and GGUF, teacher forcing and free decode
 for src in ./glm_tiny glm_tiny_f32.gguf; do
-  SNAP=$src REF=glm_tiny/ref_glm.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 64 16 16
-  SNAP=$src REF=glm_tiny/ref_glm.json COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 64 16 16
+  SNAP=$src REF=ref_glm.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 64 16 16
+  SNAP=$src REF=ref_glm.json COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 64 16 16
 done
-for cap in 1 2 8; do SNAP=glm_tiny_f32.gguf REF=glm_tiny/ref_glm.json COLI_TEMP=0 ./colibri $cap 16 16; done
+for cap in 1 2 8; do SNAP=glm_tiny_f32.gguf REF=ref_glm.json COLI_TEMP=0 ./colibri $cap 16 16; done
 ```
 
 ## Pass criteria
@@ -60,3 +60,4 @@ for cap in 1 2 8; do SNAP=glm_tiny_f32.gguf REF=glm_tiny/ref_glm.json COLI_TEMP=
 | Date | Result |
 |---|---|
 | 2026-10-09 | written; needs phase 6 (`st2gguf --arch glm-dsa`, the GGUF arm of `colibri.c`) — then the CI step. |
+| 2026-10-09 | phase 6 implemented; the CI step is in `.github/workflows/check.yml` (job `gguf-oracle`): `make_glm_oracle.py`, `st2gguf --arch glm-dsa` (F32, fused, Q8_0), `tests/test_gguf_load_glm` suite + cross-checks, upstream's two oracle commands on `./glm_tiny` and on the F32 GGUF, `diff` of the `GLM C engine` lines (container == GGUF, cap 1/2/8, fused file, `DSA=0`), the TF mismatch counts compared, Q8_0 reported. No torch in the dev container: the first result is the next CI run (recorded in the tasks' state table). |

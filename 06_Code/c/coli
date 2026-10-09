@@ -1191,6 +1191,14 @@ def cmd_info(a):
         # sylph FR-29: sidecars of a GGUF model never sit beside the .gguf
         side = sidecar_dir(a.model)
         print(f"   {C.gray}{'sidecars':<10}{C.r} {side} {'' if os.path.isdir(side) else '(none yet)'}")
+        # the engine binary this architecture runs on (phase 6: glm-dsa -> colibri)
+        try:
+            resolved = resolve_model(a.model)
+            engine = engine_for(a.model)
+            print(f"   {C.gray}{'engine':<10}{C.r} {resolved.descriptor.engine_artifact} ({resolved.descriptor.id}) · "
+                  f"{'ready ✓' if os.path.exists(engine) else 'not built (coli build)'}")
+        except (FamilyConfigError, UnknownFamilyError) as error:
+            print(f"   {C.gray}{'engine':<10}{C.r} {C.yel}unsupported: {error}{C.r}")
         return
     banner("info", model=a.model)
     if not a.model:

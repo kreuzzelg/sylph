@@ -62,6 +62,7 @@
 #include "cli_args.h"
 #include "oracle.h"
 #include "st.h"
+#include "src.h"                                   /* sylph: GGUF tensor source (glm-dsa arm, phase 6) */
 #ifdef __linux__
 #include "uring.h"
 #endif
@@ -247,6 +248,12 @@ typedef struct {
  * 100+ ordinal as a public default/committed-upstream value -- the real
  * ordinal is only settled when the format MERGES into dev, exactly as fmt=8's
  * two renumbers demonstrate. */
+/* sylph (phase 6): fmt = QT_GGML_BASE + ggml type is a dense matrix or expert slice kept as the
+ * raw blocks a GGUF stores (q4 = the rows, s = NULL, gs = the block size); matmul_qt_ex
+ * dispatches them to gq.h. Never produced by qt_resolve_fmt (container path untouched). */
+#define QT_GGML_BASE 16
+static inline int qt_is_ggml(int fmt){ return fmt>=QT_GGML_BASE && fmt<QT_GGML_BASE+GQ_TYPE_COUNT; }
+static inline int qt_ggml_type(int fmt){ return fmt-QT_GGML_BASE; }
 typedef struct {
     int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;  /* gs=group size (0=per-row, 128=grouped) */
     int planar;  /* K1: fmt=2 con nibble a PIANI (vedi quant.h) — i kernel *_i4p; 0 = coppie classiche */
@@ -273,6 +280,7 @@ typedef struct {
 static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     int64_t n=(int64_t)t->O*t->I;
     if(t->fmt==0) return n*4;
+    if(qt_is_ggml(t->fmt)) return (int64_t)t->O*(int64_t)gq_row_bytes(qt_ggml_type(t->fmt),t->I);   /* raw GGUF blocks, no scale array */
     if(t->fmt==1) return n + (int64_t)t->O*4;
     if(t->fmt==3) return (int64_t)t->O*((t->I+3)/4) + (int64_t)t->O*4;
     if(t->fmt==4){ /* int4 grouped: packed nibbles + O*ceil(I/gs) scales */
@@ -358,6 +366,7 @@ static int64_t qt_rb(const QT *t){ return t->mmap_view ? 0 : qt_bytes(t); }
  * 4-byte allocation. UNVERIFIED at runtime (same static/arithmetic-only
  * caveat as the fmt=4/5/8 fix above -- no model run performed). */
 static int64_t qt_scale_bytes(const QT *t){
+    if(qt_is_ggml(t->fmt)) return 0;   /* GGUF blocks carry their scales in-block */
     if(t->fmt==4){ int ng=(t->I+t->gs-1)/t->gs; return (int64_t)t->O*ng*4; }
     if(t->fmt==5){ int64_t ng=((int64_t)t->I+63)/64; return (int64_t)t->O*ng*4; }
     if(t->fmt==6) return 4;   /* E8/IQ3: FIXED 4-byte tag (qsalloc(1)), not O*4 -- see this
@@ -461,6 +470,14 @@ typedef struct {
 
 typedef struct {
     Cfg c; shards S;
+    /* sylph (phase 6): the GGUF arm. is_gguf = the snapshot is a .gguf (or a directory of parts);
+     * src is the façade (src.h, glm-dsa name table); the strings are the startup line's facts. */
+    TensorSource src; int is_gguf;
+    size_t gguf_slot_bytes;                      /* bytes of one expert's three slices (slab size) */
+    int kvb_policy;                              /* 1 = attn_kv_b fused, 2 = attn_k_b/attn_v_b split */
+    int kvb_ktype; int64_t kvb_widen_bytes;      /* stored type of attn_k_b and the f32 bytes it widened to (sum over blocks) */
+    int ix_blocks;                               /* trunk blocks carrying indexer tensors */
+    char nextn_clause[200];                      /* "nextn absent" | "nextn blk.L eh_proj T (b bpw) loaded|skipped (...)" */
     int ebits, dbits;                            /* bit expert / bit densa */
     QT embed, lm_head; float *final_norm;
     Layer *L;
@@ -1205,6 +1222,12 @@ static inline int pq_want(const QT *g,const QT *u,int nr){
  * projections need it: IDOT's int8 activation quantization costs +0.117 nats/token there
  * (~+12% perplexity), measured. Every other prefill matmul keeps IDOT as before. */
 static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot){
+    if(qt_is_ggml(w->fmt)){   /* sylph: raw GGUF blocks -> gq.h (one row of x at a time; gq_matmul is OMP over rows) */
+        int ty=qt_ggml_type(w->fmt);
+        for(int s=0;s<S;s++) if(gq_matmul(y+(int64_t)s*w->O, x+(int64_t)s*w->I, ty, w->q4, w->I, w->O)){
+            fprintf(stderr,"matmul_qt: GGUF type %s rows of %d are not whole blocks\n", gq_type_name(ty), w->I); exit(1); }
+        return;
+    }
 #ifdef COLI_METAL
     /* fmt=8 (fp8 passthrough) deliberately absent from this allowlist, same as fmt=5/6:
      * the S>=g_metal_gemm_min batched prefill GEMM path (coli_metal_gemm) only knows
@@ -1713,6 +1736,7 @@ static jval* cfg_root(const char *snap, char **arena){
     return json_parse(b,arena);
 }
 static int gi(jval*r,const char*k){ jval*v=json_get(r,k); return v?(int)v->num:0; }
+static void cfg_validate(Cfg *c);
 static void load_cfg(Cfg *c, const char *snap){
     char *ar=NULL; jval *r=cfg_root(snap,&ar);
     c->hidden=gi(r,"hidden_size"); c->n_layers=gi(r,"num_hidden_layers");
@@ -1778,23 +1802,7 @@ static void load_cfg(Cfg *c, const char *snap){
     c->qk_head=c->qk_nope+c->qk_rope;
     c->attn_scale = 1.f / sqrtf((float)c->qk_head);
     if(c->n_group!=1){ fprintf(stderr,"this engine requires n_group=1 (GLM-5.2)\n"); exit(1); }
-    /* VALIDAZIONE (report PR #25): il config.json arriva da mirror non fidati — dimensioni
-     * ostili non devono superare questo punto. Un solo choke point protegge ogni alloc a valle. */
-    #define CKR(name,v,lo,hi) if((v)<(lo)||(v)>(hi)){ \
-        fprintf(stderr,"config: %s=%d is outside [%d,%d]\n",name,(int)(v),(int)(lo),(int)(hi)); exit(1); }
-    CKR("hidden_size",c->hidden,1,1<<20)         CKR("num_hidden_layers",c->n_layers,1,128)
-    CKR("num_attention_heads",c->n_heads,1,1024) CKR("n_routed_experts",c->n_experts,1,4096)
-    CKR("num_experts_per_tok",c->topk,1,64)      CKR("moe_intermediate_size",c->moe_inter,1,1<<20)
-    CKR("intermediate_size",c->dense_inter,1,1<<24) CKR("first_k_dense_replace",c->first_dense,0,c->n_layers)
-    CKR("q_lora_rank",c->q_lora,0,1<<20)         CKR("kv_lora_rank",c->kv_lora,1,1<<20)
-    CKR("qk_nope_head_dim",c->qk_nope,1,1<<16)   CKR("qk_rope_head_dim",c->qk_rope,1,1<<16)
-    CKR("v_head_dim",c->v_head,1,1<<16)          CKR("n_shared_experts",c->n_shared,0,64)
-    CKR("vocab_size",c->vocab,1,1<<24)           CKR("index_topk",c->index_topk,0,1<<20)
-    CKR("index_n_heads",c->index_nh,0,1024)      CKR("index_head_dim",c->index_hd,0,1<<16)
-    if(c->topk>c->n_experts){
-        fprintf(stderr,"config: num_experts_per_tok=%d exceeds n_routed_experts=%d\n",
-                c->topk,c->n_experts); exit(1); }
-    #undef CKR
+    cfg_validate(c);   /* the CKR range block, shared with the GGUF arm (sylph phase 6) */
     free(ar);
 }
 
@@ -2246,7 +2254,11 @@ static int qt_load_mmap(Model *m, const char *name, int O, int I, QT *t){
     return 0;
 }
 
+static QT qt_load_gguf(Model *m, const char *name, int O, int I);
+static QT glm_load_kv_b(Model *m, int layer, int H);
+static int glm_is_kv_b_name(const char *name, int *layer);
 static QT qt_load(Model *m, const char *name, int O, int I, int bits){
+    if(m->is_gguf){ int li; return glm_is_kv_b_name(name,&li) ? glm_load_kv_b(m,li,m->c.n_heads) : qt_load_gguf(m,name,O,I); }   /* sylph: GGUF arm */
     QT t; memset(&t,0,sizeof(t)); qt_from_disk(m,name,O,I,bits,0,&t);
 #ifdef COLI_CUDA
     if(g_cuda_enabled&&g_cuda_dense){
@@ -2262,6 +2274,7 @@ static QT qt_load(Model *m, const char *name, int O, int I, int bits){
  * classico. Il flag mmap_view del QT risultante distingue i due casi per
  * planarize, contabilita' e free paths. */
 static QT qt_load_ex(Model *m, const char *name, int O, int I, int bits, int mmap_ok){
+    if(m->is_gguf) return qt_load(m,name,O,I,bits);   /* sylph: no mmap views of a GGUF (the loader decodes) */
     if(mmap_ok){
         QT t;
         if(qt_load_mmap(m,name,O,I,&t)==0) return t;
@@ -2270,6 +2283,8 @@ static QT qt_load_ex(Model *m, const char *name, int O, int I, int bits, int mma
 }
 
 static float *ld(Model *m, const char *name){   /* tensore 1D f32 residente (norme/bias) */
+    if(m->is_gguf){ int64_t n=ts_numel(&m->src,name); if(n<0) ts_refuse_missing(&m->src,name);   /* sylph: exact decode from the GGUF */
+        float *p=(float*)qalloc((size_t)n*sizeof(float)); ts_read_f32(&m->src,name,p,n); return p; }
     int64_t n=st_numel(&m->S,name); if(n<0) st_die_missing(&m->S,name);
     float *p=(float*)qalloc((size_t)n*sizeof(float));   /* registrato per la GPU sotto METAL */
     st_read_f32(&m->S,name,p,0); return p;
@@ -2429,14 +2444,273 @@ static void metal_fmt_gate_notice(Model *m){
         k>=5?"sparse ":"", nbad[k]==1?"":"s");
 }
 
+/* ===================================================================================================
+ * sylph phase 6: the GGUF arm of this engine (`glm-dsa`, GLM-5 / 5.2 as llama.cpp's converter
+ * writes it). Contract and cases: 07_Tests/IntegrationTest/glm_assembly.md; design: architecture
+ * v1 §6–8 (commit 5184f3d8). The container path above is untouched (NFR-5): every function here
+ * is reached only when m->is_gguf, and the engine's math never sees a GGUF-specific value
+ * (NFR-3: nothing is re-quantized -- f32/f16/bf16 are decoded exactly, quantized matrices stay
+ * the author's blocks, fmt = QT_GGML_BASE + type, and run on gq.h).
+ * =================================================================================================== */
+static int src_has(Model *m, const char *name){
+    if(!m->is_gguf) return st_has(&m->S,name);
+    const char *rest; int i=qn_split_layer(name,&rest);
+    if(i>=0 && !strcmp(rest,"self_attn.kv_b_proj.weight")){   /* either MLA spelling (policy 1 or 2) */
+        char g[96]; snprintf(g,sizeof g,"blk.%d.attn_kv_b.weight",i); if(gguf_find(&m->src.G,g)) return 1;
+        snprintf(g,sizeof g,"blk.%d.attn_k_b.weight",i); if(!gguf_find(&m->src.G,g)) return 0;
+        snprintf(g,sizeof g,"blk.%d.attn_v_b.weight",i); return gguf_find(&m->src.G,g)!=NULL; }
+    return ts_has(&m->src,name);
+}
+
+#define GCFG_NEED(cond, ...) do{ if(!(cond)){ fprintf(stderr,"[GGUF] "); fprintf(stderr,__VA_ARGS__); fprintf(stderr," -- refusing\n"); exit(1); } }while(0)
+
+/* idx_type[] (v1 §7.1): the explicit `attention.indexer.types` array wins, else the blocks that
+ * carry indexer tensors. An explicit "full" on a block without the tensors is refused (-1). */
+static int glm_idx_types(int8_t *out, int n, const int8_t *explicit_types, const uint8_t *has_indexer){
+    for(int i=0;i<n;i++){
+        if(explicit_types){ out[i]=explicit_types[i]!=0; if(out[i] && !has_indexer[i]) return -1; }
+        else out[i]=has_indexer[i]!=0;
+    }
+    return 0;
+}
+/* the NextN precision guard (v1 §7.5): eh_proj below 8 bits per weight is skipped unless MTP=1 */
+static int glm_mtp_bits_ok(int ggml_type, int force){ return force || gguf_bits_per_weight(ggml_type)>=8.0; }
+
+/* MLA reconciliation, policy 2 (FR-18): rebuild the engine's kv_b [H*(nope+v)][kvl] from the
+ * absorbed split llama.cpp stores -- attn_k_b ne {nope, kvl, H} (per head K_h[kvl][nope], i.e.
+ * the k rows transposed) and attn_v_b ne {kvl, v, H} (per head V_h[v][kvl] as the engine wants
+ * it). kb_ne / vb_ne are the stored dims; a geometry mismatch is refused (-1), nothing is read
+ * out of bounds. Lossless: a pure re-indexing of exactly decoded values. */
+static int glm_kv_b_from_split(float *out, const float *kb, const int64_t *kb_ne, const float *vb, const int64_t *vb_ne, int H, int nope, int v, int kvl){
+    if(H<=0||nope<=0||v<=0||kvl<=0) return -1;
+    if(kb_ne[0]!=nope||kb_ne[1]!=kvl||kb_ne[2]!=H) return -1;
+    if(vb_ne[0]!=kvl||vb_ne[1]!=v||vb_ne[2]!=H) return -1;
+    for(int h=0;h<H;h++){
+        float *K=out+(size_t)h*(nope+v)*kvl, *V=K+(size_t)nope*kvl;
+        const float *Kh=kb+(size_t)h*kvl*nope;          /* [kvl][nope] */
+        for(int r=0;r<kvl;r++) for(int j=0;j<nope;j++) K[(size_t)j*kvl+r]=Kh[(size_t)r*nope+j];
+        memcpy(V, vb+(size_t)h*v*kvl, (size_t)v*kvl*sizeof(float));
+    }
+    return 0;
+}
+
+static void cfg_validate(Cfg *c){
+    /* VALIDAZIONE (report PR #25): dimensioni ostili non devono superare questo punto; un solo
+     * choke point protegge ogni alloc a valle. Shared by the config.json and the GGUF arm. */
+    #define CKR(name,v,lo,hi) if((v)<(lo)||(v)>(hi)){ \
+        fprintf(stderr,"config: %s=%d is outside [%d,%d]\n",name,(int)(v),(int)(lo),(int)(hi)); exit(1); }
+    CKR("hidden_size",c->hidden,1,1<<20)         CKR("num_hidden_layers",c->n_layers,1,128)
+    CKR("num_attention_heads",c->n_heads,1,1024) CKR("n_routed_experts",c->n_experts,1,4096)
+    CKR("num_experts_per_tok",c->topk,1,64)      CKR("moe_intermediate_size",c->moe_inter,1,1<<20)
+    CKR("intermediate_size",c->dense_inter,1,1<<24) CKR("first_k_dense_replace",c->first_dense,0,c->n_layers)
+    CKR("q_lora_rank",c->q_lora,0,1<<20)         CKR("kv_lora_rank",c->kv_lora,1,1<<20)
+    CKR("qk_nope_head_dim",c->qk_nope,1,1<<16)   CKR("qk_rope_head_dim",c->qk_rope,1,1<<16)
+    CKR("v_head_dim",c->v_head,1,1<<16)          CKR("n_shared_experts",c->n_shared,0,64)
+    CKR("vocab_size",c->vocab,1,1<<24)           CKR("index_topk",c->index_topk,0,1<<20)
+    CKR("index_n_heads",c->index_nh,0,1024)      CKR("index_head_dim",c->index_hd,0,1<<16)
+    if(c->topk>c->n_experts){
+        fprintf(stderr,"config: num_experts_per_tok=%d exceeds n_routed_experts=%d\n",
+                c->topk,c->n_experts); exit(1); }
+    #undef CKR
+}
+
+/* Cfg from the glm-dsa.* keys (v1 §7.1, the table verbatim); the same CKR block validates both arms. */
+static void glm_cfg_from_gguf(Model *m){
+    Cfg *c=&m->c; TensorSource *ts=&m->src; GgufSet *G=&ts->G;
+    #define GK(key) gguf_kv_i64_or(G,"glm-dsa." key,-1)
+    int64_t blocks=GK("block_count"), nextn=gguf_kv_i64_or(G,"glm-dsa.nextn_predict_layers",0);
+    GCFG_NEED(blocks>0&&blocks<=512&&nextn>=0&&nextn<blocks,"glm-dsa.block_count %lld / nextn_predict_layers %lld out of range",(long long)blocks,(long long)nextn);
+    c->n_layers=(int)(blocks-nextn);
+    c->hidden=(int)GK("embedding_length"); c->n_heads=(int)GK("attention.head_count");
+    c->n_experts=(int)GK("expert_count"); c->topk=(int)GK("expert_used_count");
+    c->moe_inter=(int)GK("expert_feed_forward_length"); c->dense_inter=(int)GK("feed_forward_length");
+    int64_t fd=GK("leading_dense_block_count"); c->first_dense=fd<0?0:(int)fd;
+    int64_t ql=GK("attention.q_lora_rank"); c->q_lora=ql<0?0:(int)ql;
+    c->kv_lora=(int)GK("attention.kv_lora_rank"); c->qk_rope=(int)GK("rope.dimension_count");
+    int64_t klm=GK("attention.key_length_mla"); c->qk_nope=(int)(klm-c->qk_rope); c->v_head=(int)GK("attention.value_length_mla");
+    int64_t sh=GK("expert_shared_count"); c->n_shared=sh<0?0:(int)sh;
+    double ws=1.0; gguf_kv_f64(G,"glm-dsa.expert_weights_scale",&ws); c->routed_scale=(float)ws;
+    int64_t nt=0; c->norm_topk=gguf_kv_i64(G,"glm-dsa.expert_weights_norm",&nt)?(nt!=0):0;
+    int64_t gating=gguf_kv_i64_or(G,"glm-dsa.expert_gating_func",2);
+    GCFG_NEED(gating==2,"glm-dsa.expert_gating_func = %lld: this engine implements sigmoid gating (2) only",(long long)gating);
+    c->n_group=(int)gguf_kv_i64_or(G,"glm-dsa.expert_group_count",1); c->topk_group=(int)gguf_kv_i64_or(G,"glm-dsa.expert_group_used_count",1);
+    GCFG_NEED(c->n_group==1,"glm-dsa.expert_group_count = %d: this engine requires n_group=1 (GLM-5.2)",c->n_group);
+    double eps=1e-5, theta=10000.0;
+    gguf_kv_f64(G,"glm-dsa.attention.layer_norm_rms_epsilon",&eps); gguf_kv_f64(G,"glm-dsa.rope.freq_base",&theta);
+    c->eps=(float)eps; c->theta=(float)theta;
+    GCFG_NEED(c->hidden>0&&c->n_heads>0&&c->n_experts>0&&c->topk>0&&c->moe_inter>0&&c->dense_inter>0&&c->kv_lora>0&&c->qk_rope>0&&klm>c->qk_rope&&c->v_head>0,
+              "glm-dsa.* keys incomplete (embedding_length %d, head_count %d, expert_count %d, expert_used_count %d, expert_feed_forward_length %d, feed_forward_length %d, kv_lora_rank %d, rope.dimension_count %d, key_length_mla %lld, value_length_mla %d)",
+              c->hidden,c->n_heads,c->n_experts,c->topk,c->moe_inter,c->dense_inter,c->kv_lora,c->qk_rope,(long long)klm,c->v_head);
+    /* vocab: the token list, cross-checked against token_embd / output */
+    int64_t ntok=gguf_kv_arr_len(G,"tokenizer.ggml.tokens");
+    GgufTensor *emb=gguf_find(G,"token_embd.weight"), *outw=gguf_find(G,"output.weight");
+    GCFG_NEED(emb&&emb->n_dims==2&&emb->ne[0]==c->hidden,"token_embd.weight missing or not {%d, vocab}",c->hidden);
+    GCFG_NEED(outw&&outw->n_dims==2&&outw->ne[0]==c->hidden,"output.weight missing or not {%d, vocab} (this engine does not tie lm_head)",c->hidden);
+    c->vocab=(int)(ntok>0?ntok:emb->ne[1]);
+    GCFG_NEED(c->vocab==emb->ne[1]&&outw->ne[1]==c->vocab,"vocab %d disagrees with token_embd (%lld) / output (%lld) rows",c->vocab,(long long)emb->ne[1],(long long)outw->ne[1]);
+    /* DSA indexer keys (0 if absent -> has_dsa = 0) and the per-block types */
+    int64_t inh=GK("attention.indexer.head_count"), ihd=GK("attention.indexer.key_length"), itk=GK("attention.indexer.top_k");
+    c->index_nh=inh<0?0:(int)inh; c->index_hd=ihd<0?0:(int)ihd; c->index_topk=itk<0?0:(int)itk;
+    { uint8_t has_ix[128]={0}; int8_t ex[128]; const int8_t *exp=NULL; m->ix_blocks=0;
+      for(int i=0;i<c->n_layers&&i<128;i++){ char nm[64]; snprintf(nm,sizeof nm,"blk.%d.indexer.attn_k.weight",i); has_ix[i]=gguf_find(G,nm)!=NULL; m->ix_blocks+=has_ix[i]; }
+      int64_t nty=gguf_kv_arr_len(G,"glm-dsa.attention.indexer.types");
+      if(nty>0){ GCFG_NEED(nty>=c->n_layers,"glm-dsa.attention.indexer.types has %lld entries for %d blocks",(long long)nty,c->n_layers);
+          for(int i=0;i<c->n_layers&&i<128;i++){ int64_t v=0; const char *sv=gguf_kv_arr_str(G,"glm-dsa.attention.indexer.types",i);
+              if(sv) v=!strcmp(sv,"full"); else gguf_kv_arr_i64(G,"glm-dsa.attention.indexer.types",i,&v); ex[i]=v!=0; }
+          exp=ex; }
+      GCFG_NEED(glm_idx_types(c->idx_type,c->n_layers<128?c->n_layers:128,exp,has_ix)==0,"glm-dsa.attention.indexer.types names a block that carries no indexer tensors"); }
+    /* stop ids (FR-20): the three tokenizer keys, plus the control tokens by name */
+    c->n_stop=0;
+    { const char *keys[3]={"tokenizer.ggml.eos_token_id","tokenizer.ggml.eot_token_id","tokenizer.ggml.eom_token_id"};
+      for(int k=0;k<3;k++){ int64_t v; if(gguf_kv_i64(G,keys[k],&v)&&v>=0&&v<c->vocab){ int dup=0; for(int j=0;j<c->n_stop;j++) if(c->stop_ids[j]==(int)v) dup=1; if(!dup&&c->n_stop<8) c->stop_ids[c->n_stop++]=(int)v; } }
+      const char *names[3]={"<|endoftext|>","<|user|>","<|observation|>"};
+      for(int64_t i=0;i<ntok&&c->n_stop<8;i++){ const char *s=gguf_kv_arr_str(G,"tokenizer.ggml.tokens",i); if(!s||s[0]!='<') continue;
+          for(int k=0;k<3;k++) if(!strcmp(s,names[k])){ int dup=0; for(int j=0;j<c->n_stop;j++) if(c->stop_ids[j]==(int)i) dup=1; if(!dup&&c->n_stop<8) c->stop_ids[c->n_stop++]=(int)i; } } }
+    c->qk_head=c->qk_nope+c->qk_rope;
+    c->attn_scale=1.f/sqrtf((float)c->qk_head);
+    cfg_validate(c);
+    /* the expert geometry of every MoE block (and the NextN block), and the slab size */
+    ts->n_layers=c->n_layers; ts->nextn=(int)nextn; ts->n_attn=c->n_layers; m->gguf_slot_bytes=0;
+    for(int i=c->first_dense;i<c->n_layers+(nextn?1:0);i++){
+        TsExpert e; GCFG_NEED(ts_expert(ts,i,0,&e)==0,"block %d has no ffn_{gate,up,down}_exps tensors",i);
+        GCFG_NEED(e.cols[0]==c->hidden&&e.rows[0]==c->moe_inter&&e.cols[1]==c->hidden&&e.rows[1]==c->moe_inter&&e.cols[2]==c->moe_inter&&e.rows[2]==c->hidden,
+                  "block %d expert tensors {%lld,%lld}/{%lld,%lld}/{%lld,%lld} do not match hidden %d / expert_feed_forward_length %d",
+                  i,(long long)e.cols[0],(long long)e.rows[0],(long long)e.cols[1],(long long)e.rows[1],(long long)e.cols[2],(long long)e.rows[2],c->hidden,c->moe_inter);
+        if(ts_expert_bytes(&e)>m->gguf_slot_bytes) m->gguf_slot_bytes=ts_expert_bytes(&e);
+    }
+    #undef GK
+}
+
+/* exact decode of a whole GGUF tensor (any supported type) into f32, row by row */
+static void glm_deq_tensor(Model *m, GgufTensor *t, float *out, const char *what){
+    int64_t rows=1; for(int d=1;d<t->n_dims;d++) rows*=t->ne[d];
+    size_t rb=gq_row_bytes(t->type,(int)t->ne[0]);
+    GCFG_NEED(gq_supported(t->type)&&rb>0,"%s: type %s rows of %lld are not whole blocks",what,gguf_type_name(t->type),(long long)t->ne[0]);
+    uint8_t *raw=malloc(rb*(size_t)rows); if(!raw){ fprintf(stderr,"OOM reading %s\n",what); exit(1); }
+    ts_pread(&m->src,t->file,t->off,raw,rb*(size_t)rows,what);
+    for(int64_t r=0;r<rows;r++) gq_deq_row(t->type,raw+rb*(size_t)r,out+(size_t)r*t->ne[0],(int)t->ne[0]);
+    free(raw);
+}
+
+/* a dense matrix [O][I] from the GGUF: f32/f16/bf16 decoded exactly (fmt 0), quantized types as
+ * the author's raw blocks (fmt QT_GGML_BASE + type, gq.h kernels). `bits` is ignored (NFR-3). */
+static QT qt_load_gguf(Model *m, const char *name, int O, int I){
+    QT t; memset(&t,0,sizeof t); t.O=O; t.I=I;
+    TsTensor tt; if(ts_find(&m->src,name,&tt)) ts_refuse_missing(&m->src,name);
+    GCFG_NEED(tt.expert<0,"%s is an expert slice, not a dense matrix",name);
+    int64_t ne0=tt.gt->ne[0], ne1=tt.gt->n_dims>1?tt.gt->ne[1]:1;
+    GCFG_NEED(ne0==I&&ne1==O,"%s (GGUF %s): shape {%lld,%lld}, config implies {%d,%d}",name,tt.gname,(long long)ne0,(long long)ne1,I,O);
+    if(!gq_supported(tt.type)) ts_refuse_type(name,&tt);
+    if(tt.type==GQ_F32||tt.type==GQ_F16||tt.type==GQ_BF16){
+        t.fmt=0; t.qf=(float*)qalloc((size_t)O*I*sizeof(float)); ts_read_f32(&m->src,name,t.qf,(int64_t)O*I); return t; }
+    uint8_t *raw; size_t nb; int ty;
+    if(ts_read_rows_any(&m->src,name,I,O,&raw,&nb,&ty)){ fprintf(stderr,"[GGUF] %s: cannot take the raw rows\n",name); exit(1); }
+    t.fmt=QT_GGML_BASE+ty; t.q4=raw; t.gs=gq_block(ty);
+    return t;
+}
+/* kv_b of block `layer`: policy 1 (attn_kv_b as stored) or policy 2 (the split, rebuilt). Always
+ * f32 (fmt 0) -- the absorb path (qt_addrow / qt_matvec_rows) reads it row-wise -- an exact
+ * decode of the stored values, never a re-quantization. */
+static QT glm_load_kv_b(Model *m, int layer, int H){
+    Cfg *c=&m->c; int nope=c->qk_nope, v=c->v_head, kvl=c->kv_lora; char nm[96];
+    QT t; memset(&t,0,sizeof t); t.fmt=0; t.O=H*(nope+v); t.I=kvl; t.qf=(float*)qalloc((size_t)t.O*t.I*sizeof(float));
+    snprintf(nm,sizeof nm,"blk.%d.attn_kv_b.weight",layer); GgufTensor *f=gguf_find(&m->src.G,nm);
+    if(f){
+        GCFG_NEED(f->n_dims==2&&f->ne[0]==kvl&&f->ne[1]==t.O,"%s: shape {%lld,%lld}, config implies {%d,%d}",nm,(long long)f->ne[0],(long long)(f->n_dims>1?f->ne[1]:1),kvl,t.O);
+        glm_deq_tensor(m,f,t.qf,nm); if(!m->kvb_policy) m->kvb_policy=1; return t;
+    }
+    char kn[96], vn[96]; snprintf(kn,sizeof kn,"blk.%d.attn_k_b.weight",layer); snprintf(vn,sizeof vn,"blk.%d.attn_v_b.weight",layer);
+    GgufTensor *kb=gguf_find(&m->src.G,kn), *vb=gguf_find(&m->src.G,vn);
+    GCFG_NEED(kb&&vb,"block %d: neither %s nor attn_k_b/attn_v_b present (kv_b_proj, FR-18)",layer,nm);
+    GCFG_NEED(kb->n_dims==3&&vb->n_dims==3&&kb->ne[0]==nope&&kb->ne[1]==kvl&&kb->ne[2]==H&&vb->ne[0]==kvl&&vb->ne[1]==v&&vb->ne[2]==H,
+              "%s {%lld,%lld,%lld} / %s {%lld,%lld,%lld}: config implies {%d,%d,%d} / {%d,%d,%d}",
+              kn,(long long)kb->ne[0],(long long)kb->ne[1],(long long)(kb->n_dims>2?kb->ne[2]:1),vn,(long long)vb->ne[0],(long long)vb->ne[1],(long long)(vb->n_dims>2?vb->ne[2]:1),nope,kvl,H,kvl,v,H);
+    float *kf=falloc((int64_t)H*kvl*nope), *vf=falloc((int64_t)H*v*kvl);
+    glm_deq_tensor(m,kb,kf,kn); glm_deq_tensor(m,vb,vf,vn);
+    if(glm_kv_b_from_split(t.qf,kf,kb->ne,vf,vb->ne,H,nope,v,kvl)){ fprintf(stderr,"[GGUF] block %d: kv_b split geometry refused\n",layer); exit(1); }
+    free(kf); free(vf);
+    m->kvb_policy=2; m->kvb_ktype=kb->type; m->kvb_widen_bytes+=(int64_t)H*kvl*nope*(int64_t)sizeof(float);
+    return t;
+}
+static int glm_is_kv_b_name(const char *name, int *layer){ const char *rest; int i=qn_split_layer(name,&rest); if(i<0||strcmp(rest,"self_attn.kv_b_proj.weight")) return 0; *layer=i; return 1; }
+
+/* the startup line (FR-30 twin, format in glm_assembly.md) */
+static void glm_print_startup(Model *m, int mtp_loaded){
+    Cfg *c=&m->c; TensorSource *ts=&m->src; GgufSet *G=&ts->G;
+    int cnt[GGML_TYPE_COUNT]={0}; int64_t dense=0, experts=0, n_exp=0;
+    for(int64_t i=0;i<G->nt;i++){ GgufTensor *t=&G->t[i]; const char *n=gguf_tensor_name(G,t);
+        if(strstr(n,"_exps.")){ experts+=t->nbytes>0?t->nbytes:0; if(t->n_dims==3&&!n_exp) n_exp=t->ne[2]; }
+        else { dense+=t->nbytes>0?t->nbytes:0; if(t->type>=0&&t->type<GGML_TYPE_COUNT) cnt[t->type]++; } }
+    TsExpert e; const char *tg="?",*tu="?",*td="?";
+    if(ts_expert(ts,c->first_dense,0,&e)==0){ tg=gguf_type_name(e.type[0]); tu=gguf_type_name(e.type[1]); td=gguf_type_name(e.type[2]); }
+    char side[2304]; ts_sidecar_dir(ts,side,sizeof side);
+    char buf[4096]; int w=snprintf(buf,sizeof buf,"[GGUF] glm-dsa · %d blocks (%d dense, %d MoE) · %d part%s · experts %s/%s/%s %.2f MB each × %lld × %d = %.2f GB · dense",
+        c->n_layers,c->first_dense,c->n_layers-c->first_dense,G->nfiles,G->nfiles==1?"":"s",tg,tu,td,m->gguf_slot_bytes/1048576.0,(long long)n_exp,c->n_layers-c->first_dense+(mtp_loaded?1:0),experts/1073741824.0);
+    for(int t=0;t<GGML_TYPE_COUNT&&w<(int)sizeof buf;t++) if(cnt[t]) w+=snprintf(buf+w,sizeof buf-(size_t)w," %s×%d",gguf_type_name(t),cnt[t]);
+    if(w<(int)sizeof buf) w+=snprintf(buf+w,sizeof buf-(size_t)w," %.2f GB · kv_b from %s · indexer %d/%d blocks · %s · experts on CPU (gq) · sidecars %s",
+        dense/1073741824.0, m->kvb_policy==1?"attn_kv_b":"attn_k_b/attn_v_b", m->ix_blocks, c->n_layers, m->nextn_clause, side);
+    if(m->kvb_policy==2){ char kw[96]; snprintf(kw,sizeof kw," (k widened from %s, %.2f MB)",gguf_type_name(m->kvb_ktype),m->kvb_widen_bytes/1048576.0);
+        char *at=strstr(buf,"attn_k_b/attn_v_b"); if(at){ char tail[4096]; snprintf(tail,sizeof tail,"%s",at+17); snprintf(at+17,sizeof buf-(size_t)(at+17-buf),"%s%s",kw,tail); } }
+    fprintf(stderr,"%s\n",buf);
+}
+/* the "GGUF reads:" line (FR-30), printed at the end of a run next to the cache statistics */
+static void glm_print_reads(Model *m, int64_t ntok){
+    if(!m->is_gguf) return;
+    uint64_t sl=__atomic_load_n(&m->src.rd_slices,__ATOMIC_RELAXED), by=__atomic_load_n(&m->src.rd_bytes,__ATOMIC_RELAXED);
+    int parts=ts_parts_touched(&m->src);
+    fprintf(stderr,"GGUF reads: %llu slices · %.2f MB · %.3f MB/token · %d part%s touched\n",(unsigned long long)sl,by/1e6,ntok>0?by/1e6/(double)ntok:0.0,parts,parts==1?"":"s");
+}
+
+/* ---- tokenizer from the GGUF's tokenizer.ggml.* arrays (FR-20, pre = glm4 -> cl100k family) ---- */
+static GgufSet *g_tok_gguf;   /* set when the model is a GGUF: tok_load_src builds the Tok from it */
+static void glm_tok_load(Tok *T, const GgufSet *G){
+    memset(T,0,sizeof(*T)); tk_build_bytemap(T);
+    int64_t n=gguf_kv_arr_len(G,"tokenizer.ggml.tokens");
+    GCFG_NEED(n>0&&n<=(1<<21),"the GGUF has no tokenizer.ggml.tokens");
+    const char *pre=gguf_kv_str(G,"tokenizer.ggml.pre");
+    GCFG_NEED(pre&&(!strcmp(pre,"glm4")||!strcmp(pre,"glm-4")||!strcmp(pre,"chatglm-bpe")),"tokenizer.ggml.pre is '%s'; this engine's pre-tokenizer is GLM's (glm4, cl100k family) and never guesses",pre?pre:"(missing)");
+    int64_t nt=gguf_kv_arr_len(G,"tokenizer.ggml.token_type");
+    T->n_ids=(int)n; T->id2str=calloc((size_t)n,sizeof(char*)); T->id_added=calloc((size_t)n,sizeof(int)); T->id_special=calloc((size_t)n,sizeof(int));
+    if(!T->id2str||!T->id_added||!T->id_special){ fprintf(stderr,"tokenizer: OOM sizing %lld ids\n",(long long)n); exit(1); }
+    int vc=1; while(vc<n*2) vc<<=1; hm_init(&T->vocab,vc);
+    int nadded=0;
+    for(int64_t i=0;i<n;i++){
+        const char *s=gguf_kv_arr_str(G,"tokenizer.ggml.tokens",i); if(!s) s="";
+        int64_t ty=1; if(nt==n) gguf_kv_arr_i64(G,"tokenizer.ggml.token_type",i,&ty);
+        char *dup=strdup(s); T->id2str[i]=dup;
+        hm_put(&T->vocab,dup,(int)strlen(dup),(int)i);
+        if(ty==3||ty==4){ T->id_added[i]=1; if(ty==3) T->id_special[i]=1; nadded++; }
+    }
+    int64_t nm=gguf_kv_arr_len(G,"tokenizer.ggml.merges");
+    if(nm<=0){ T->rankbpe=1; hm_init(&T->merges,16); }
+    else { int mc=1; while(mc<nm*2) mc<<=1; hm_init(&T->merges,mc);
+        for(int64_t r=0;r<nm;r++){ const char *mk=gguf_kv_arr_str(G,"tokenizer.ggml.merges",r); if(!mk) continue;
+            const char *sp=strchr(mk,' '); if(!sp||sp==mk||!sp[1]) continue;
+            int ll=(int)(sp-mk), rl=(int)strlen(sp+1);
+            char *key=malloc((size_t)ll+1+(size_t)rl); memcpy(key,mk,(size_t)ll); key[ll]=0; memcpy(key+ll+1,sp+1,(size_t)rl);
+            hm_put(&T->merges,key,ll+1+rl,(int)r); } }
+    if(nadded){ T->nsp=nadded; T->sp=calloc((size_t)nadded,sizeof(Special)); int k=0;
+        for(int64_t i=0;i<n;i++) if(T->id_added[i]){ T->sp[k].str=T->id2str[i]; T->sp[k].len=(int)strlen(T->id2str[i]); T->sp[k].id=(int)i; k++; }
+        qsort(T->sp,T->nsp,sizeof(Special),cmp_sp_len); }
+    T->json_root=NULL;
+    fprintf(stderr,"[tok] loaded %lld pieces (%lld merges, %d added) from the GGUF metadata (pre %s)\n",(long long)n,(long long)(nm<0?0:nm),nadded,pre);
+}
+static void tok_load_src(Tok *T, const char *tokenizer_json_path){ if(g_tok_gguf) glm_tok_load(T,g_tok_gguf); else tok_load(T,tokenizer_json_path); }
+
 static void model_init_range(Model *m, const char *snap, int cap,
                              int ebits, int dbits, int layer_begin,
                              int layer_end, int load_boundaries, int load_mtp,
                              int init_telemetry, int allow_trunk_mmap){
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
-    load_cfg(&m->c,snap);
     { const char *xd=getenv("COLI_MODEL_DIRS");        /* SPLIT: model shards spread across N drives */
-      st_init_multi(&m->S,snap,(xd&&*xd)?xd:NULL); }
+      m->is_gguf=ts_is_gguf_path(snap);
+      if(m->is_gguf){                                  /* sylph: a glm-dsa GGUF carries config, names and tokenizer */
+          ts_init_arch(&m->src,&m->S,snap,(xd&&*xd)?xd:NULL,TS_ARCH_GLM_DSA);
+          glm_cfg_from_gguf(m); g_tok_gguf=&m->src.G; snprintf(m->nextn_clause,sizeof m->nextn_clause,"nextn absent");
+      } else {
+          load_cfg(&m->c,snap);
+          st_init_multi(&m->S,snap,(xd&&*xd)?xd:NULL);
+      } }
     Cfg *c=&m->c; char nm[256]; int H=c->n_heads, D=c->hidden;
     if(layer_end==0) layer_end=c->n_layers;
     if(layer_begin<0||layer_begin>=layer_end||layer_end>c->n_layers){
@@ -2561,14 +2835,26 @@ static void model_init_range(Model *m, const char *snap, int cap,
         char mn[256]; m->has_mtp=1;
         for(unsigned q=0;q<sizeof(req)/sizeof(req[0]);q++){
             snprintf(mn,sizeof(mn),"model.layers.%d.%s",c->n_layers,req[q]);
-            if(!st_has(&m->S,mn)){ m->has_mtp=0; break; }
+            if(!src_has(m,mn)){ m->has_mtp=0; break; }
         }
         /* probe the LAST expert by index, not a fixed 255: REAP-pruned
          * checkpoints have n_routed_experts < 256 and the MTP set stays complete,
          * so a hardcoded expert.255 would spuriously report has_mtp=0 on them. */
         snprintf(mn,sizeof(mn),"model.layers.%d.mlp.experts.%d.down_proj.weight",c->n_layers,c->n_experts-1);
-        if(!st_has(&m->S,mn)) m->has_mtp=0;
+        if(!src_has(m,mn)) m->has_mtp=0;
         if(getenv("MTP") && atoi(getenv("MTP"))==0) m->has_mtp=0;
+        if(m->is_gguf){   /* sylph: the NextN precision guard (v1 §7.5) and the startup clause (glm_assembly.md) */
+            char en[80]; snprintf(en,sizeof en,"blk.%d.nextn.eh_proj.weight",c->n_layers); GgufTensor *eh=gguf_find(&m->src.G,en);
+            const char *me=getenv("MTP"); int force=me&&atoi(me)==1;
+            if(!eh) snprintf(m->nextn_clause,sizeof m->nextn_clause,"nextn absent");
+            else { double bpw=gguf_bits_per_weight(eh->type); const char *why;
+                if(me&&atoi(me)==0) why="skipped (MTP=0)";
+                else if(!glm_mtp_bits_ok(eh->type,force)){ m->has_mtp=0; why="skipped (below 8 bpw; MTP=1 to force)"; }
+                else if(!m->has_mtp) why="skipped (incomplete NextN set)";
+                else why="loaded";
+                if(!strcmp(why,"skipped (below 8 bpw; MTP=1 to force)")) snprintf(m->nextn_clause,sizeof m->nextn_clause,"nextn blk.%d eh_proj %s (%.2f bpw) skipped (%.2f bpw < 8; MTP=1 to force)",c->n_layers,gguf_type_name(eh->type),bpw,bpw);
+                else snprintf(m->nextn_clause,sizeof m->nextn_clause,"nextn blk.%d eh_proj %s (%.2f bpw) %s",c->n_layers,gguf_type_name(eh->type),bpw,why); }
+        }
         if(m->has_mtp){
             int i=c->n_layers; Layer *l=&m->mtpL;
             #define PM(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
@@ -2609,7 +2895,7 @@ static void model_init_range(Model *m, const char *snap, int cap,
         for(int i=layer_begin;i<layer_end && m->has_dsa;i++){
             if(!c->idx_type[i]) continue;
             snprintf(inm,sizeof(inm),"model.layers.%d.self_attn.indexer.wq_b.weight",i);
-            if(!st_has(&m->S,inm)) m->has_dsa=0;
+            if(!src_has(m,inm)) m->has_dsa=0;
         }
         if(getenv("DSA") && atoi(getenv("DSA"))==0) m->has_dsa=0;
         if(m->has_dsa){
@@ -2660,6 +2946,7 @@ static void model_init_range(Model *m, const char *snap, int cap,
         if(!m->has_mtp) rt_drop_row(c->n_layers);
     }
     m->resident_bytes=rb;
+    if(m->is_gguf && load_boundaries) glm_print_startup(m,m->has_mtp);
 }
 
 static void model_init(Model *m, const char *snap, int cap,
@@ -2672,6 +2959,7 @@ static void embed_row(Model *m, int tok, float *x){
     int D=m->c.hidden; QT *e=&m->embed;
     if(tok<0 || tok>=e->O){ memset(x,0,(size_t)D*sizeof(float)); return; }   /* #SEC-5: out-of-range token id -> zero row, never OOB */
     if(e->fmt==0){ memcpy(x, e->qf+(int64_t)tok*D, D*sizeof(float)); return; }
+    if(qt_is_ggml(e->fmt)){ if(gq_embed_row(qt_ggml_type(e->fmt), e->q4, tok, x, D)){ fprintf(stderr,"embed_row: bad GGUF row\n"); exit(1); } return; }
     if(e->fmt==4){ /* grouped int4: per-group scale (embed/lm_head at io_bits, usually fmt 0/1) */
         const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2); int gs=e->gs,ng=(D+gs-1)/gs;
         const float *scl=e->s+(int64_t)tok*ng;
@@ -2966,6 +3254,35 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     }
 #endif
     Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden, b=m->ebits;
+    if(m->is_gguf){   /* sylph: three raw slices into the slab, QTs as fmt QT_GGML_BASE + type (gq.h) */
+        TsExpert e;
+        if(ts_expert(&m->src,layer,eid,&e)){ if(fatal){ fprintf(stderr,"[GGUF] block %d has no expert tensors\n",layer); exit(1); } return -1; }
+        if(e.cols[0]!=D||e.rows[0]!=I||e.cols[1]!=D||e.rows[1]!=I||e.cols[2]!=I||e.rows[2]!=D){
+            fprintf(stderr,"[GGUF] block %d expert %d: slice geometry does not match the config\n",layer,eid); if(fatal) exit(1); return -1; }
+        int64_t need=(int64_t)ts_expert_bytes(&e);
+        if(!s->slab || need>s->slab_cap){
+#ifdef COLI_METAL
+            if(s->slab && g_metal_enabled) coli_metal_unregister(s->slab);
+            compat_aligned_free(s->slab);
+            size_t nb=((size_t)need+16383)&~(size_t)16383;
+            if(posix_memalign((void**)&s->slab,16384,nb)){ fprintf(stderr,"OOM slab\n"); if(fatal) exit(1); s->slab=NULL; s->slab_cap=0; return -1; }
+            s->slab_cap=(int64_t)nb; if(g_metal_enabled) coli_metal_register(s->slab,nb);
+#else
+            compat_aligned_free(s->slab);
+            if(posix_memalign((void**)&s->slab,4096,(size_t)need)){ fprintf(stderr,"OOM slab\n"); if(fatal) exit(1); s->slab=NULL; s->slab_cap=0; return -1; }
+            s->slab_cap=need; numa_slab_bind(s->slab,(size_t)need);
+#endif
+        }
+        int64_t pos[3]={0,(int64_t)e.bytes[0],(int64_t)(e.bytes[0]+e.bytes[1])};
+        for(int k=0;k<3;k++) ts_read_expert_slice(&m->src,&e,k,s->slab+pos[k]);
+        QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
+        for(int k=0;k<3;k++){ qt[k]->fmt=QT_GGML_BASE+e.type[k]; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gq_block(e.type[k]);
+            qt[k]->qf=NULL; qt[k]->q8=NULL; qt[k]->q4=s->slab+pos[k]; qt[k]->s=NULL; qt[k]->planar=0; }
+        atomic_fetch_add_explicit(&g_prof_io,need,memory_order_relaxed);
+        if(g_disk_split){ if(layer==c->n_layers){ __atomic_add_fetch(&m->ld_mtp,1,__ATOMIC_RELAXED); __atomic_add_fetch(&m->bytes_mtp,(uint64_t)need,__ATOMIC_RELAXED); }
+                          else { __atomic_add_fetch(&m->ld_main,1,__ATOMIC_RELAXED); __atomic_add_fetch(&m->bytes_main,(uint64_t)need,__ATOMIC_RELAXED); } }
+        (void)b; s->eid=eid; return 0;
+    }
     /* suf as a bounded char[][16] (not const char*) lets GCC prove the %s in the
      * nm[k]/qn snprintfs can't overflow: worst key is "model.layers.<i>.mlp.experts.<i>.down_proj.weight"
      * = 66 bytes incl NUL, well under nm[288] and qn[320]. See #484. */
@@ -3904,6 +4221,7 @@ static void expert_host_ensure(Model *m, int layer, ESlot *s){
  * EN: under O_DIRECT the weights bypass the page cache, so their WILLNEED is wasted;
  * the .qs scales are always buffered, so keep theirs. Advisory hint -> output-preserving. */
 static void expert_prefetch(Model *m, int layer, int eid){
+    if(m->is_gguf) return;   /* sylph: the GGUF path has no readahead hint yet (one pread per slice, FR-27) */
     char nm[300]; int rep=expert_route(layer,eid);
     const char *suf[3]={"gate_proj.weight","up_proj.weight","down_proj.weight"};
     for(int k=0;k<3;k++){
@@ -8109,7 +8427,7 @@ static void run_score(Model *m, const char *snap, const char *path){
         jval *mt=json_get(r,"model_type");
         if(mt_is_glm(mt?mt->str:NULL)){
             char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
-            Tok T; tok_load(&T,tkp);
+            Tok T; tok_load_src(&T,tkp);
             pfx[0]=tok_id_of(&T,"[gMASK]"); pfx[1]=tok_id_of(&T,"<sop>");
             if(pfx[0]>=0&&pfx[1]>=0){ pfx_on=1;
                 fprintf(stderr,"[SCORE] GLM snapshot: prepending [gMASK]<sop> (ids %d,%d) to unprefixed requests — disable with SCORE_PREFIX=0\n",pfx[0],pfx[1]);
@@ -8536,7 +8854,7 @@ static void run_consist(Model *m, const int *full, int nfull, int np){
  * CONSIST_NP overrides the default halfway split. */
 static void run_consist_prompt(Model *m, const char *snap, const char *prompt){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
-    Tok T; tok_load(&T,tkp);
+    Tok T; tok_load_src(&T,tkp);
     int cap=(int)strlen(prompt)+16; int *ids=malloc(((size_t)cap+4)*sizeof(int));
     if(!ids){ fprintf(stderr,"CONSIST: out of memory\n"); tok_free(&T); return; }
     int n=tok_encode(&T,prompt,(int)strlen(prompt),ids,cap);
@@ -8564,7 +8882,7 @@ static void run_consist_prompt(Model *m, const char *snap, const char *prompt){
  * detokenizza e stampa il testo in streaming. */
 static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     Cfg *c=&m->c; char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
-    Tok T; tok_load(&T,tkp);
+    Tok T; tok_load_src(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm_tok(&m->c, eos, &T);
     grammar_setup(&g_grd,&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
@@ -8674,6 +8992,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     if(g_cuda_enabled) cuda_stats_print();
 #endif
     profile_print(m,dt);
+    glm_print_reads(m,ngen);   /* sylph: the GGUF reads of this prompt run (FR-30) */
     if(g_prof) prof_report(m,&pb,dt,produced,stdout);
     if(g_pilot_real) printf("PILOT_REAL: %ld load cross-layer completati, %ld scartati (main gia' sul layer) | PILOT_K=%d\n",
         (long)atomic_load_explicit(&g_pilot_loads,memory_order_relaxed),
@@ -9416,7 +9735,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
 
 static void run_serve_mux(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
-    Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm_tok(&m->c,eos,&T);
+    Tok T; tok_load_src(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm_tok(&m->c,eos,&T);
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
     int nctx=getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
     if(nctx<1||nctx>512){fprintf(stderr,"KV_SLOTS must be between 1 and 512\n");exit(2);}
@@ -9599,7 +9918,7 @@ static void run_serve(Model *m, const char *snap){
 #endif
     double t_serve0=now_s();             /* PROF: wall base for the exit-time profile_print */
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
-    Tok T; tok_load(&T,tkp);
+    Tok T; tok_load_src(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm_tok(&m->c, eos, &T);
     grammar_setup(&g_grd,&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
@@ -11161,6 +11480,108 @@ static int coli_env_on(const char *name)
              strcmp(v,"off")==0 || strcmp(v,"no")==0);
 }
 
+
+/* ---- sylph phase 6: the cross-check behind tests/test_gguf_load_glm (glm_assembly.md case 2) ----
+ * Loads the Model from the GGUF exactly as main() would (model_init), opens the HF snapshot
+ * beside it and compares: the Cfg field by field against config.json, every dense tensor the
+ * engine holds (decoded back to f32 where it kept raw blocks), kv_b rebuilt from the split,
+ * and every expert slice of every MoE block, against st_read_f32 of the HF name. Bit-exact
+ * for an F32 file; with tol_q8 the Q8_0 / F16 tensors are allowed the quantizer's rounding
+ * (half a Q8_0 step of the 32-block's absmax; one f16 ulp). Prints "FAIL: ..." and counts. */
+static void qt_to_f32(const QT *t, float *out){
+    if(t->fmt==0){ memcpy(out,t->qf,(size_t)t->O*t->I*sizeof(float)); return; }
+    if(qt_is_ggml(t->fmt)){ int ty=qt_ggml_type(t->fmt); size_t rb=gq_row_bytes(ty,t->I);
+        for(int r=0;r<t->O;r++) gq_deq_row(ty,t->q4+rb*(size_t)r,out+(size_t)r*t->I,t->I); return; }
+    fprintf(stderr,"qt_to_f32: fmt %d is not a GGUF format\n",t->fmt); exit(1);
+}
+static int glm_xc_cmp(const char *what, const float *eng, const float *hf, int64_t n, int tol_mode, int stored_type, int *fails){
+    int64_t bad=0; double worst=0; int64_t wi=-1;
+    for(int64_t i=0;i<n;i++){
+        double d=fabs((double)eng[i]-(double)hf[i]); double tol=0;
+        if(tol_mode){
+            if(stored_type==GQ_Q8_0||stored_type==GQ_Q4_K||stored_type==GQ_Q5_K||stored_type==GQ_Q6_K){
+                int64_t b0=i-(i%32); float am=0; for(int64_t j=b0;j<b0+32&&j<n;j++){ float a=fabsf(hf[j]); if(a>am) am=a; }
+                /* half a step, plus the f16 rounding of d applied to |q| <= 127 (ggml stores d as f16;
+                 * the quantizer rounds with the f32 d): 0.5 + 127/2048 < 0.57 of a step */
+                tol=am/127.0*0.57+1e-7; }
+            else if(stored_type==GQ_F16||stored_type==GQ_BF16) tol=fabs((double)hf[i])*(1.0/1024.0)+6e-8;
+        }
+        if(d>tol){ bad++; if(d>worst){ worst=d; wi=i; } }
+    }
+    if(bad){ (*fails)++; printf("FAIL: %s: %lld of %lld elements differ (worst |d| %.3g at %lld: engine %.8g hf %.8g)\n",what,(long long)bad,(long long)n,worst,(long long)wi,wi>=0?eng[wi]:0.f,wi>=0?hf[wi]:0.f); return 1; }
+    return 0;
+}
+static int glm_xc_qt(Model *m, shards *S2, const char *hf, const QT *t, int tol, int *fails){
+    int64_t n=(int64_t)t->O*t->I, hn=st_numel(S2,hf);
+    if(hn!=n){ (*fails)++; printf("FAIL: %s: engine holds %lld elements, snapshot %lld\n",hf,(long long)n,(long long)hn); return 1; }
+    float *a=falloc(n), *b=falloc(n); qt_to_f32(t,a); st_read_f32(S2,hf,b,0);
+    int ty=GQ_F32;
+    if(t->fmt) ty=qt_ggml_type(t->fmt);
+    else { int li;
+        if(glm_is_kv_b_name(hf,&li)){   /* f32 rebuilt from the stored parts: the loosest of their types bounds the error */
+            char kn[96], vn[96], fn[96]; snprintf(kn,sizeof kn,"blk.%d.attn_k_b.weight",li); snprintf(vn,sizeof vn,"blk.%d.attn_v_b.weight",li); snprintf(fn,sizeof fn,"blk.%d.attn_kv_b.weight",li);
+            GgufTensor *parts[3]={gguf_find(&m->src.G,kn),gguf_find(&m->src.G,vn),gguf_find(&m->src.G,fn)};
+            for(int k=0;k<3;k++) if(parts[k]){ int pt=parts[k]->type; int rank=pt==GQ_F32?0:(pt==GQ_F16||pt==GQ_BF16)?1:2, cur=ty==GQ_F32?0:(ty==GQ_F16||ty==GQ_BF16)?1:2; if(rank>cur) ty=rank==1?GQ_F16:GQ_Q8_0; }
+        } else { int st=ts_ggml_type(&m->src,hf); if(st>=0) ty=st; } }
+    int r=glm_xc_cmp(hf,a,b,n,tol,ty,fails); free(a); free(b); return r;
+}
+static int glm_xc_vec(shards *S2, const char *hf, const float *v, int64_t n, int *fails){
+    int64_t hn=st_numel(S2,hf);
+    if(hn!=n){ (*fails)++; printf("FAIL: %s: engine holds %lld elements, snapshot %lld\n",hf,(long long)n,(long long)hn); return 1; }
+    float *b=falloc(n); st_read_f32(S2,hf,b,0); int r=glm_xc_cmp(hf,v,b,n,0,GQ_F32,fails); free(b); return r;
+}
+#define XC_CFG(field) do{ if(m->c.field!=hc.field){ (*fails)++; printf("FAIL: Cfg." #field ": GGUF %d, config.json %d\n",(int)m->c.field,(int)hc.field); } }while(0)
+static int glm_cross_check(Model *m, const char *gguf, const char *hf, int tol_q8, int *fails){
+    if(!ts_is_gguf_path(gguf)){ printf("FAIL: %s is not a GGUF\n",gguf); return -1; }
+    model_init(m,gguf,8,16,16);
+    if(!m->is_gguf){ printf("FAIL: the loader did not take the GGUF arm\n"); return -1; }
+    Cfg hc; memset(&hc,0,sizeof hc); load_cfg(&hc,hf);
+    XC_CFG(hidden); XC_CFG(n_layers); XC_CFG(n_heads); XC_CFG(n_experts); XC_CFG(topk); XC_CFG(moe_inter); XC_CFG(dense_inter); XC_CFG(first_dense);
+    XC_CFG(q_lora); XC_CFG(kv_lora); XC_CFG(qk_nope); XC_CFG(qk_rope); XC_CFG(qk_head); XC_CFG(v_head); XC_CFG(n_shared); XC_CFG(vocab);
+    XC_CFG(n_group); XC_CFG(topk_group); XC_CFG(norm_topk); XC_CFG(index_topk); XC_CFG(index_nh); XC_CFG(index_hd); XC_CFG(n_stop);
+    if(fabsf(m->c.eps-hc.eps)>1e-9f||fabsf(m->c.theta-hc.theta)>1e-3f*hc.theta||fabsf(m->c.routed_scale-hc.routed_scale)>1e-6f||fabsf(m->c.attn_scale-hc.attn_scale)>1e-9f){
+        (*fails)++; printf("FAIL: Cfg eps/theta/routed_scale/attn_scale: GGUF %g/%g/%g/%g, config.json %g/%g/%g/%g\n",m->c.eps,m->c.theta,m->c.routed_scale,m->c.attn_scale,hc.eps,hc.theta,hc.routed_scale,hc.attn_scale); }
+    for(int i=0;i<hc.n_stop;i++){ int f=0; for(int j=0;j<m->c.n_stop;j++) if(m->c.stop_ids[j]==hc.stop_ids[i]) f=1; if(!f){ (*fails)++; printf("FAIL: stop id %d of config.json not in the GGUF's set\n",hc.stop_ids[i]); } }
+    for(int i=0;i<hc.n_layers&&i<128;i++) if(m->c.idx_type[i]!=hc.idx_type[i]){ (*fails)++; printf("FAIL: idx_type[%d]: GGUF %d, config.json %d\n",i,m->c.idx_type[i],hc.idx_type[i]); }
+    shards S2; memset(&S2,0,sizeof S2); st_init_multi(&S2,hf,NULL);
+    Cfg *c=&m->c; int D=c->hidden; char nm[256];
+    glm_xc_qt(m,&S2,"model.embed_tokens.weight",&m->embed,tol_q8,fails);
+    glm_xc_qt(m,&S2,"lm_head.weight",&m->lm_head,tol_q8,fails);
+    glm_xc_vec(&S2,"model.norm.weight",m->final_norm,D,fails);
+    int nexp=0;
+    for(int i=0;i<c->n_layers+(m->has_mtp?1:0);i++){
+        Layer *l=i<c->n_layers?&m->L[i]:&m->mtpL;
+        #define P(s) (snprintf(nm,sizeof nm,"model.layers.%d." s,i),nm)
+        glm_xc_vec(&S2,P("input_layernorm.weight"),l->in_ln,D,fails); glm_xc_vec(&S2,P("post_attention_layernorm.weight"),l->post_ln,D,fails);
+        glm_xc_qt(m,&S2,P("self_attn.q_a_proj.weight"),&l->q_a,tol_q8,fails); glm_xc_vec(&S2,P("self_attn.q_a_layernorm.weight"),l->q_a_ln,c->q_lora,fails);
+        glm_xc_qt(m,&S2,P("self_attn.q_b_proj.weight"),&l->q_b,tol_q8,fails); glm_xc_qt(m,&S2,P("self_attn.kv_a_proj_with_mqa.weight"),&l->kv_a,tol_q8,fails);
+        glm_xc_vec(&S2,P("self_attn.kv_a_layernorm.weight"),l->kv_a_ln,c->kv_lora,fails);
+        glm_xc_qt(m,&S2,P("self_attn.kv_b_proj.weight"),&l->kv_b,tol_q8,fails); glm_xc_qt(m,&S2,P("self_attn.o_proj.weight"),&l->o,tol_q8,fails);
+        if(!l->sparse){ glm_xc_qt(m,&S2,P("mlp.gate_proj.weight"),&l->gate_proj,tol_q8,fails); glm_xc_qt(m,&S2,P("mlp.up_proj.weight"),&l->up_proj,tol_q8,fails); glm_xc_qt(m,&S2,P("mlp.down_proj.weight"),&l->down_proj,tol_q8,fails); }
+        else {
+            glm_xc_vec(&S2,P("mlp.gate.weight"),l->router,(int64_t)c->n_experts*D,fails); glm_xc_vec(&S2,P("mlp.gate.e_score_correction_bias"),l->router_bias,c->n_experts,fails);
+            glm_xc_qt(m,&S2,P("mlp.shared_experts.gate_proj.weight"),&l->sh_gate,tol_q8,fails); glm_xc_qt(m,&S2,P("mlp.shared_experts.up_proj.weight"),&l->sh_up,tol_q8,fails); glm_xc_qt(m,&S2,P("mlp.shared_experts.down_proj.weight"),&l->sh_down,tol_q8,fails);
+            for(int e=0;e<c->n_experts;e++){
+                ESlot s; memset(&s,0,sizeof s); s.eid=-1;
+                if(expert_load(m,i,e,&s,0,0)){ (*fails)++; printf("FAIL: block %d expert %d: load failed\n",i,e); continue; }
+                char en[288]; snprintf(en,sizeof en,"model.layers.%d.mlp.experts.%d.gate_proj.weight",i,e); glm_xc_qt(m,&S2,en,&s.g,tol_q8,fails);
+                snprintf(en,sizeof en,"model.layers.%d.mlp.experts.%d.up_proj.weight",i,e); glm_xc_qt(m,&S2,en,&s.u,tol_q8,fails);
+                snprintf(en,sizeof en,"model.layers.%d.mlp.experts.%d.down_proj.weight",i,e); glm_xc_qt(m,&S2,en,&s.d,tol_q8,fails);
+                compat_aligned_free(s.slab); nexp++;
+            }
+        }
+        if(i<c->n_layers && m->has_dsa && c->idx_type[i]){
+            glm_xc_qt(m,&S2,P("self_attn.indexer.wq_b.weight"),&m->ix_wq[i],tol_q8,fails); glm_xc_qt(m,&S2,P("self_attn.indexer.wk.weight"),&m->ix_wk[i],tol_q8,fails);
+            glm_xc_qt(m,&S2,P("self_attn.indexer.weights_proj.weight"),&m->ix_wp[i],tol_q8,fails);
+            glm_xc_vec(&S2,P("self_attn.indexer.k_norm.weight"),m->ix_knw[i],c->index_hd,fails); glm_xc_vec(&S2,P("self_attn.indexer.k_norm.bias"),m->ix_knb[i],c->index_hd,fails); }
+        if(i==c->n_layers){ glm_xc_qt(m,&S2,P("eh_proj.weight"),&m->eh_proj,tol_q8,fails); glm_xc_vec(&S2,P("enorm.weight"),m->enorm,D,fails); glm_xc_vec(&S2,P("hnorm.weight"),m->hnorm,D,fails); glm_xc_vec(&S2,P("shared_head.norm.weight"),m->mtp_norm,D,fails); }
+        #undef P
+    }
+    printf("cross-check: %d blocks%s, %d expert slices x3, kv_b policy %d, has_dsa %d, tolerance %s\n",c->n_layers,m->has_mtp?" + nextn":"",nexp,m->kvb_policy,m->has_dsa,tol_q8?"q8":"exact");
+    return 0;
+}
+#undef XC_CFG
+
 #ifndef COLIBRI_NO_MAIN
 int main(int argc, char **argv){
     int strict=coli_env_on("ORACLE_STRICT");
@@ -11413,6 +11834,7 @@ int main(int argc, char **argv){
     { const char *dh=getenv("COLI_DISKCLASS_WINDOW");        /* DISK-CLASS recency window, see its declaration */
       if(dh){ g_direct_heat_ticks=(uint32_t)strtoul(dh,NULL,10); g_direct_heat_explicit=1; } }
     g_uring = getenv("URING")?atoi(getenv("URING")):0;
+    if(g_uring && ts_is_gguf_path(snap)){ fprintf(stderr,"[GGUF] URING=1 ignored: the io_uring loader reads safetensors shards; GGUF slices use pread\n"); g_uring=0; }
     if(g_uring){
 #ifdef __linux__
         if(g_mmap){ fprintf(stderr,"URING=1 is incompatible with COLI_MMAP=1\n"); return 2; }
@@ -11777,7 +12199,7 @@ int main(int argc, char **argv){
 #endif
     /* DUAL-SSD: register the mirror copy BEFORE any pin/autopin load, so the
      * OMP-parallel pin warmup already streams from both drives. */
-    mirror_setup(&m);
+    if(!m.is_gguf) mirror_setup(&m);   /* sylph: mirrors are a safetensors feature (COLI_MODEL_DIRS holds GGUF parts instead) */
     /* HOT-STORE: PIN=<statsfile> [PIN_GB=g] -> top expert per frequenza fissi in RAM.
      * Va PRIMA di cap_for_ram: i pinnati contano nel residente. */
     if(getenv("PIN")){
@@ -11790,7 +12212,8 @@ int main(int argc, char **argv){
              * nessuno dei due -> nessun pin (AUTOPIN piu' sotto resta escluso: PIN e' settato).
              * EN: prefer the live usage history over the frozen one-shot profile, so each
              * reload's pin placement follows the accumulated real workload. */
-            snprintf(pauto,sizeof(pauto),"%s/.coli_usage",snap);
+            if(m.is_gguf){ char sd[2304]; ts_sidecar_dir(&m.src,sd,sizeof sd); snprintf(pauto,sizeof(pauto),"%.2000s.coli_usage",sd); }   /* FR-29: never beside the .gguf */
+            else snprintf(pauto,sizeof(pauto),"%s/.coli_usage",snap);
             FILE *pf=fopen(pauto,"rb"); long psz=0;
             if(pf){ fseek(pf,0,SEEK_END); psz=ftell(pf); fclose(pf); }
             if(psz<=0){ snprintf(pauto,sizeof(pauto),"%s/stats.txt",snap);
@@ -11823,7 +12246,10 @@ int main(int argc, char **argv){
      * conosce la TUA storia, la LRU si adatta alla sessione). AUTOPIN=0 disattiva. */
     { double ram_env = getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0;
       int est_ctx = getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default di run_serve */
-      snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap);
+      if(m.is_gguf){   /* FR-29: sidecars of a GGUF model live in <dir>/.coli-<stem>/, created on first use */
+          char sd[2304]; ts_sidecar_dir(&m.src,sd,sizeof sd); snprintf(g_usage_path,sizeof(g_usage_path),"%.2000s.coli_usage",sd);
+          if(getenv("AUTOPIN")==NULL || atoi(getenv("AUTOPIN"))) { size_t L=strlen(sd); if(L>1&&sd[L-1]=='/') sd[L-1]=0; mkdir(sd,0755); }
+      } else snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap);
 #ifdef COLI_VULKAN
       /* #653's correction, for the Vulkan tier. On an integrated GPU the tier's
        * HOST_VISIBLE|DEVICE_LOCAL allocation is the SAME physical RAM that
@@ -12028,6 +12454,7 @@ int main(int argc, char **argv){
         if(g_cuda_enabled) cuda_stats_print();
 #endif
         free(pred); oracle_ref_free(&ref);
+        glm_print_reads(&m,nfull);
         return strict && (!finite || nfull-ok>tf_allowed);
     }
     int *out=malloc((size_t)nfull*sizeof(int));
@@ -12040,6 +12467,8 @@ int main(int argc, char **argv){
     printf("\nGLM C engine      : "); for(int i=np;i<np+emitted;i++){ printf("%d ", out[i]); if(out[i]==full[i])match++; }
     printf("\nMatching tokens: %d/%d\n", match, n_new);
     if(emitted!=n_new) fprintf(stderr,"[ORACLE] incomplete generation: %d/%d tokens\n",emitted,n_new);
+    if(m.has_mtp) fprintf(stderr,"[MTP] proposed %llu accepted %llu (%.0f %%)\n",(unsigned long long)m.mtp_prop,(unsigned long long)m.mtp_acc,m.mtp_prop?100.0*m.mtp_acc/m.mtp_prop:0.0);
+    glm_print_reads(&m,emitted);
     double tot=m.hits+m.miss;
     printf("N-gram speculation (DRAFT=%d): %.2f tokens/forward (%llu forwards per %llu tokens)\n",
         g_draft, m.n_fw?(double)m.n_emit/m.n_fw:1.0, (unsigned long long)m.n_fw, (unsigned long long)m.n_emit);

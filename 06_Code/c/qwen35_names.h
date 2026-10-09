@@ -67,6 +67,22 @@ static const QnEntry qn_global[] = {
     { "model.norm.weight",         "output_norm.weight", QN_X_NORM_PLUS1 },
     { "lm_head.weight",            "output.weight",      QN_X_NONE },
 };
+/* NextN (MTP) head (phase 6, 07_Tests/IntegrationTest/qwen36_mtp.md): transformers saves it
+ * as "mtp.<kind>" and one block "mtp.layers.0.<kind>"; llama.cpp stores the head under
+ * "blk.<L>.nextn.<name>" and the block as an ordinary "blk.<L>.*" with L = the trunk block
+ * count (nextn_predict_layers = 1). L is not in the HF name, so the engine sets
+ * qn_nextn_layer from its Cfg (-1 = no NextN block known: the names stay unmapped).
+ * The norms follow the architecture's 1+w convention; whether the converter that wrote a
+ * real file (bartowski's Qwen3.6) applied it to enorm/hnorm is to be verified on that file
+ * before the head is ever used (a 1+w norm reads ~1, a plain one ~0). */
+static int qn_nextn_layer = -1;
+static const QnEntry qn_mtp[] = {
+    { "mtp.fc.weight",                    "nextn.eh_proj.weight",          QN_X_NONE },
+    { "mtp.pre_fc_norm_embedding.weight", "nextn.enorm.weight",            QN_X_NORM_PLUS1 },
+    { "mtp.pre_fc_norm_hidden.weight",    "nextn.hnorm.weight",            QN_X_NORM_PLUS1 },
+    { "mtp.norm.weight",                  "nextn.shared_head_norm.weight", QN_X_NORM_PLUS1 },
+};
+#define QN_N_MTP    ((int)(sizeof qn_mtp    / sizeof qn_mtp[0]))
 #define QN_N_LAYER  ((int)(sizeof qn_layer  / sizeof qn_layer[0]))
 #define QN_N_EXPERT ((int)(sizeof qn_expert / sizeof qn_expert[0]))
 #define QN_N_GLOBAL ((int)(sizeof qn_global / sizeof qn_global[0]))
@@ -90,6 +106,13 @@ static inline int qn_to_gguf(const char *hf, char *out, size_t cap, int *layer, 
     for (int k = 0; k < QN_N_GLOBAL; k++)
         if (!strcmp(hf, qn_global[k].hf)) { snprintf(out, cap, "%s", qn_global[k].gguf); return qn_global[k].xform; }
     const char *rest; int i = qn_split_layer(hf, &rest);
+    if (i < 0 && !strncmp(hf, "mtp.", 4)) {           /* the NextN head and its block */
+        if (qn_nextn_layer < 0) return -1;
+        for (int k = 0; k < QN_N_MTP; k++)
+            if (!strcmp(hf, qn_mtp[k].hf)) { *layer = qn_nextn_layer; snprintf(out, cap, "blk.%d.%s", qn_nextn_layer, qn_mtp[k].gguf); return qn_mtp[k].xform; }
+        if (strncmp(hf, "mtp.layers.0.", 13)) return -1;
+        i = qn_nextn_layer; rest = hf + 13;
+    }
     if (i < 0) return -1;
     *layer = i;
     for (int k = 0; k < QN_N_LAYER; k++)
@@ -114,10 +137,17 @@ static inline int qn_to_hf(const char *gguf, char *out, size_t cap) {
     char *end; long i = strtol(gguf + 4, &end, 10);
     if (end == gguf + 4 || *end != '.') return -1;
     const char *rest = end + 1;
+    if (!strncmp(rest, "nextn.", 6)) {
+        for (int k = 0; k < QN_N_MTP; k++)
+            if (!strcmp(rest, qn_mtp[k].gguf)) { snprintf(out, cap, "%s", qn_mtp[k].hf); return 0; }
+        return -1;
+    }
+    const char *pfx = (qn_nextn_layer >= 0 && i == qn_nextn_layer) ? "mtp.layers.0." : NULL;
+    char lp[32]; if (!pfx) { snprintf(lp, sizeof lp, "model.layers.%ld.", i); pfx = lp; }
     for (int k = 0; k < QN_N_LAYER; k++)
-        if (!strcmp(rest, qn_layer[k].gguf)) { snprintf(out, cap, "model.layers.%ld.%s", i, qn_layer[k].hf); return 0; }
+        if (!strcmp(rest, qn_layer[k].gguf)) { snprintf(out, cap, "%s%s", pfx, qn_layer[k].hf); return 0; }
     for (int k = 0; k < QN_N_EXPERT; k++)
-        if (!strcmp(rest, qn_expert[k].gguf)) { snprintf(out, cap, "model.layers.%ld.mlp.experts.*.%s", i, qn_expert[k].hf); return 0; }
+        if (!strcmp(rest, qn_expert[k].gguf)) { snprintf(out, cap, "%smlp.experts.*.%s", pfx, qn_expert[k].hf); return 0; }
     return -1;
 }
 

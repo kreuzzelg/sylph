@@ -156,8 +156,9 @@ class TensorKindsTest(unittest.TestCase):
         prefix, placed = self._classify_all(_concrete(QWEN38_2P4T))
         self.assertEqual(prefix, "model.")
         kinds = {p[0] for p in placed}
-        self.assertEqual(kinds, {"global", "layer", "skip"})
-        self.assertEqual({p[1] for p in placed if p[0] == "skip"}, {"mtp"})
+        self.assertEqual(kinds, {"global", "layer", "mtp"})
+        self.assertEqual({p[1] for p in placed if p[0] == "mtp" and not p[1].startswith("layers.")},
+                         {"fc.weight", "norm.weight", "pre_fc_norm_embedding.weight", "pre_fc_norm_hidden.weight"})
         self.assertEqual({p[1] for p in placed if p[0] == "global"}, set(GLOBAL_KINDS))
         self.assertEqual({p[2] for p in placed if p[0] == "layer"},
                          set(LAYER_KINDS) - set())
@@ -165,7 +166,7 @@ class TensorKindsTest(unittest.TestCase):
     def test_every_35b_tensor_is_placed(self):
         prefix, placed = self._classify_all(_concrete(QWEN36_35B))
         self.assertEqual(prefix, "model.language_model.")
-        self.assertEqual({p[1] for p in placed if p[0] == "skip"}, {"mtp", "visual"})
+        self.assertEqual({p[1] for p in placed if p[0] == "skip"}, {"visual"})
         self.assertEqual(sum(p[0] == "layer" for p in placed),
                          sum(p[0] == "layer" for p in self._classify_all(
                              _concrete(QWEN38_2P4T))[1]))
@@ -200,7 +201,7 @@ class TensorKindsTest(unittest.TestCase):
                     classify(name, "model.")
 
     def test_skip_groups_have_a_stated_reason(self):
-        for group in ("mtp", "visual"):
+        for group in ("visual",):
             self.assertTrue(skip_reason(group))
         self.assertEqual(skip_reason("nope"), "")
 

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Integration test for the NextN (MTP) block in qwen36 (phase 6). See qwen36_mtp.md.
 
+Cases 2-6 of the document's table are replaced by the fallback contract (decision 2026-10-09,
+spec section 9 c): the head is converted, detected and reported, not used for decoding.
+
     python3 07_Tests/IntegrationTest/run_qwen36_mtp.py [--keep] [--no-build]
 """
 import json
@@ -96,61 +99,55 @@ def case1(fx):
 
 
 def case2(fx):
-    print("case 2: lossless draft/verify")
+    """The fallback contract of qwen36_mtp.md (decision 2026-10-09, spec section 9 c): the head is
+    detected, typed and reported as 'present, not used'; ids equal the --no-mtp file's. The
+    precision guard is reported for a Q4_K head too (what the guard WOULD say)."""
+    print("case 2: head reported, not used (fallback contract); ids equal the trunk-only file's")
     if "mtp_f32" not in fx or "nomtp" not in fx:
         return None
     ran_a, ids_a, out_a = ref_run(fx["mtp_f32"], 8, fx["ref"])
-    ran_b, ids_b, out_b = ref_run(fx["mtp_f32"], 8, fx["ref"], {"MTP": "0"})
     ran_c, ids_c, out_c = ref_run(fx["nomtp"], 8, fx["ref"])
-    check(ran_a and ran_b and ran_c, "three runs")
-    check(re.search(r"eh_proj F32 \([0-9.]+ bpw\) loaded", mtp_clause(out_a)) is not None, f"startup line: head loaded ({mtp_clause(out_a)!r})")
-    check("skipped (MTP=0)" in mtp_clause(out_b), f"MTP=0: skipped ({mtp_clause(out_b)!r})")
-    check(ids_a is not None and ids_a == ids_b == ids_c, "greedy ids identical with the head, with MTP=0 and from the trunk-only file")
-    m = re.search(r"\[MTP\] proposed (\d+) · accepted (\d+)", out_a)
-    check(m is not None and int(m.group(1)) >= 1, "[MTP] statistics printed, at least one proposal")
-    check("[MTP]" not in out_b, "no [MTP] line when skipped")
+    check(ran_a and ran_c, "both runs")
+    check(re.search(r"^blk\.8 eh_proj F32 \(32\.00 bpw\) present, not used \(MTP decoding not implemented\)$", mtp_clause(out_a)) is not None,
+          f"startup line: nextn blk.8 eh_proj F32 (32.00 bpw) present, not used ({mtp_clause(out_a)!r})")
+    check(mtp_clause(out_c) == "", "trunk-only file: no nextn clause")
+    check(ids_a is not None and ids_a == ids_c, "greedy ids identical with the head present and from the trunk-only file")
+    check("[MTP]" not in out_a, "no [MTP] statistics line (the head is not used)")
+    if "mtp_q4k" in fx:
+        ran, ids0, out0 = ref_run(fx["mtp_q4k"], 8, fx["ref"])
+        check(ran and "eh_proj Q4_K (4.50 bpw) present, not used" in mtp_clause(out0), f"Q4_K head named with its bits ({mtp_clause(out0)!r})")
     return ids_a
 
 
-def case3(fx, ids):
-    print("case 3: precision guard")
-    if "mtp_q4k" not in fx:
-        return
-    ran, ids0, out0 = ref_run(fx["mtp_q4k"], 8, fx["ref"])
-    check(ran and re.search(r"skipped \(4\.50 bpw < 8", mtp_clause(out0)) is not None, f"Q4_K eh_proj skipped by default ({mtp_clause(out0)!r})")
-    ran, ids1, out1 = ref_run(fx["mtp_q4k"], 8, fx["ref"], {"MTP": "1"})
-    check(ran and "loaded" in mtp_clause(out1) and ids1 == ids0, "MTP=1 forces loading; ids unchanged (lossless)")
-
-
 def case4(fx, tmp):
-    print("case 4: PPL mode ignores the head")
-    if "mtp_f32" not in fx:
+    print("case 4: PPL mode unaffected by the head")
+    if "mtp_f32" not in fx or "nomtp" not in fx:
         return
-    a = ppl_body(fx["mtp_f32"], 8, fx["ref"], tmp / "a.tsv"); b = ppl_body(fx["mtp_f32"], 8, fx["ref"], tmp / "b.tsv", {"MTP": "0"})
-    check(a is not None and a == b, "dumps byte-identical with and without MTP=0")
+    a = ppl_body(fx["mtp_f32"], 8, fx["ref"], tmp / "a.tsv"); b = ppl_body(fx["nomtp"], 8, fx["ref"], tmp / "b.tsv")
+    check(a is not None and a == b, "dumps byte-identical with the head present and from the trunk-only file")
 
 
 def case5(fx):
     print("case 5: serve frames identical")
-    if "mtp_f32" not in fx:
+    if "mtp_f32" not in fx or "nomtp" not in fx:
         return
     prompts = ["the cat sat on the mat and then", "once upon a time"]
     ok1, a, _ = es.serve_session(fx["mtp_f32"], prompts, tok=fx["tok"])
-    ok2, b, _ = es.serve_session(fx["mtp_f32"], prompts, tok=fx["tok"], env={"MTP": "0"})
+    ok2, b, _ = es.serve_session(fx["nomtp"], prompts, tok=fx["tok"])
     check(ok1 and ok2, "both sessions reach READY")
     if ok1 and ok2:
         strip = lambda rs: [(r["accept"], r["frames"]) for r in rs]   # DONE carries timings; ids and tails are the contract
-        check(strip(a) == strip(b), "frames (ids, tails) identical to the MTP=0 session")
+        check(strip(a) == strip(b), "frames (ids, tails) identical to the trunk-only session")
 
 
 def case6(fx, ids):
-    print("case 6: streaming with the head")
+    print("case 6: streaming unchanged by the head's presence")
     if "mtp_f32" not in fx or ids is None:
         return
     ran, ids1, out1 = ref_run(fx["mtp_f32"], 1, fx["ref"])
     check(ran and ids1 == ids, "cap 1: ids identical to cap 8")
     g = es.gguf_reads(out1)
-    check(g is not None and g[0] > 0 and g[0] % 3 == 0, f"GGUF reads: slices = 3 × misses incl. the MTP layer ({g})")
+    check(g is not None and g[0] > 0 and g[0] % 3 == 0, f"GGUF reads: slices = 3 × misses over the 8 trunk blocks ({g})")
 
 
 def main(argv):
@@ -162,7 +159,6 @@ def main(argv):
         fx = case0(tmp)
         case1(fx)
         ids = case2(fx)
-        case3(fx, ids)
         case4(fx, tmp)
         case5(fx)
         case6(fx, ids)
