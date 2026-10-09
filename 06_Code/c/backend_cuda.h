@@ -71,6 +71,35 @@ static inline int coli_cuda_weight_at_supported(int fmt) {
     return fmt == 0 || fmt == 1 || fmt == 2 || fmt == 3 || fmt == 4 || fmt == 8;
 }
 
+/* sylph (GGUF): raw ggml block tensors on the device. A tensor whose rows are
+ * the blocks the file stores -- Q8_0 (32 weights, 34 bytes), Q4_K (256, 144),
+ * Q5_K (256, 176), Q6_K (256, 210) -- travels under fmt = COLI_FMT_GGML_BASE +
+ * ggml type id and has its own kernel branch (blk_* in backend_cuda.cu), the
+ * way fmt 6 and 7 do; it never routes through weight_at, whose predicate above
+ * is untouched, so the absorb gates keep refusing it. An upload carries no
+ * scale array (the scales live inside the blocks) and is refused when I is not
+ * a whole number of blocks. The kernels reproduce gq.h's scalar reference
+ * (gq_dot_row_ref) bit for bit: 8 lanes = element & 7, fmaf, the fixed 8->1
+ * tree, the block scale applied where the reference applies it. Contract and
+ * truth table: 07_Tests/IntegrationTest/cuda_tier_kquant.md,
+ * tests/test_cuda_block_fmt_guard.c. */
+#define COLI_FMT_GGML_BASE 16
+static inline int coli_cuda_block_fmt_type(int fmt) {
+    int t = fmt - COLI_FMT_GGML_BASE;
+    return (t == 8 || t == 12 || t == 13 || t == 14) ? t : -1;
+}
+static inline int coli_cuda_block_fmt_supported(int fmt) { return coli_cuda_block_fmt_type(fmt) >= 0; }
+/* weights per block: 32 for Q8_0, 256 for the K-quants; 0 for anything else */
+static inline int coli_cuda_block_fmt_elems(int fmt) {
+    int t = coli_cuda_block_fmt_type(fmt);
+    return t < 0 ? 0 : (t == 8 ? 32 : 256);
+}
+/* bytes per block: 34 / 144 / 176 / 210; 0 for anything else */
+static inline int coli_cuda_block_fmt_bytes(int fmt) {
+    int t = coli_cuda_block_fmt_type(fmt);
+    return t == 8 ? 34 : t == 12 ? 144 : t == 13 ? 176 : t == 14 ? 210 : 0;
+}
+
 /* The two decisions the fmt=8 LUT gate rests on, as pure predicates. They live
  * here rather than inline in backend_cuda.cu so a host-side test can pin them
  * with no CUDA toolchain and no GPU (tests/test_cuda_lut_gate.c). backend_cuda.cu

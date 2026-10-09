@@ -41,8 +41,9 @@ from make_gguf_fixture import GgufWriter, U32, I32, F32 as KV_F32, BOOL, STR, AR
 import qwen36_tensor_kinds as kinds  # noqa: E402
 
 T_F32, T_F16, T_Q8_0, T_BF16 = 0, 1, 8, 30
-TYPE_IDS = {"f32": T_F32, "f16": T_F16, "q8_0": T_Q8_0, "bf16": T_BF16}
-FILE_TYPE = {"f32": 0, "f16": 1, "q8_0": 7, "bf16": 32}        # general.file_type (llama_ftype)
+T_Q4_K, T_Q5_K, T_Q6_K = 12, 13, 14
+TYPE_IDS = {"f32": T_F32, "f16": T_F16, "q8_0": T_Q8_0, "bf16": T_BF16, "q4_k": T_Q4_K, "q5_k": T_Q5_K, "q6_k": T_Q6_K}
+FILE_TYPE = {"f32": 0, "f16": 1, "q8_0": 7, "bf16": 32, "q4_k": 15, "q5_k": 17, "q6_k": 18}   # general.file_type (llama_ftype: *_M)
 TOK_NORMAL, TOK_CONTROL, TOK_USER_DEFINED, TOK_UNUSED = 1, 3, 4, 5
 
 
@@ -202,7 +203,94 @@ def pack_q8_0(vals):
     return bytes(out)
 
 
-PACK = {"f32": pack_f32, "f16": pack_f16, "bf16": pack_bf16, "q8_0": pack_q8_0}
+# ---- K-quants (fixtures only; cuda_tier_kquant.md) ---------------------------------------------
+# Valid blocks in ggml's exact layouts, encoded with a direct per-sub-block min/max
+# rule rather than ggml's iterative search (make_qkx2_quants / make_qx_quants): the
+# tests that use these files compare two decoders of the SAME bytes, so the encoder
+# only has to be valid and reasonable, not ggml-equal. E0 pins the decoder.
+def _f16(v):
+    return struct.pack("<e", max(-65504.0, min(65504.0, v)))
+
+
+def _rnd(x):
+    return int(math.floor(x + 0.5)) if x >= 0 else -int(math.floor(-x + 0.5))
+
+
+def _pack_q45_k(vals, five):
+    n = len(vals)
+    if n % 256:
+        raise ValueError(f"{'Q5_K' if five else 'Q4_K'} needs a multiple of 256 elements per row, got {n}")
+    qmax = 31 if five else 15
+    out = bytearray()
+    for b0 in range(0, n, 256):
+        blk = vals[b0:b0 + 256]
+        scales, mins = [], []
+        for j in range(8):
+            sb = blk[32 * j:32 * j + 32]
+            lo, hi = min(sb), max(sb)
+            if lo > 0: lo = 0.0                      # the min term only subtracts (value = d*sc*q - dmin*m)
+            scales.append((hi - lo) / qmax if hi > lo else 0.0); mins.append(-lo)
+        d = max(scales) / 63.0; dmin = max(mins) / 63.0
+        d16 = struct.unpack("<e", _f16(d))[0]; dmin16 = struct.unpack("<e", _f16(dmin))[0]
+        sc = [min(63, _rnd(s / d16)) if d16 else 0 for s in scales]
+        mn = [min(63, _rnd(m / dmin16)) if dmin16 else 0 for m in mins]
+        # 12 scale bytes, the layout get_scale_min_k4 reads
+        q12 = bytearray(12)
+        for j in range(4):
+            q12[j] = (sc[j] & 63) | ((sc[j + 4] >> 4) << 6)
+            q12[j + 4] = (mn[j] & 63) | ((mn[j + 4] >> 4) << 6)
+            q12[j + 8] = (sc[j + 4] & 0xF) | ((mn[j + 4] & 0xF) << 4)
+        qs = bytearray(128); qh = bytearray(32)
+        for j in range(4):
+            for half in range(2):
+                k = 2 * j + half
+                eff_d = d16 * sc[k]; eff_m = dmin16 * mn[k]
+                for l in range(32):
+                    x = blk[32 * k + l]
+                    q = _rnd((x + eff_m) / eff_d) if eff_d else 0
+                    q = max(0, min(qmax, q))
+                    if half: qs[32 * j + l] |= (q & 0xF) << 4
+                    else: qs[32 * j + l] |= q & 0xF
+                    if five and (q & 16): qh[l] |= 1 << k
+        out += _f16(d16) + _f16(dmin16) + q12 + (qh if five else b"") + qs
+    return bytes(out)
+
+
+def pack_q4_k(vals): return _pack_q45_k(vals, False)
+def pack_q5_k(vals): return _pack_q45_k(vals, True)
+
+
+def pack_q6_k(vals):
+    n = len(vals)
+    if n % 256:
+        raise ValueError(f"Q6_K needs a multiple of 256 elements per row, got {n}")
+    out = bytearray()
+    for b0 in range(0, n, 256):
+        blk = vals[b0:b0 + 256]
+        amax = [max(abs(v) for v in blk[16 * k:16 * k + 16]) for k in range(16)]
+        scales = [a / 31.0 for a in amax]
+        d = max(scales) / 127.0
+        d16 = struct.unpack("<e", _f16(d))[0]
+        sc = [max(-128, min(127, _rnd(s / d16))) if d16 else 0 for s in scales]
+        ql = bytearray(128); qh = bytearray(64)
+        for h in range(2):
+            for r in range(128):
+                k = 8 * h + (r >> 4)
+                eff = d16 * sc[k]
+                x = blk[128 * h + r]
+                q = max(-32, min(31, _rnd(x / eff))) if eff else 0
+                v = q + 32
+                part, l = r >> 5, r & 31
+                lo, hi = v & 0xF, v >> 4
+                if part == 0: ql[64 * h + l] |= lo; qh[32 * h + l] |= hi << 0
+                elif part == 1: ql[64 * h + l + 32] |= lo; qh[32 * h + l] |= hi << 2
+                elif part == 2: ql[64 * h + l] |= lo << 4; qh[32 * h + l] |= hi << 4
+                else: ql[64 * h + l + 32] |= lo << 4; qh[32 * h + l] |= hi << 6
+        out += ql + qh + bytes((s & 0xFF) for s in sc) + _f16(d16)
+    return bytes(out)
+
+
+PACK = {"f32": pack_f32, "f16": pack_f16, "bf16": pack_bf16, "q8_0": pack_q8_0, "q4_k": pack_q4_k, "q5_k": pack_q5_k, "q6_k": pack_q6_k}
 
 
 # ---- tokenizer -----------------------------------------------------------------------------------
@@ -234,13 +322,15 @@ def placeholder_tokens(g):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("hf_dir"); ap.add_argument("--out", required=True)
-    ap.add_argument("--type", default="f32", choices=sorted(TYPE_IDS)); ap.add_argument("--expert-type", default=None, choices=sorted(TYPE_IDS))
+    ap.add_argument("--type", default="f32", choices=["bf16", "f16", "f32", "q8_0"]); ap.add_argument("--expert-type", default=None, choices=sorted(TYPE_IDS))
+    ap.add_argument("--down-type", default=None, choices=sorted(TYPE_IDS), help="type of ffn_down_exps (default: --expert-type); the Q4_K_M files alternate Q5_K/Q6_K there")
     ap.add_argument("--tokenizer", default=None); ap.add_argument("--name", default=None); ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--split", type=int, default=0, help="write N parts <stem>-0000k-of-0000N.gguf as llama.cpp's gguf-split does (expert_streaming.md)")
     a = ap.parse_args(argv)
     g = load_config(a.hf_dir)
     snap = Snapshot(a.hf_dir)
     dense_t, exp_t = a.type, a.expert_type or a.type
+    down_t = a.down_type or exp_t
     prefix = kinds.resolve_prefix(snap.tensors.keys())
 
     # classify every name first (the converter's contract): layer -> {kind: name}
@@ -329,7 +419,7 @@ def main(argv=None):
                 base = e * 2 * inter * H
                 gate += gu[base: base + inter * H]; up += gu[base + inter * H: base + 2 * inter * H]
             emit(b + "ffn_gate_exps.weight", gate, None, exp_t, ne=[H, inter, E]); emit(b + "ffn_up_exps.weight", up, None, exp_t, ne=[H, inter, E])
-            emit(b + "ffn_down_exps.weight", dn, None, exp_t, ne=[inter, H, E])
+            emit(b + "ffn_down_exps.weight", dn, None, down_t, ne=[inter, H, E])
         else:
             gate = []; up = []; down = []; inter = None
             for e in range(E):
@@ -337,14 +427,14 @@ def main(argv=None):
                 _, v = rd(f"mlp.experts.{e}.up_proj.weight"); up += v
                 _, v = rd(f"mlp.experts.{e}.down_proj.weight"); down += v
             emit(b + "ffn_gate_exps.weight", gate, None, exp_t, ne=[H, inter, E]); emit(b + "ffn_up_exps.weight", up, None, exp_t, ne=[H, inter, E])
-            emit(b + "ffn_down_exps.weight", down, None, exp_t, ne=[inter, H, E])
+            emit(b + "ffn_down_exps.weight", down, None, down_t, ne=[inter, H, E])
 
     total = sum(n for _, n in stats.values())
     for t, (cnt, nbytes) in sorted(stats.items()):
         print(f"  {t:5s} {cnt:5d} tensors {nbytes / 1e6:10.2f} MB")
     if skipped: print("  skipped: " + ", ".join(f"{k} ×{v}" for k, v in skipped.items()))
     print(f"{a.out}: qwen35moe, {g['n_layers']} blocks ({g['layer_types'].count('full_attention')} attention), {g['n_experts']} experts, "
-          f"{sum(c for c, _ in stats.values())} tensors, {total / 1e6:.2f} MB, dense {dense_t}, experts {exp_t}, tokenizer {'from ' + a.tokenizer if a.tokenizer else 'placeholder'}")
+          f"{sum(c for c, _ in stats.values())} tensors, {total / 1e6:.2f} MB, dense {dense_t}, experts {exp_t}{'' if down_t == exp_t else ' (down ' + down_t + ')'}, tokenizer {'from ' + a.tokenizer if a.tokenizer else 'placeholder'}")
     if a.dry_run: return 0
     if a.split and a.split > 1:
         # gguf-split layout: part 1 carries the model metadata, parts > 1 only the split.*

@@ -77,6 +77,11 @@ def _tensor_sizes(path):
         yield name, end - start, dtype
 
 
+GGUF_TRUNK_RE = re.compile(
+    r"^(output\.weight|blk\.\d+\.(attn_qkv|attn_gate|ssm_out|attn_q|attn_k|attn_v|attn_output|"
+    r"ffn_gate_shexp|ffn_up_shexp|ffn_down_shexp)\.weight)$")
+
+
 def _analyze_gguf(resolved, model):
     """sylph: the same analysis for a GGUF source. Routed experts are the slices
     of blk.N.ffn_{gate,up,down}_exps; everything else is dense. Dense bytes are
@@ -85,7 +90,7 @@ def _analyze_gguf(resolved, model):
     import ggufinfo
     parts = ggufinfo.open_set(str(model))
     summary = ggufinfo.summarize(parts)
-    expert_groups, dense_bytes = {}, 0
+    expert_groups, dense_bytes, trunk_bytes = {}, 0, 0
     for t in ggufinfo.all_tensors(parts):
         if not t.nbytes:
             continue
@@ -96,6 +101,12 @@ def _analyze_gguf(resolved, model):
                 expert_groups[(layer, e)] = expert_groups.get((layer, e), 0) + t.nbytes // n_exp
         else:
             dense_bytes += t.nbytes
+            # What the engine's placer can put in VRAM as stored (sylph phase 5): the
+            # components qwen36.c offers -- output, DeltaNet in_proj qkv ++ z (dnproj),
+            # out_proj (dnout), attention q/k/v/o (attnproj), shared expert (shexp).
+            # Norms, embeddings, conv and the small DeltaNet vectors stay on the CPU.
+            if GGUF_TRUNK_RE.match(t.name):
+                trunk_bytes += t.nbytes
     layer_sizes = {}
     for (layer, _), size in expert_groups.items():
         layer_sizes.setdefault(layer, []).append(size)
@@ -108,6 +119,7 @@ def _analyze_gguf(resolved, model):
         "dense_disk_bytes": dense_bytes,
         "expert_fixed_bytes": 0,
         "trunk_int8_bytes": 0,
+        "trunk_gguf_bytes": trunk_bytes,
         "expert_bytes": sum(expert_groups.values()),
         "expert_count": len(expert_groups),
         "expert_layers": len(per_layer),
@@ -1102,6 +1114,11 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     # trunk first -- it is read every token -- on the first planned device,
     # if it fits that device's allowance; the experts get what is left.
     trunk_bytes = int(info.get("trunk_int8_bytes", 0) or 0)
+    trunk_label = "int8 trunk"
+    if not trunk_bytes and info.get("trunk_gguf_bytes"):
+        # GGUF: the matrices go up as the author quantized them (raw blocks), so
+        # the figure is their stored size, not an int8 re-quantization.
+        trunk_bytes = int(info["trunk_gguf_bytes"]); trunk_label = "trunk"
     trunk_placed = 0
     if trunk_bytes and gpu_plan and gpu_plan[0]["usable_bytes"] >= trunk_bytes \
             and requested_vram >= trunk_bytes:
@@ -1234,7 +1251,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                     "warm_expert_bytes": warm_bytes, "cache_slots_per_layer": cap},
             "vram": {"role": "hot-experts", "devices": gpu_plan,
                      "budget_bytes": vram_budget, "hot_expert_bytes": hot_bytes,
-                     "trunk_bytes": trunk_placed,
+                     "trunk_bytes": trunk_placed, "trunk_label": trunk_label,
                      "expert_capacity": vram_experts, "requires_host_backing": False},
         },
         "expected_bottleneck": bottleneck,
@@ -1361,7 +1378,7 @@ def format_plan(plan):
                 + ("" if plans_placement(gpu) else " (identity only)")
                 for gpu in vram["devices"])
             trunk = vram.get("trunk_bytes", 0)
-            lines.append("VRAM   " + (f"{format_bytes(trunk)} int8 trunk + " if trunk else "") +
+            lines.append("VRAM   " + (f"{format_bytes(trunk)} {vram.get('trunk_label', 'int8 trunk')} + " if trunk else "") +
                          f"{format_bytes(vram['budget_bytes'])} hot tier · "
                          f"~{vram['expert_capacity']} experts · {names}")
     else:

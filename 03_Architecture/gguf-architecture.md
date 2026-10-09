@@ -447,6 +447,26 @@ cannot hold 256-element blocks; `make_tiny_qwen36_hf.py --hidden 256 --inter 256
 activation twin (FR-14) is opt-in on the GGUF path (`QWEN_EXPERT_ACT=i8`, default f32); the
 container keeps upstream's default.
 
+**Amendment 2026-10-09 (phase 5 as implemented).** As designed above, with these names
+and findings: `blk_lane`/`blk_row`/`blk_matmul`/`grouped_hidden_blk_dual`/`grouped_down_blk`
+in `backend_cuda.cu` (one row = eight threads, one per reference lane, the eight partials
+folded by lane 0 with `gq_hsum8_scalar`'s tree; a 256-thread block covers 32 rows; the
+reduction order depends on the type and `I` only); the f16 decode is the integer path of
+`gq_f16_to_f32`, so no fp16 intrinsic is involved. The tier's slot keeps `kt[3]/kb[3]`
+and points `g4/u4/d4` into the slab, so `enqueue_locked`, the LFRU and `qt_fill_next`
+work unchanged; the upload queue entry carries the slice description. The `[GGUF]` line
+moved to after the tier decision (`Model.gguf_line`, `g_defer_gguf_line`), which is
+where "experts on CUDA tier (<n> planned)" is known. CPU misses on a GGUF run through
+`gq_expert_cpu` (`gq_matmul` rows + `gq_swiglu`), the same kernels and activation sums as
+`gq_moe_run`, so a miss and a resident expert agree to the bit; the mixed-residency sum
+order (misses before hits) is the one documented gate-level difference. The int8-
+activation twin lives in `gq_i8.h`: per-32 int8 activation blocks with one f32 scale
+(finer than ggml's Q8_K per-256), integer dots on AVX2 (`maddubs`/`madd`), the scalar
+twin as the reference of the SIMD twin (1e-5 relative, not bit-for-bit: a deviation,
+not a reference). The `Q8_0` dense matrices exist as the lossless split only with the
+dense-int8 path on; with `COLI_DENSE_I8=0` they are f32 and nothing is offered to the
+placer (the phase-4 harness default) — the system test runs the CUDA arm with the default.
+
 ## 12. Phased plan (details and status in `../04_Tasks/tasks.md`)
 
 | Phase | Deliverables | Exit |

@@ -66,3 +66,4 @@ worst-position print and the `[place]` lines say which component).
 | Date | Result |
 |---|---|
 | 2026-10-09 | written; needs phase 5 (block formats, `qt_init_gguf`, GGUF dense placement, planner field, the harness's E3 deviation arm) and the owner's card. The owner's open points (spec §9): the Ollama tag/blob. |
+| 2026-10-09 | phase 5 implemented: everything this test exercises exists (`make -C 06_Code/c qwen36 CUDA=1`, `make cuda-test-gq`, `coli plan --gpu 0`, `--deviation COLI_CUDA=1` incl. the E3 arm, `QWEN_EXPERT_ACT=i8`); verified on the fake backend only — G0–G6 are the owner's runs. |

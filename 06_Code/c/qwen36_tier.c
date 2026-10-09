@@ -27,6 +27,9 @@ typedef struct {
     /* raw RAM pointers (slots are never evicted when cap==n_experts) -- lets
      * warmstart, lookahead and LFRU swaps run without an engine callback */
     const uint8_t *g4,*u4,*d4; const float *gs,*us,*ds;
+    /* sylph GGUF flavour (G.kq_mode): g4/u4/d4 point INTO the slot's slab, the
+     * three slices are kt[i] (ggml type) x kb[i] bytes; gs/us/ds are NULL */
+    int kt[3]; size_t kb[3];
 } QSlot;
 
 static struct {
@@ -39,6 +42,9 @@ static struct {
      * promuoveva mai niente, senza dire una parola (#1331). backend_cuda sa
      * gia' leggere fmt=1: mancava solo che glielo offrissimo. */
     int wfmt;
+    /* sylph: 1 when the experts are raw ggml blocks (wfmt = COLI_FMT_GGML_BASE,
+     * the type travels per upload); kq_slot[3] the largest slice sizes. */
+    int kq_mode; size_t kq_slot[3];
     int dev[QT_MAX_DEV];
     size_t budget[QT_MAX_DEV], used[QT_MAX_DEV];
     size_t exp_bytes;                     /* estimated VRAM bytes per expert */
@@ -47,7 +53,7 @@ static struct {
     pthread_t th;
     int th_stop, waiters;
     /* upload ring with staging copies */
-    struct { int layer, eid; uint8_t *w; float *s; int v_layer, v_eid; } q[QT_QCAP];
+    struct { int layer, eid; uint8_t *w; float *s; int v_layer, v_eid; int kt[3]; size_t kb[3]; } q[QT_QCAP];
     int qh, qt_, qn;
     int inflight;   /* enqueued and not yet resident. qn frees the ring slot at
                      * dequeue, BEFORE the backend copies anything, so "queue
@@ -78,12 +84,22 @@ static void wait_take_locked(void){
 static QSlot *qs(int layer, int eid){ return &G.slot[(size_t)layer*G.ne + eid]; }
 static int home(int eid){ return eid % G.ndev; }
 
+static size_t G_stage_down_bytes;   /* kq_mode: bytes of the down slice being staged (G.mx held) */
 /* Staging: packed int4 (g|u|d) two's-complement -> offset-binary (XOR 0x88,
  * the upload format of backend_cuda fmt=2) + copy the scales (gs|us|ds). */
 static void stage(uint8_t *dw, float *dsc,
                   const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
                   const float *gs,const float *us,const float *ds){
     size_t mb = (size_t)G.D*G.Ih/(G.wfmt==4?2:1);
+    if(G.kq_mode){
+        /* raw ggml blocks: the three slices are contiguous in the slot's slab
+         * (g4 is its start); the caller sized dw for them. No scales. */
+        (void)dsc; (void)gs; (void)us; (void)ds;
+        memcpy(dw, g4, (size_t)(u4-g4) + (size_t)(d4-u4) + 0);   /* gate + up */
+        size_t off = (size_t)(d4-g4);
+        memcpy(dw+off, d4, G_stage_down_bytes);
+        return;
+    }
     if(G.wfmt==1 || G.wfmt==8){
         /* int8: il formato del backend e' gia' quello in RAM, si copia e basta.
          * Niente XOR: quello serve a portare i nibble int4 da complemento a due
@@ -159,6 +175,8 @@ static void *uploader(void *arg){
         int layer=G.q[G.qh].layer, eid=G.q[G.qh].eid;
         int vl=G.q[G.qh].v_layer, ve=G.q[G.qh].v_eid;
         uint8_t *w=G.q[G.qh].w; float *sc=G.q[G.qh].s;
+        int qkt[3]; size_t qkb[3];             /* sylph: slice description, copied before the ring slot is reused */
+        memcpy(qkt,G.q[G.qh].kt,sizeof qkt); memcpy(qkb,G.q[G.qh].kb,sizeof qkb);
         G.qh=(G.qh+1)%QT_QCAP; G.qn--;
         pthread_cond_broadcast(&G.cv_take);          /* queue space available */
         if(ve>=0){
@@ -189,7 +207,14 @@ static void *uploader(void *arg){
         size_t mb=(size_t)G.D*G.Ih/(G.wfmt==4?2:1);
         ColiCudaTensor *tg=NULL,*tu=NULL,*td=NULL;
         int ok;
-        if(G.wfmt==8){
+        if(G.kq_mode){
+            /* sylph: three raw ggml block tensors, fmt 16 + type, no scale
+             * array; gate/up are [Ih x D] (I = D), down is [D x Ih]. */
+            const int *kt=qkt; const size_t *kb=qkb;
+            ok = coli_cuda_tensor_upload(&tg, w,             NULL, COLI_FMT_GGML_BASE+kt[0], G.D,  G.Ih, dv)
+              && coli_cuda_tensor_upload(&tu, w+kb[0],       NULL, COLI_FMT_GGML_BASE+kt[1], G.D,  G.Ih, dv)
+              && coli_cuda_tensor_upload(&td, w+kb[0]+kb[1], NULL, COLI_FMT_GGML_BASE+kt[2], G.Ih, G.D,  dv);
+        } else if(G.wfmt==8){
             /* e4m3 bytes as they came from the checkpoint, block scales
              * [ceil(O/128), ceil(I/128)] per matrix -- the layout #817's
              * kernels and tensor_upload(fmt=8) already agree on */
@@ -233,7 +258,7 @@ static void *uploader(void *arg){
  * The dense-i8 quantization (engine-side) provides q/sc with the same
  * per-row semantics quant_matmul's fmt=1 applies (y[o] = acc * sc[o]),
  * so CPU and GPU compute the same numbers up to accumulation order. */
-static struct { ColiCudaTensor *t; int dev, dev_ok, on; } G_lmh;
+static struct { ColiCudaTensor *t; int dev, dev_ok, on, fmt; } G_lmh;
 
 /* ---- placement table (COLI_PLACE) --------------------------------------- */
 /* Parsed lazily on first query and cached: qt_place_of runs per layer during
@@ -301,7 +326,7 @@ static int qt_place_named(const char *component){
 /* One fused qkv++z tensor per DeltaNet layer. Indexed by model layer index,
  * so the array is n_layers wide and the attention slots stay empty. */
 #define QT_DN_MAX_LAYERS 128
-static struct { ColiCudaTensor *t; int dev, on; } G_dnp[QT_DN_MAX_LAYERS];
+static struct { ColiCudaTensor *t; int dev, on, fmt; } G_dnp[QT_DN_MAX_LAYERS];
 
 /* ---- automatic placement (COLI_PLACE unset or "auto") ------------------ */
 /* The hand-written list above is a measurement tool. Nobody running a 6 GB
@@ -510,6 +535,33 @@ int qt_init_fp8(int nl, int ne, int D, int Ih, int cap, int topk, const float *e
     return ok;
 }
 
+/* sylph: ggml type names for the refusal note (ids as ggml.h / gguf.h) */
+static const char *kq_type_name(int t){
+    static const char *n[] = {"F32","F16","Q4_0","Q4_1","Q4_2","Q4_3","Q5_0","Q5_1","Q8_0","Q8_1","Q2_K","Q3_K","Q4_K","Q5_K","Q6_K","Q8_K",
+                              "IQ2_XXS","IQ2_XS","IQ3_XXS","IQ1_S","IQ4_NL","IQ3_S","IQ2_S","IQ4_XS","I8","I16","I32","I64","F64","IQ1_M","BF16"};
+    return (t>=0 && t<(int)(sizeof n/sizeof *n)) ? n[t] : "?";
+}
+static int G_kq_pending; static size_t G_kq_slot[3];
+int qt_init_gguf(int nl, int ne, int D, int Ih, int cap, int topk, const size_t slot_bytes[3], uint32_t types_present){
+    if(G.on) return 0;
+    const char *e=getenv("COLI_CUDA");
+    if(!(e && *e=='1')) return 0;
+    for(int t=0;t<32;t++){
+        if(!(types_present & (1u<<t))) continue;
+        if(!coli_cuda_block_fmt_supported(COLI_FMT_GGML_BASE+t)){
+            fprintf(stderr,"[qtier] GGUF expert type %s has no CUDA kernel -> CPU path\n",kq_type_name(t));
+            return 0;
+        }
+    }
+    if(!slot_bytes || !slot_bytes[0] || !slot_bytes[1] || !slot_bytes[2]) return 0;
+    G_kq_pending = 1; memcpy(G_kq_slot, slot_bytes, sizeof G_kq_slot);
+    int ok = qt_init(nl, ne, D, Ih, cap, topk, 0, 0);
+    G_kq_pending = 0;
+    if(ok) fprintf(stderr,"[qtier] GGUF experts as raw ggml blocks: slot %.2f MB (%zu + %zu + %zu bytes), %.2f MB of VRAM each\n",
+                   (slot_bytes[0]+slot_bytes[1]+slot_bytes[2])/1048576.0, slot_bytes[0], slot_bytes[1], slot_bytes[2], G.exp_bytes/1048576.0);
+    return ok;
+}
+
 /* VRAM an allocation of `bytes` really occupies (cudaMalloc granularity,
  * see the exp_bytes comment in qt_init). */
 static size_t dev_alloc_footprint(size_t bytes){
@@ -595,7 +647,8 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
 
     /* Weight format and bytes per expert come first now: the automatic
      * placement below needs them to price the experts a trunk item displaces. */
-    G.wfmt = G_fp8_stream ? 8 : (expert_is_int4 ? 4 : 1);
+    G.wfmt = G_fp8_stream ? 8 : G_kq_pending ? COLI_FMT_GGML_BASE : (expert_is_int4 ? 4 : 1);
+    G.kq_mode = G_kq_pending; if(G.kq_mode) memcpy(G.kq_slot, G_kq_slot, sizeof G.kq_slot);
     if(G.wfmt==1 && expert_gs>0){
         fprintf(stderr,"[qtier] int8 experts with grouped scales (gs=%d) cannot be "
                        "expressed on the GPU (fmt=1 is per-row only) -> CPU path\n", expert_gs);
@@ -626,6 +679,12 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     G.exp_bytes = 3*dev_alloc_footprint(mat_bytes)
                 + 2*dev_alloc_footprint(G.sc_gu*sizeof(float))
                 + dev_alloc_footprint(G.sc_d*sizeof(float));
+    if(G.kq_mode){
+        /* raw ggml blocks: three weight allocations of the slot's slice sizes,
+         * no scale arrays (the scales live inside the blocks) */
+        G.sc_gu = 0; G.sc_d = 0;
+        G.exp_bytes = dev_alloc_footprint(G.kq_slot[0]) + dev_alloc_footprint(G.kq_slot[1]) + dev_alloc_footprint(G.kq_slot[2]);
+    }
 
     /* Per-device allowance for tier + trunk: CUDA_EXPERT_GB when numeric,
      * else free minus 1 GB headroom. The heat table is loaded here too (it
@@ -791,9 +850,23 @@ int qt_lmhead_init(const int8_t *q, const float *sc, int I, int O){
         fprintf(stderr,"[lmh] lm_head upload failed -> stays on CPU\n");
         return 0;
     }
-    G_lmh.dev=dev; G_lmh.on=1;
+    G_lmh.dev=dev; G_lmh.on=1; G_lmh.fmt=1;
     fprintf(stderr,"[lmh] lm_head [%d x %d] int8 resident on CUDA dev %d (%.2f GB)\n",
             O,I,dev,(double)O*I/1073741824.0);
+    return 1;
+}
+/* sylph: the output matrix as raw ggml blocks on the lm_head device */
+int qt_lmhead_init_kq(const uint8_t *blocks, int type, int I, int O){
+    int fmt = COLI_FMT_GGML_BASE + type;
+    if(!G_lmh.dev_ok||!G.on||!blocks||!coli_cuda_block_fmt_supported(fmt)||I % coli_cuda_block_fmt_elems(fmt)) return 0;
+    int dev=G_lmh.dev;
+    if(!coli_cuda_tensor_upload(&G_lmh.t,blocks,NULL,fmt,I,O,dev)){
+        fprintf(stderr,"[lmh] lm_head upload failed -> stays on CPU\n");
+        return 0;
+    }
+    G_lmh.dev=dev; G_lmh.on=1; G_lmh.fmt=fmt;
+    fprintf(stderr,"[lmh] lm_head [%d x %d] %s resident on CUDA dev %d (%.2f GB)\n",
+            O,I,kq_type_name(type),dev,(double)(I/coli_cuda_block_fmt_elems(fmt))*coli_cuda_block_fmt_bytes(fmt)*O/1073741824.0);
     return 1;
 }
 
@@ -807,7 +880,19 @@ int qt_dnproj_init(int layer, const int8_t *q, const float *sc,
         fprintf(stderr,"[dnp] layer %d upload failed -> stays on CPU\n", layer);
         return 0;
     }
-    G_dnp[layer].dev = device; G_dnp[layer].on = 1;
+    G_dnp[layer].dev = device; G_dnp[layer].on = 1; G_dnp[layer].fmt = 1;
+    return 1;
+}
+/* sylph: the fused qkv ++ z projection as raw ggml blocks (both halves share the type) */
+int qt_dnproj_init_kq(int layer, const uint8_t *blocks, int type, int I, int O, int device){
+    int fmt = COLI_FMT_GGML_BASE + type;
+    if(layer < 0 || layer >= QT_DN_MAX_LAYERS) return 0;
+    if(device == QT_PLACE_CPU || !blocks || !coli_cuda_block_fmt_supported(fmt) || I % coli_cuda_block_fmt_elems(fmt)) return 0;
+    if(!coli_cuda_tensor_upload(&G_dnp[layer].t, blocks, NULL, fmt, I, O, device)){
+        fprintf(stderr,"[dnp] layer %d upload failed -> stays on CPU\n", layer);
+        return 0;
+    }
+    G_dnp[layer].dev = device; G_dnp[layer].on = 1; G_dnp[layer].fmt = fmt;
     return 1;
 }
 
@@ -818,7 +903,7 @@ int qt_dnproj_init(int layer, const int8_t *q, const float *sc,
  * tier learning its name. The engine offers sizes through qt_trunk_offer(),
  * asks qt_place_of() where each went, and hands the quantized bytes here. */
 #define QT_DENSE_MAX 1024
-static struct { ColiCudaTensor *t; int dev, on; size_t bytes; } G_dense[QT_DENSE_MAX];
+static struct { ColiCudaTensor *t; int dev, on, fmt; size_t bytes; } G_dense[QT_DENSE_MAX];
 static int G_dense_n;
 int qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device){
     if(device == QT_PLACE_CPU || !q || !sc || I <= 0 || O <= 0) return -1;
@@ -828,13 +913,29 @@ int qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device){
         fprintf(stderr,"[dense] upload [%d x %d] to dev %d failed -> stays on CPU\n", O, I, device);
         return -1;
     }
-    G_dense[h].dev = device; G_dense[h].on = 1; G_dense[h].bytes = (size_t)I*O + (size_t)O*sizeof(float);
+    G_dense[h].dev = device; G_dense[h].on = 1; G_dense[h].fmt = 1; G_dense[h].bytes = (size_t)I*O + (size_t)O*sizeof(float);
+    G_dense_n++;
+    return h;
+}
+/* sylph: a GGUF dense matrix as raw ggml blocks (fmt 16 + type, no scales) */
+int qt_dense_init_kq(const uint8_t *blocks, int type, int I, int O, int device){
+    int fmt = COLI_FMT_GGML_BASE + type;
+    if(device == QT_PLACE_CPU || !blocks || I <= 0 || O <= 0 || !coli_cuda_block_fmt_supported(fmt)) return -1;
+    if(I % coli_cuda_block_fmt_elems(fmt)) return -1;
+    if(G_dense_n >= QT_DENSE_MAX) return -1;
+    int h = G_dense_n;
+    if(!coli_cuda_tensor_upload(&G_dense[h].t, blocks, NULL, fmt, I, O, device)){
+        fprintf(stderr,"[dense] upload [%d x %d] %s to dev %d failed -> stays on CPU\n", O, I, kq_type_name(type), device);
+        return -1;
+    }
+    G_dense[h].dev = device; G_dense[h].on = 1; G_dense[h].fmt = fmt;
+    G_dense[h].bytes = (size_t)(I / coli_cuda_block_fmt_elems(fmt)) * (size_t)coli_cuda_block_fmt_bytes(fmt) * (size_t)O;
     G_dense_n++;
     return h;
 }
 int qt_dense_matmul_batch(int h, float *y, const float *x, int S, int I, int O){
     if(h < 0 || h >= G_dense_n || !G_dense[h].on || S <= 0) return 0;
-    if(coli_cuda_matmul(&G_dense[h].t, y, x, NULL, NULL, 1, S, I, O, G_dense[h].dev, 0)) return 1;
+    if(coli_cuda_matmul(&G_dense[h].t, y, x, NULL, NULL, G_dense[h].fmt, S, I, O, G_dense[h].dev, 0)) return 1;
     fprintf(stderr,"[dense] handle %d GPU matmul failed; CPU from here on\n", h);
     G_dense[h].on = 0;
     return 0;
@@ -849,7 +950,7 @@ int qt_dnproj_ready(int layer){
 }
 int qt_dnproj_matmul_batch(int layer, float *y, const float *x, int S, int I, int O){
     if(!qt_dnproj_ready(layer) || S <= 0) return 0;
-    if(coli_cuda_matmul(&G_dnp[layer].t,y,x,NULL,NULL,1,S,I,O,G_dnp[layer].dev,0))
+    if(coli_cuda_matmul(&G_dnp[layer].t,y,x,NULL,NULL,G_dnp[layer].fmt?G_dnp[layer].fmt:1,S,I,O,G_dnp[layer].dev,0))
         return 1;
     fprintf(stderr,"[dnp] layer %d GPU matmul failed; CPU from here on\n", layer);
     G_dnp[layer].on = 0;
@@ -863,7 +964,7 @@ int qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O){
 int qt_lmhead_matmul(float *y, const float *x, int I, int O){
     if(!G_lmh.on) return 0;
     /* cached-tensor path: upload params are ignored once *t exists */
-    if(coli_cuda_matmul(&G_lmh.t,y,x,NULL,NULL,1,1,I,O,G_lmh.dev,0)) return 1;
+    if(coli_cuda_matmul(&G_lmh.t,y,x,NULL,NULL,G_lmh.fmt?G_lmh.fmt:1,1,I,O,G_lmh.dev,0)) return 1;
     fprintf(stderr,"[lmh] GPU matmul failed; falling back to CPU from here on\n");
     G_lmh.on=0;
     return 0;
@@ -892,13 +993,17 @@ static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,int reserved){
     int hd=home(eid);
     if(!reserved && v_eid<0 && G.used[hd]+G.exp_bytes>G.budget[hd]) return 0;
     size_t mb=(size_t)G.D*G.Ih/(G.wfmt==4?2:1);   /* buffer di staging: int8/fp8 = 1 byte/elemento */
-    uint8_t *w=malloc(3*mb); float *sc=malloc((2*G.sc_gu+G.sc_d)*sizeof(float));
-    if(!w||!sc){ free(w); free(sc); return 0; }
+    uint8_t *w; float *sc=NULL;
+    if(G.kq_mode){ w=malloc(s->kb[0]+s->kb[1]+s->kb[2]); if(!w) return 0; }
+    else { w=malloc(3*mb); sc=malloc((2*G.sc_gu+G.sc_d)*sizeof(float));
+           if(!w||!sc){ free(w); free(sc); return 0; } }
     if(!reserved && v_eid<0) G.used[hd]+=G.exp_bytes;
     s->queued=1;
+    G_stage_down_bytes=s->kb[2];
     stage(w,sc,s->g4,s->u4,s->d4,s->gs,s->us,s->ds);
     G.q[G.qt_].layer=layer; G.q[G.qt_].eid=eid; G.q[G.qt_].w=w; G.q[G.qt_].s=sc;
     G.q[G.qt_].v_layer=v_layer; G.q[G.qt_].v_eid=v_eid;
+    memcpy(G.q[G.qt_].kt,s->kt,sizeof s->kt); memcpy(G.q[G.qt_].kb,s->kb,sizeof s->kb);
     G.qt_=(G.qt_+1)%QT_QCAP; G.qn++; G.inflight++;
     pthread_cond_signal(&G.cv);
     return 1;
@@ -966,6 +1071,43 @@ void qt_note_block(int layer,int eid,
     while(G.qn>=QT_QCAP && !G.th_stop) wait_take_locked();
     enqueue_locked(layer,eid,-1,-1,0);
     if(G_fp8_stream) stream_forget(s);
+    pthread_mutex_unlock(&G.mx);
+}
+
+/* sylph: the GGUF twins. The slot's slab is contiguous (gate | up | down), so
+ * g4/u4/d4 become pointers into it and the staging copies kb[] bytes. */
+static void kq_point(QSlot *s,const uint8_t *kq,const int ktype[3],const size_t kbytes[3]){
+    if(s->g4) return;                      /* set once: cap == n_experts, the slab never moves */
+    memcpy(s->kt,ktype,sizeof s->kt); memcpy(s->kb,kbytes,sizeof s->kb);
+    s->g4=kq; s->u4=kq+kbytes[0]; s->d4=kq+kbytes[0]+kbytes[1]; s->gs=s->us=s->ds=NULL;
+}
+void qt_note_kq(int layer,int eid,const uint8_t *kq,const int ktype[3],const size_t kbytes[3]){
+    if(!G.on || !G.kq_mode || !kq) return;
+    QSlot *s=qs(layer,eid);
+    pthread_mutex_lock(&G.mx);
+    kq_point(s,kq,ktype,kbytes);
+    if(s->heat<0xFFFFFFFFu) s->heat++;
+    enqueue_locked(layer,eid,-1,-1,0);
+    pthread_mutex_unlock(&G.mx);
+}
+void qt_note_kq_block(int layer,int eid,const uint8_t *kq,const int ktype[3],const size_t kbytes[3]){
+    if(!G.on || !G.kq_mode || !kq) return;
+    QSlot *s=qs(layer,eid);
+    pthread_mutex_lock(&G.mx);
+    kq_point(s,kq,ktype,kbytes);
+    while(G.qn>=QT_QCAP && !G.th_stop) wait_take_locked();
+    enqueue_locked(layer,eid,-1,-1,0);
+    pthread_mutex_unlock(&G.mx);
+}
+void qt_note_kq_planned(int layer,int eid,const uint8_t *kq,const int ktype[3],const size_t kbytes[3]){
+    if(!G.on || !G.kq_mode) return;
+    QSlot *s=qs(layer,eid);
+    pthread_mutex_lock(&G.mx);
+    if(!kq){ if(s->planned){ G.used[home(eid)]-=G.exp_bytes; s->planned=0; } pthread_mutex_unlock(&G.mx); return; }
+    kq_point(s,kq,ktype,kbytes);
+    while(G.qn>=QT_QCAP && !G.th_stop) wait_take_locked();
+    if(!enqueue_locked(layer,eid,-1,-1,1)){ if(s->planned) G.used[home(eid)]-=G.exp_bytes; }
+    s->planned=0;
     pthread_mutex_unlock(&G.mx);
 }
 

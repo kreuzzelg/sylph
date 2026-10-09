@@ -86,6 +86,11 @@ int  qt_dnproj_matmul_batch(int layer, float *y, const float *x, int S, int I, i
  * qt_place_of(name, layer) after it, then hand the quantized bytes here.
  * Returns the handle (>= 0) or -1 (stays on the CPU). */
 int  qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device);
+/* sylph: the same handle for a GGUF dense matrix kept as raw ggml blocks
+ * (`type` = ggml type id; a Q8_0 split is re-joined by the caller). */
+int  qt_dense_init_kq(const uint8_t *blocks, int type, int I, int O, int device);
+int  qt_lmhead_init_kq(const uint8_t *blocks, int type, int I, int O);
+int  qt_dnproj_init_kq(int layer, const uint8_t *blocks, int type, int I, int O, int device);
 int  qt_dense_matmul(int handle, float *y, const float *x, int I, int O);
 /* Row-major x[S,I] -> y[S,O], using the same resident int8 tensor. */
 int  qt_dense_matmul_batch(int handle, float *y, const float *x, int S, int I, int O);
@@ -103,6 +108,16 @@ int  qt_init_fp8(int n_layers, int n_experts, int hidden, int inter,
 int  qt_init(int n_layers, int n_experts, int hidden, int inter,
              int cap_experts_per_layer, int topk, int expert_gs,
              int expert_is_int4);
+/* sylph (GGUF): experts as the raw ggml blocks the file stores (Slot.kq).
+ * slot_bytes[3] are the largest gate/up/down slice sizes over all blocks (an
+ * expert is charged the sum of their device footprints); types_present is the
+ * bitmask of ggml type ids among the expert tensors -- a type without a CUDA
+ * kernel (anything but Q8_0/Q4_K/Q5_K/Q6_K) is refused by name and the run
+ * stays on the CPU (FR-36). Uploads travel as backend fmt 16 + type with no
+ * scale array. Contract: 07_Tests/IntegrationTest/cuda_tier_kquant.md. */
+int  qt_init_gguf(int n_layers, int n_experts, int hidden, int inter,
+                  int cap_experts_per_layer, int topk,
+                  const size_t slot_bytes[3], uint32_t types_present);
 int  qt_ready(void);
 int  qt_is_resident(int layer, int eid);
 void qt_shutdown(void);
@@ -114,6 +129,12 @@ void qt_shutdown(void);
 void qt_note(int layer, int eid,
              const uint8_t *g4, const uint8_t *u4, const uint8_t *d4,
              const float *gs, const float *us, const float *ds);
+/* The GGUF twins of qt_note / qt_note_planned / qt_note_block: kq points at the
+ * slot's slab, ktype/kbytes describe its three slices (gate, up, down). The
+ * tier stages a copy of the bytes; the slab stays the engine's. */
+void qt_note_kq(int layer, int eid, const uint8_t *kq, const int ktype[3], const size_t kbytes[3]);
+void qt_note_kq_planned(int layer, int eid, const uint8_t *kq, const int ktype[3], const size_t kbytes[3]);
+void qt_note_kq_block(int layer, int eid, const uint8_t *kq, const int ktype[3], const size_t kbytes[3]);
 
 /* Launch the GPU groups for the resident subset of the K selected experts
  * (async, all devices in parallel). Returns a bitmask of the k handled by
@@ -144,6 +165,13 @@ void qt_stats(void);
 
 static inline int  qt_init(int a,int b,int c,int d,int e,int f,int g,int h){(void)h;(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int  qt_init_fp8(int a,int b,int c,int d,int e,int f,const float*g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
+static inline int  qt_init_gguf(int a,int b,int c,int d,int e,int f,const size_t*g,uint32_t h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;return 0;}
+static inline void qt_note_kq(int a,int b,const uint8_t*c,const int*d,const size_t*e){(void)a;(void)b;(void)c;(void)d;(void)e;}
+static inline void qt_note_kq_planned(int a,int b,const uint8_t*c,const int*d,const size_t*e){(void)a;(void)b;(void)c;(void)d;(void)e;}
+static inline void qt_note_kq_block(int a,int b,const uint8_t*c,const int*d,const size_t*e){(void)a;(void)b;(void)c;(void)d;(void)e;}
+static inline int  qt_dense_init_kq(const uint8_t*a,int b,int c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return -1;}
+static inline int  qt_lmhead_init_kq(const uint8_t*a,int b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
+static inline int  qt_dnproj_init_kq(int a,const uint8_t*b,int c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_lmhead_init(const int8_t*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline int  qt_lmhead_matmul(float*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
 #define QT_PLACE_CPU (-1)

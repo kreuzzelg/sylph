@@ -241,6 +241,53 @@ static int cmd_moe_digest(void) {
     return 0;
 }
 
+/* The int8-activation twin (gq_i8.h, FR-14): a deviation, so it is pinned by
+ * TOLERANCE against the f32 reference and the deltas are printed, not hidden.
+ * Int8 activations carry up to d/2 = amax/254 of error per element; the dot's
+ * error is bounded by that times the row's L1 norm, so the bound is relative
+ * to sum |w_i| * max |x|, not to the (possibly cancelling) result. The AVX2
+ * twin sums the same integers in another order: 1e-5 of the same scale. */
+static void test_i8(int type, int I, int O) {
+    uint8_t *w = rand_rows(type, O, I, 0); size_t rb = gq_row_bytes(type, I);
+    float *x = malloc((size_t)I * sizeof(float)), *deq = malloc((size_t)I * sizeof(float));
+    void *buf = malloc(gq_act8_bytes(I)); GqAct8 a; gq_act8_bind(&a, buf, I);
+    for (int i = 0; i < I; i++) x[i] = frand();
+    gq_act8_quantize(x, I, &a);
+    float amax = 0.f; for (int i = 0; i < I; i++) if (fabsf(x[i]) > amax) amax = fabsf(x[i]);
+    double worst = 0, worst_simd = 0;
+    for (int o = 0; o < O; o++) {
+        const uint8_t *row = w + rb * (size_t)o;
+        float ref = gq_dot_row_ref(type, row, x, I), i8 = gq_dot8_row_ref(type, row, &a, I), fast = gq_dot8_row(type, row, &a, I);
+        gq_deq_row(type, row, deq, I); double l1 = 0; for (int i = 0; i < I; i++) l1 += fabs((double)deq[i]);
+        double scale = l1 * amax / 254.0 + 1e-6;                      /* the per-element bound times the L1 norm */
+        double e = fabs((double)i8 - (double)ref) / scale, es = fabs((double)fast - (double)i8) / (l1 * amax + 1e-6);
+        if (e > worst) worst = e; if (es > worst_simd) worst_simd = es;
+    }
+    printf("i8 twin %s I=%d: |i8 - f32| <= %.3f of the error bound, SIMD vs scalar %.2e relative\n", gq_type_name(type), I, worst, worst_simd);
+    CHECK(worst <= 1.0, "%s I=%d: int8 twin exceeds the activation error bound (%.3f x)", gq_type_name(type), I, worst);
+    CHECK(worst_simd <= 1e-5, "%s I=%d: AVX2 int8 twin differs from the scalar twin by %.2e", gq_type_name(type), I, worst_simd);
+    free(w); free(x); free(deq); free(buf);
+}
+static void test_layer_i8(int S, int K, int H, int F, int E) {
+    uint8_t **g = malloc(sizeof *g * E), **u = malloc(sizeof *u * E), **d = malloc(sizeof *d * E);
+    GqExpert *ex = malloc(sizeof *ex * E); const GqExpert **sel = malloc(sizeof *sel * (size_t)S * K);
+    int *idx = malloc(sizeof(int) * (size_t)S * K); float *val = malloc(sizeof(float) * (size_t)S * K);
+    for (int e = 0; e < E; e++) { int tg = (e & 1) ? GQ_Q4_K : GQ_Q5_K, td = (e & 2) ? GQ_Q6_K : GQ_Q8_0;
+        g[e] = rand_rows(tg, F, H, 0); u[e] = rand_rows(tg, F, H, 0); d[e] = rand_rows(td, H, F, 0);
+        ex[e].g = g[e]; ex[e].u = u[e]; ex[e].d = d[e]; ex[e].tg = ex[e].tu = tg; ex[e].td = td; }
+    for (int i = 0; i < S * K; i++) { idx[i] = (int)(rnd() % E); val[i] = 0.1f + (rnd() & 255) / 512.f; sel[i] = &ex[idx[i]]; }
+    float *x = malloc((size_t)S * H * sizeof(float)), *o32 = malloc((size_t)S * H * sizeof(float)), *o8 = malloc((size_t)S * H * sizeof(float));
+    for (int i = 0; i < S * H; i++) x[i] = frand();
+    void *sc = malloc(gq_moe_scratch_bytes(S, K, H, F));
+    gq_moe_run(o32, x, S, K, H, F, idx, val, sel, sc);
+    gq_moe_run_i8(o8, x, S, K, H, F, idx, val, sel, sc);
+    double mx = 0, dm = 0; for (int i = 0; i < S * H; i++) { if (fabs(o32[i]) > mx) mx = fabs(o32[i]); double dd = fabs((double)o32[i] - o8[i]); if (dd > dm) dm = dd; }
+    printf("i8 twin layer S=%d K=%d H=%d F=%d: max |delta| %.3e vs max |out| %.3e (%.2f%%)\n", S, K, H, F, dm, mx, 100.0 * dm / (mx + 1e-30));
+    CHECK(dm <= 0.05 * mx + 1e-4, "int8 layer twin deviates by %.3e (max |out| %.3e)", dm, mx);
+    for (int e = 0; e < E; e++) { free(g[e]); free(u[e]); free(d[e]); }
+    free(g); free(u); free(d); free(ex); free(sel); free(idx); free(val); free(x); free(o32); free(o8); free(sc);
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "deq")) return cmd_deq(argc, argv);
     if (argc >= 2 && !strcmp(argv[1], "moe-digest")) return cmd_moe_digest();
@@ -286,6 +333,12 @@ int main(int argc, char **argv) {
     test_layer(1, 8, 2048, 512, 16);
     test_layer(7, 8, 2048, 512, 12);
     test_layer(5, 4, 256, 256, 6);
+
+    /* the int8-activation twin (FR-14, opt-in): tolerance-pinned, deltas printed */
+    { const int T8[4] = { GQ_Q8_0, GQ_Q4_K, GQ_Q5_K, GQ_Q6_K };
+      for (int t = 0; t < 4; t++) { test_i8(T8[t], 2048, 64); test_i8(T8[t], 512, 64); } }
+    test_layer_i8(1, 8, 2048, 512, 16);
+    test_layer_i8(5, 4, 256, 256, 6);
 
     if (fails) { printf("%d failure(s)\n", fails); return 1; }
     printf("all passed\n"); return 0;

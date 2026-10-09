@@ -36,9 +36,9 @@ next to the expert-cache hit rate.
 | dense matrices | `Q8_0` → lossless int8 plane + per-32 scales on upstream's kernels; K-quants → `gq_matmul`; f32/f16/bf16 → the container's int8-at-load path (`COLI_DENSE_I8=0` for exact f32) |
 | tokenizer | from `tokenizer.ggml.*` (`pre = qwen35`); identical ids to Qwen's `tokenizer.json` on the test corpus |
 | sidecars | `<dir>/.coli-<stem>/` — nothing is ever written beside the `.gguf` |
-| GPU | not yet: `COLI_CUDA=1` is ignored with a note (phase 5) |
+| GPU | `COLI_CUDA=1` on a CUDA build (`make qwen36 CUDA=1`): the hot experts go to VRAM as the raw ggml blocks they are (`Q8_0`/`Q4_K`/`Q5_K`/`Q6_K`, backend formats 16 + type), computed by kernels that reproduce the CPU reference bit for bit; the dense trunk is placed by the same auto-placer as for containers (`output`, DeltaNet projections, attention, shared expert, as stored; a `Q8_0` split is re-joined). `coli plan --gpu 0` prices the trunk and the expert budget (`VRAM … trunk + … hot tier · ~N experts`). A CPU-only build says `COLI_CUDA=1 ignored: built without CUDA`; a type without a kernel is refused by name. Measured on the RTX 3070: `07_Tests/SystemTest/gpu_rtx3070.md` |
 
-Knobs: `COLI_GGUF_EMBED`, `PPL_DUMP`, `PPL_DUMP_FULL` in [ENVIRONMENT.md](ENVIRONMENT.md).
+Knobs: `COLI_GGUF_EMBED`, `PPL_DUMP`, `PPL_DUMP_FULL`, `QWEN_EXPERT_ACT=i8` (the opt-in int8-activation twin on the GGUF path; f32 by default) in [ENVIRONMENT.md](ENVIRONMENT.md); the tier's knobs (`COLI_CUDA`, `COLI_GPUS`, `CUDA_EXPERT_GB`, `COLI_PLACE`, `HEAT_FILE`) in [qwen36-cuda-tier.md](qwen36-cuda-tier.md).
 
 ## Equivalence
 

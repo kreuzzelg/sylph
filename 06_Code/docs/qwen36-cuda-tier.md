@@ -37,6 +37,24 @@ more GPUs and computed there through the existing shared CUDA backend
   such a run gets the tier's VRAM speed at full residency cost, and the 29 GB
   figure below does not apply to it.
 
+## GGUF models (sylph)
+
+A GGUF source (`SNAP=<file.gguf>`, [gguf.md](gguf.md)) rides the same tier with its
+experts as **raw ggml blocks**: a slot's three slices (`ffn_gate/up/down_exps`,
+`Q4_K`/`Q5_K`/`Q6_K`/`Q8_0`) are uploaded as backend formats `16 + ggml type` with no
+scale array, and computed by kernels (`blk_*` in `backend_cuda.cu`) that reproduce
+`gq.h`'s scalar reference bit for bit — so a resident expert and a CPU miss agree to the
+bit, and a run with every expert resident produces the same log-probs as the CPU path
+(the SiLU's device `expf` is the one measured deviation). `qt_init_gguf` charges an
+expert the sum of its three slice footprints and refuses a type without a kernel by
+name. The dense trunk is offered and placed exactly as for a container, as stored
+(`output`, `dnproj` = qkv ++ z when both halves share a type, `dnout`, `attnproj`,
+`shexp`; a `Q8_0` matrix held as the lossless int8 split is re-joined into blocks for
+the device). The `[GGUF]` startup line ends `experts on CUDA tier (<n> planned)`;
+`coli plan --gpu 0` prices the trunk from the file (`VRAM … trunk + … hot tier`).
+Contracts and tests: `07_Tests/IntegrationTest/cuda_tier_kquant.md` (fake backend in
+`make check`, `make cuda-test-gq` on the card), `07_Tests/SystemTest/gpu_rtx3070.md`.
+
 ## Usage
 
 ```bash

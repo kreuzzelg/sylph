@@ -69,6 +69,14 @@ static inline size_t gq_row_bytes(int t, int I) {
     return (size_t)(I / gq_types[t].block) * (size_t)gq_types[t].tsize;
 }
 
+/* a*b+c as ONE rounding where the hardware has it (the same choice the CUDA tier
+ * makes in qt_take, see gq_moe_run's tail); plain multiply-add elsewhere */
+#if defined(__FMA__) || defined(__ARM_FEATURE_FMA) || defined(__aarch64__)
+#define GQ_FMA(a, b, c) fmaf((a), (b), (c))
+#else
+#define GQ_FMA(a, b, c) ((a) * (b) + (c))
+#endif
+
 /* ---- scalar conversions ------------------------------------------------------ */
 
 static inline uint16_t gq_ld16(const uint8_t *p) { return (uint16_t)(p[0] | ((unsigned)p[1] << 8)); }
@@ -756,7 +764,9 @@ static inline size_t gq_moe_scratch_bytes(int S, int K, int H, int F) {
     return n * (2 * (size_t)F + (size_t)H) * sizeof(float)   /* g, u per (s,k); contribution per (s,k) */
          + n * (size_t)F * sizeof(float)                       /* h per (s,k) */
          + ((size_t)S * (H / 32) + n * (F / 32)) * sizeof(float) /* per-32 sums of x and h (K-quant min terms) */
-         + n * sizeof(int) * 4 + 8192;
+         + n * sizeof(int) * 4 + 8192
+         /* room for the int8-activation twin (gq_i8.h): x per token, h per (s,k) as int8 blocks + scales + sums */
+         + (size_t)S * ((size_t)H + (size_t)(H / 32) * 8 + 128) + n * ((size_t)F + (size_t)(F / 32) * 8 + 128) + 256;
 }
 static inline void gq_swiglu(float *h, const float *g, const float *u, int F) {
     for (int i = 0; i < F; i++) { float gv = g[i]; h[i] = (gv / (1.f + expf(-gv))) * u[i]; }
@@ -833,7 +843,14 @@ static inline void gq_moe_run(float *out, const float *x, int S, int K, int H, i
             for (int r = r0; r < r1; r++) ci[r] = gq_dot_row_xs(ex->td, ex->d + rd * (size_t)r, hi, hsi, F);
         }
     }
-    /* rank-order sum per token */
+    /* rank-order sum per token. GQ_FMA, not `os[d] += wgt * c[d]`: the CUDA
+     * tier's qt_take accumulates the same products in the same k order, and
+     * the two must round identically for the GPU path to reproduce this one
+     * bit for bit (cuda_tier_kquant.md, contract 2). With -ffp-contract=fast
+     * the compiler would fuse this loop anyway on an FMA host, but not
+     * necessarily the one in qwen36_tier.c; spelling it out removes the
+     * dependence on that decision. Hosts without FMA keep the plain multiply
+     * and add (a software fmaf would be a libm call per element). */
     #pragma omp parallel for schedule(static)
     for (int s = 0; s < S; s++) {
         float *os = out + (size_t)s * H;
@@ -841,7 +858,7 @@ static inline void gq_moe_run(float *out, const float *x, int S, int K, int H, i
         for (int k = 0; k < K; k++) {
             int i = s * K + k; if (idx[i] < 0 || !experts[i]) continue;
             float wgt = val[i]; const float *c = ctb + (size_t)i * H;
-            for (int d = 0; d < H; d++) os[d] += wgt * c[d];
+            for (int d = 0; d < H; d++) os[d] = GQ_FMA(wgt, c[d], os[d]);
         }
     }
 }
@@ -871,5 +888,8 @@ static inline int gq_selftest(void) {
     bad += gq_f32_to_f16(gq_f16_to_f32(0xFBFF)) != 0xFBFF;         /* -65504 round trip */
     return bad;
 }
+
+/* the int8-activation twin (opt-in, FR-14): needs everything above */
+#include "gq_i8.h"
 
 #endif /* COLI_GQ_H */

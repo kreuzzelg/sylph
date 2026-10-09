@@ -98,6 +98,8 @@ jobs:
           cat equiv_ci/report.md
       - name: Expert streaming integration test (container present here)
         run: python3 07_Tests/IntegrationTest/run_expert_streaming.py
+      - name: CUDA tier on raw ggml blocks, fake backend (phase 5, cuda_tier_kquant.md part A)
+        run: python3 07_Tests/IntegrationTest/run_cuda_tier_kquant.py --no-build
 
   macos:
     runs-on: macos-latest

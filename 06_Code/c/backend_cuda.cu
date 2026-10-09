@@ -80,7 +80,7 @@ struct ColiCudaTensor {
 };
 
 static size_t tensor_scale_bytes(const ColiCudaTensor *t) {
-    if (!t->fmt || t->fmt == 6) return 0;
+    if (!t->fmt || t->fmt == 6 || coli_cuda_block_fmt_supported(t->fmt)) return 0;   /* in-block scales */
     return t->scale_count * (t->fmt == 7 ? sizeof(uint8_t) : sizeof(float));
 }
 
@@ -200,6 +200,12 @@ __host__ __device__ static size_t row_bytes(int fmt, int I) {
     if (fmt == 7) return (size_t)(I + 1) / 2;   /* MXFP4: e2m1 nibbles, 2 per byte */
     if (fmt == 6) return (size_t)(((int64_t)I + COLI_E8_QK - 1) / COLI_E8_QK) * COLI_E8_BBYTES;
     if (fmt == 8) return (size_t)I;             /* fp8-e4m3: raw bytes, layout of fmt=1 */
+    /* sylph: raw ggml blocks (fmt 16 + type, backend_cuda.h). Not a whole
+     * number of blocks -> 0, and the upload refuses. */
+    if (fmt == 24) return I % 32 ? 0 : (size_t)(I / 32) * 34;
+    if (fmt == 28) return I % 256 ? 0 : (size_t)(I / 256) * 144;
+    if (fmt == 29) return I % 256 ? 0 : (size_t)(I / 256) * 176;
+    if (fmt == 30) return I % 256 ? 0 : (size_t)(I / 256) * 210;
     return 0;
 }
 
@@ -904,6 +910,166 @@ __global__ static void grouped_down_w4(float *y,const float *x,const GroupDesc *
     if(!threadIdx.x)y[(size_t)(d.offset+s)*D+o]=p[0]*d.ds[o];
 }
 
+/* ---- sylph: raw ggml block formats (fmt 16 + type; backend_cuda.h) ----------
+ *
+ * One GEMV row is computed by EIGHT threads, one per lane of gq.h's scalar
+ * reference (lane = element & 7). Each lane walks the row's blocks in order
+ * and keeps exactly the accumulators gq_dot_*_ref keeps, with fmaf at every
+ * step the reference uses one; lane 0 then folds the eight partials with the
+ * reference's fixed tree (gq_hsum8_scalar: (l0+l4)+(l2+l6) ... ). The result is
+ * bit-identical to gq_dot_row_ref -- and so to the CPU expert path, which
+ * gq_kernels.md pins to that reference -- for every input. A 256-thread block
+ * therefore covers 32 output rows; the reduction order is a function of the
+ * type and I alone, never of the launch geometry (cuda_tier_kquant.md, B1/B4).
+ * Device expf in the fused SiLU is the one named deviation (B2). */
+__device__ static inline float blk_bits_f32(uint32_t b) { return __uint_as_float(b); }
+/* IEEE half -> single, exact, the integer path of gq_f16_to_f32 (no fp16 intrinsics,
+ * so HIP and every arch agree to the bit) */
+__device__ static inline float blk_f16(const uint8_t *p) {
+    uint32_t h = (uint32_t)p[0] | ((uint32_t)p[1] << 8);
+    uint32_t sign = (h & 0x8000u) << 16, exp = (h >> 10) & 0x1Fu, man = h & 0x3FFu;
+    if (exp == 0) {
+        if (man == 0) return blk_bits_f32(sign);
+        int e = -1; do { e++; man <<= 1; } while (!(man & 0x400u));
+        return blk_bits_f32(sign | ((uint32_t)(112 - e) << 23) | ((man & 0x3FFu) << 13));
+    }
+    if (exp == 31) return blk_bits_f32(sign | 0x7F800000u | (man << 13));
+    return blk_bits_f32(sign | ((exp + 112) << 23) | (man << 13));
+}
+/* gq_scale_min_k4: the j-th 6-bit (scale, min) pair of a Q4_K/Q5_K block */
+__device__ static inline void blk_scale_min_k4(int j, const uint8_t *q, int *d, int *m) {
+    if (j < 4) { *d = q[j] & 63; *m = q[j + 4] & 63; }
+    else { *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
+}
+/* gq_q6_get: element r (0..127) of one 128-element Q6_K half */
+__device__ static inline int blk_q6_get(const uint8_t *ql, const uint8_t *qh, int r) {
+    int part = r >> 5, l = r & 31;
+    switch (part) {
+    case 0:  return (int)((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+    case 1:  return (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+    case 2:  return (int)((ql[l]      >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
+    default: return (int)((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32;
+    }
+}
+/* gq_xsub32_ref for lane sums: x[l] + x[l+8] + x[l+16] + x[l+24], then the tree */
+__device__ static inline float blk_hsum8(const float *l) {
+    float a0 = l[0] + l[4], a1 = l[1] + l[5], a2 = l[2] + l[6], a3 = l[3] + l[7];
+    float b0 = a0 + a2, b1 = a1 + a3;
+    return b0 + b1;
+}
+__device__ static inline float blk_xsub32(const float *xb) {
+    float lx[8];
+    for (int m = 0; m < 8; m++) { lx[m] = xb[m]; lx[m] += xb[m + 8]; lx[m] += xb[m + 16]; lx[m] += xb[m + 24]; }
+    return blk_hsum8(lx);
+}
+/* lane partials of one row. Two outputs: `a` is the main accumulator the
+ * tree folds; `ax` the Q4_K/Q5_K min-term accumulator (0 for the others),
+ * folded by its own tree and added once -- exactly gq_dot_q45_k_ref's tail. */
+__device__ static void blk_lane(int type, const uint8_t *row, const float *x, int I, int lane, float *a, float *ax) {
+    float acc = 0.f, accx = 0.f;
+    if (type == 8) {                                   /* Q8_0 */
+        for (int g = 0; g < I / 32; g++) {
+            const uint8_t *b = row + 34 * (size_t)g; const float d = blk_f16(b); const float *xb = x + 32 * g;
+            float ln = fmaf((float)(int8_t)b[2 + lane], xb[lane], 0.f);
+            ln = fmaf((float)(int8_t)b[2 + lane + 8],  xb[lane + 8],  ln);
+            ln = fmaf((float)(int8_t)b[2 + lane + 16], xb[lane + 16], ln);
+            ln = fmaf((float)(int8_t)b[2 + lane + 24], xb[lane + 24], ln);
+            acc = fmaf(ln, d, acc);
+        }
+    } else if (type == 12 || type == 13) {             /* Q4_K / Q5_K */
+        const int five = type == 13; const size_t bs = five ? 176 : 144;
+        float accq0 = 0.f, accq1 = 0.f;
+        for (int g = 0; g < I / 256; g++) {
+            const uint8_t *b = row + bs * (size_t)g;
+            const uint8_t *qh = b + 16, *ql = five ? b + 48 : b + 16;
+            const float *xb = x + 256 * g;
+            const float d = blk_f16(b), dmin = blk_f16(b + 2);
+            for (int j = 0; j < 4; j++) for (int half = 0; half < 2; half++) {
+                const int k = 2 * j + half;
+                const uint8_t u = (uint8_t)((half ? 2u : 1u) << (2 * j));
+                int sd, sm; blk_scale_min_k4(k, b + 4, &sd, &sm);
+                const float d1 = d * (float)sd;
+                float ln = 0.f;
+                for (int t = 0; t < 4; t++) {
+                    const int i = lane + 8 * t;
+                    int v = half ? (ql[32 * j + i] >> 4) : (ql[32 * j + i] & 0xF);
+                    if (five && (qh[i] & u)) v += 16;
+                    ln = fmaf((float)v, xb[32 * k + i], ln);
+                }
+                if (half) accq1 = fmaf(ln, d1, accq1); else accq0 = fmaf(ln, d1, accq0);
+                if (k == lane) {                          /* this lane owns sub-block k's min term */
+                    const float nm1 = -(dmin * (float)sm);
+                    accx = fmaf(blk_xsub32(xb + 32 * k), nm1, accx);
+                }
+            }
+        }
+        acc = accq0 + accq1;
+    } else if (type == 14) {                           /* Q6_K */
+        float acc4[4] = {0.f, 0.f, 0.f, 0.f};
+        for (int g = 0; g < I / 256; g++) {
+            const uint8_t *b = row + 210 * (size_t)g; const float d = blk_f16(b + 208);
+            float accb[4] = {0.f, 0.f, 0.f, 0.f};
+            for (int h = 0; h < 2; h++) {
+                const uint8_t *ql = b + 64 * h, *qh = b + 128 + 32 * h; const int8_t *sc = (const int8_t *)(b + 192 + 8 * h);
+                const float *xh = x + 256 * g + 128 * h;
+                for (int k = 0; k < 8; k++) {
+                    const int r0 = 16 * k + lane, r1 = r0 + 8;
+                    float ln = fmaf((float)blk_q6_get(ql, qh, r0), xh[r0], 0.f);
+                    ln = fmaf((float)blk_q6_get(ql, qh, r1), xh[r1], ln);
+                    accb[k & 3] = fmaf(ln, (float)sc[k], accb[k & 3]);
+                }
+            }
+            for (int i = 0; i < 4; i++) acc4[i] = fmaf(accb[i], d, acc4[i]);
+        }
+        acc = (acc4[0] + acc4[1]) + (acc4[2] + acc4[3]);
+    }
+    *a = acc; *ax = accx;
+}
+/* 256 threads = 32 rows x 8 lanes; the row's eight partials meet in shared
+ * memory and lane 0 applies the reference tree. Returns the row value on lane
+ * 0 (undefined elsewhere). Every thread of the block must call it. */
+__device__ static float blk_row(int type, const uint8_t *row, const float *x, int I, float *red) {
+    const int lane = threadIdx.x & 7, base = threadIdx.x & ~7;
+    float a, ax; blk_lane(type, row, x, I, lane, &a, &ax);
+    red[threadIdx.x] = a; red[256 + threadIdx.x] = ax;
+    __syncthreads();
+    float r = 0.f;
+    if (!lane) { r = blk_hsum8(red + base); if (type == 12 || type == 13) r += blk_hsum8(red + 256 + base); }
+    __syncthreads();                                   /* red is reused by the next call */
+    return r;
+}
+/* dense: y[S,O] = x[S,I] . W[O,I]^T, grid (ceil(O/32), S) */
+__global__ static void blk_matmul(float *y, const float *x, const uint8_t *w, int type, int S, int I, int O, size_t rb) {
+    __shared__ float red[512];
+    const int o = blockIdx.x * 32 + (threadIdx.x >> 3), s = blockIdx.y;
+    const uint8_t *row = w + (size_t)(o < O ? o : 0) * rb;
+    float r = blk_row(type, row, x + (size_t)s * I, I, red);
+    if (!(threadIdx.x & 7) && o < O) y[(size_t)s * O + o] = r;
+    (void)S;
+}
+/* expert group, gate/up fused with the SiLU: h[(offset+s)][o] = silu(g).u, grid (ceil(I/32), max_rows, count) */
+__global__ static void grouped_hidden_blk_dual(float *gate, const float *x, const GroupDesc *desc, int I, int D) {
+    __shared__ float red[512];
+    const int o = blockIdx.x * 32 + (threadIdx.x >> 3), s = blockIdx.y, c = blockIdx.z;
+    GroupDesc d = desc[c]; if (s >= d.rows) return;
+    const int oo = o < I ? o : 0;
+    const uint8_t *gr = (const uint8_t *)d.g + (size_t)oo * row_bytes(d.gf, D);
+    const uint8_t *ur = (const uint8_t *)d.u + (size_t)oo * row_bytes(d.uf, D);
+    const float *xs = x + (size_t)(d.offset + s) * D;
+    float g = blk_row(d.gf - COLI_FMT_GGML_BASE, gr, xs, D, red);
+    float u = blk_row(d.uf - COLI_FMT_GGML_BASE, ur, xs, D, red);
+    if (!(threadIdx.x & 7) && o < I) gate[(size_t)(d.offset + s) * I + o] = (g / (1.0f + expf(-g))) * u;
+}
+__global__ static void grouped_down_blk(float *y, const float *h, const GroupDesc *desc, int D, int I) {
+    __shared__ float red[512];
+    const int o = blockIdx.x * 32 + (threadIdx.x >> 3), s = blockIdx.y, c = blockIdx.z;
+    GroupDesc d = desc[c]; if (s >= d.rows) return;
+    const int oo = o < D ? o : 0;
+    const uint8_t *row = (const uint8_t *)d.d + (size_t)oo * row_bytes(d.df, I);
+    float r = blk_row(d.df - COLI_FMT_GGML_BASE, row, h + (size_t)(d.offset + s) * I, I, red);
+    if (!(threadIdx.x & 7) && o < D) y[(size_t)(d.offset + s) * D + o] = r;
+}
+
 /* fmt=4 grouped-int4 variants (#334): identical structure to the w4 kernels,
  * but the scale varies along the input dimension — sc[o*ng + i/gs], applied
  * per element inside the accumulation (gs is even, so a packed byte never
@@ -1499,8 +1665,13 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     if (!weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
     size_t rb = row_bytes(fmt, I);
     /* fmt=6 keeps its scales inside each 98-byte block, so it is the one
-     * quantized format that legitimately arrives with scales == NULL. */
-    if (!rb || (fmt && fmt != 6 && !scales)) return 0;
+     * quantized format that legitimately arrives with scales == NULL -- and,
+     * since sylph, so do the raw ggml block formats (fmt 24/28/29/30), which
+     * are refused WITH a scale array: a caller passing one has mistaken the
+     * layout (cuda_tier_kquant.md, B3). */
+    const int blk = coli_cuda_block_fmt_supported(fmt);
+    if (!rb || (fmt && fmt != 6 && !blk && !scales)) return 0;
+    if (blk && scales) return 0;
     /* kernels would read a zero LUT; shared predicate, pinned by
      * tests/test_cuda_lut_gate.c without a CUDA toolchain */
     if (!coli_cuda_fp8_gate_admits(fmt, g_fp8_lut_ready)) return 0;
@@ -1533,7 +1704,8 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     if(fmt==2||fmt==4){ /* same nibble layout: offset-binary -> signed in place */
         offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight conversion")){coli_cuda_tensor_free(t);return 0;}}
-    if (fmt && fmt != 6) {
+    if (blk) t->scale_count = 0;           /* in-block scales, as fmt=6 */
+    if (fmt && fmt != 6 && !blk) {
         if (!cuda_ok(cudaMalloc(&t->scales, tensor_scale_bytes(t)), "scale allocation") ||
             !cuda_ok(cudaMemcpy(t->scales, scales, tensor_scale_bytes(t), cudaMemcpyHostToDevice), "scale upload")) {
             coli_cuda_tensor_free(t);
@@ -1768,6 +1940,11 @@ static int f8_warp_mode(void) {
  * original behavior), anything else the warp/shared-LUT rework. */
 static void quant_matmul_launch(float *y, const float *x, const void *w,
         const float *sc, int fmt, int S, int I, int O, size_t rb, int gs, int ng) {
+    if (coli_cuda_block_fmt_supported(fmt)) {        /* sylph: raw ggml blocks, 32 rows per block */
+        blk_matmul<<<dim3((unsigned)((O + 31) / 32), (unsigned)S), 256>>>(y, x, (const uint8_t *)w, fmt - COLI_FMT_GGML_BASE, S, I, O, rb);
+        (void)sc; (void)gs; (void)ng;
+        return;
+    }
     dim3 grid((unsigned)O, (unsigned)S);
     if (fmt == 8 && f8_warp_mode())
         quant_matmul_f8w<<<grid, 256>>>(y, x, w, sc, S, I, O);
@@ -1997,7 +2174,7 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
     if (!first) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0;
     GroupDesc host[64]; if(count>64) return 0;
-    int all_s4=1,all_q4=1,any_g4=0,any_e8=0,all_e8=1,any_f8=0,all_f8=1;
+    int all_s4=1,all_q4=1,any_g4=0,any_e8=0,all_e8=1,any_f8=0,all_f8=1,any_blk=0,all_blk=1;
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
         if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
@@ -2013,8 +2190,13 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
         all_e8&=g->fmt==6&&u->fmt==6&&d->fmt==6;
         any_f8|=g->fmt==8||u->fmt==8||d->fmt==8;
         all_f8&=g->fmt==8&&u->fmt==8&&d->fmt==8;
+        { int bg=coli_cuda_block_fmt_supported(g->fmt),bu=coli_cuda_block_fmt_supported(u->fmt),bd=coli_cuda_block_fmt_supported(d->fmt);
+          any_blk|=bg||bu||bd; all_blk&=bg&&bu&&bd; }
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
+    /* sylph: raw ggml block experts never mix with the container formats (one
+     * tier, one format family); a mixed group is a caller error, refused. */
+    if(any_blk&&!all_blk) return 0;
     /* Mixed E8/FP8 groups cannot use a homogeneous grouped kernel. */
     if((any_e8&&!all_e8)||(any_f8&&!all_f8)){
         int off=0;
@@ -2064,7 +2246,13 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
        all_s4&&D%32==0&&I%32==0&&D%8==0&&I%8==0;
     int tc_min=getenv("COLI_CUDA_TC_MIN_ROWS")?atoi(getenv("COLI_CUDA_TC_MIN_ROWS")):8;
     for(int c=0;c<count&&tc;c++)tc=rows[c]>=tc_min;
-    if(all_e8){
+    if(all_blk){
+        /* sylph GGUF experts: 32 output rows per 256-thread block, gq_dot_row_ref
+         * numerics (blk_row), SiLU fused in the dual epilogue. */
+        dim3 hg((unsigned)((I+31)/32),(unsigned)max_rows,(unsigned)count),og((unsigned)((D+31)/32),(unsigned)max_rows,(unsigned)count);
+        grouped_hidden_blk_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D);
+        grouped_down_blk<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    }else if(all_e8){
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
         grouped_hidden_e8_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D);
         if(!e8_rot_rows_dev(ctx->gate,total,I,ctx->stream))return 0;

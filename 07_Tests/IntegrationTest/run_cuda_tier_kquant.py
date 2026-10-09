@@ -52,8 +52,8 @@ TIER_ENV = {"COLI_CUDA": "1", "COLI_GPUS": "0", "QT_UPLOAD_SYNC": "1", "COLI_PLA
             "CUDA_EXPERT_GB": "1", "HEAT_FILE": "", "QT_NO_WARMSTART": "0"}
 
 
-def ref_run(binary, snap, cap, ref, env=None):
-    e = {"SNAP": snap, "COLI_DENSE_I8": "0"}
+def ref_run(binary, snap, cap, ref, env=None, dense_i8="0"):
+    e = {"SNAP": snap, "COLI_DENSE_I8": dense_i8}
     if env:
         e.update(env)
     r = es.run([binary, cap, 8, ref], env=e, cwd=C)
@@ -62,8 +62,8 @@ def ref_run(binary, snap, cap, ref, env=None):
     return ran, es.parse_ids(out), out
 
 
-def ppl_run(binary, snap, cap, ref, dump, env=None):
-    e = {"SNAP": snap, "COLI_DENSE_I8": "0", "PPL": "1", "PPL_DUMP": dump}
+def ppl_run(binary, snap, cap, ref, dump, env=None, dense_i8="0"):
+    e = {"SNAP": snap, "COLI_DENSE_I8": dense_i8, "PPL": "1", "PPL_DUMP": dump}
     if env:
         e.update(env)
     r = es.run([binary, cap, 8, ref], env=e, cwd=C)
@@ -168,16 +168,18 @@ def case2():
     check("has no CUDA kernel" in r.stderr, "the by-type refusal note was printed")
 
 
-def engine_pair(fx, key, env, label, exact):
-    """Run qwen36 and the fake-tier engine on fixture `key`; compare ids and dumps."""
+def engine_pair(fx, key, env, label, exact, dense_i8="0"):
+    """Run qwen36 and the fake-tier engine on fixture `key`; compare ids and dumps.
+    dense_i8="1" keeps the Q8_0 dense matrices as the lossless split (what the placer
+    offers); "0" dequantizes them to f32 (nothing to place, the phase-4 reference setting)."""
     snap, cap = str(fx[key]), fx["geom"]["E"] if key == "q4k" else 8
-    ran_a, ids_a, out_a = ref_run(QWEN36, snap, cap, fx["ref"])
-    ran_b, ids_b, out_b = ref_run(FAKE_ENGINE, snap, cap, fx["ref"], env)
+    ran_a, ids_a, out_a = ref_run(QWEN36, snap, cap, fx["ref"], dense_i8=dense_i8)
+    ran_b, ids_b, out_b = ref_run(FAKE_ENGINE, snap, cap, fx["ref"], env, dense_i8=dense_i8)
     check(ran_a and ran_b, f"{label}: both engines ran")
     check(ids_a is not None and ids_a == ids_b, f"{label}: ids identical")
-    d_a, d_b = fx["tmp"] / f"{key}_cpu.tsv", fx["tmp"] / f"{key}_{label.split()[0]}.tsv"
-    ok_a, body_a, _ = ppl_run(QWEN36, snap, cap, fx["ref"], d_a)
-    ok_b, body_b, out_p = ppl_run(FAKE_ENGINE, snap, cap, fx["ref"], d_b, env)
+    d_a, d_b = fx["tmp"] / f"{key}_cpu_{dense_i8}.tsv", fx["tmp"] / f"{key}_{label.split()[0]}_{dense_i8}.tsv"
+    ok_a, body_a, _ = ppl_run(QWEN36, snap, cap, fx["ref"], d_a, dense_i8=dense_i8)
+    ok_b, body_b, out_p = ppl_run(FAKE_ENGINE, snap, cap, fx["ref"], d_b, env, dense_i8=dense_i8)
     if check(ok_a and ok_b, f"{label}: both dumps written"):
         if exact:
             same = body_a == body_b
@@ -219,7 +221,7 @@ def case4(fx):
     if "q8_0" not in fx:
         return
     env = dict(TIER_ENV, COLI_PLACE="auto", COLI_TRUNK_PROBE="0")
-    out, _ = engine_pair(fx, "q8_0", env, "q8_0 placed", exact=False)
+    out, _ = engine_pair(fx, "q8_0", env, "q8_0 placed", exact=False, dense_i8="1")
     f = fake_line(out)
     if check(f is not None, "[fake-cuda] line present"):
         check(f["matmuls"] > 0, f"dense GEMVs answered by the device ({f['matmuls']})")

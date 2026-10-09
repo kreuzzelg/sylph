@@ -509,7 +509,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_segment_adapters_registration test_segment_adapters_real \
 	test_edge_adapters_registration test_edge_adapters_real \
 	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine \
-	test_e8x4g64_loader \
+	test_e8x4g64_loader test_qwen36_tier_kq_engine \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
@@ -1145,7 +1145,7 @@ qwen36: qwen36$(EXE)
 endif
 # Rebuild when CUDA_DLL changes; otherwise an existing CPU-only executable can
 # be reported as up to date despite selecting the Windows CUDA DLL tier.
-qwen36$(EXE): qwen36.c src.h gq.h gguf.h gguf_xform.h qwen35_names.h sse41_kernels.h decode_batch.h serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h idot.h st.h json.h compat.h omp_tune.h kv_prefix.h pin_pool.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h gsgemv.h qgemv.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) .build-config
+qwen36$(EXE): qwen36.c src.h gq.h gq_i8.h gguf.h gguf_xform.h qwen35_names.h sse41_kernels.h decode_batch.h serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h idot.h st.h json.h compat.h omp_tune.h kv_prefix.h pin_pool.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h gsgemv.h qgemv.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) .build-config
 	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
 # DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
@@ -1256,7 +1256,7 @@ tests/test_qwen36_tokenizer$(EXE): tests/test_qwen36_tokenizer.c gsgemv.h qgemv.
 
 # sylph phase 3: the tensor-source façade (GGUF | safetensors) and the GGUF
 # tokenizer, both through qwen36.c (07_Tests/IntegrationTest/src_facade.md).
-tests/test_gguf_load$(EXE): tests/test_gguf_load.c qwen36.c src.h gq.h gguf.h gguf_xform.h qwen35_names.h gsgemv.h qgemv.h sse41_kernels.h expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+tests/test_gguf_load$(EXE): tests/test_gguf_load.c qwen36.c src.h gq.h gq_i8.h gguf.h gguf_xform.h qwen35_names.h gsgemv.h qgemv.h sse41_kernels.h expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 tests/test_tok_gguf$(EXE): tests/test_tok_gguf.c qwen36.c src.h gguf.h gsgemv.h qgemv.h sse41_kernels.h expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
@@ -1430,12 +1430,12 @@ tests/test_gguf$(EXE): tests/test_gguf.c gguf.h compat.h
 # ggml block kernels for GGUF weights (sylph phase 2). E0 golden fixtures in
 # tests/fixtures/gq_e0/ (llama.cpp gguf-py decode of synthetic blocks); the
 # integration runner 07_Tests/IntegrationTest/run_gq_kernels.py adds real rows.
-tests/test_gq_kernels$(EXE): tests/test_gq_kernels.c gq.h gguf.h gsgemv.h sse41_kernels.h compat.h
+tests/test_gq_kernels$(EXE): tests/test_gq_kernels.c gq.h gq_i8.h gguf.h gsgemv.h sse41_kernels.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # NFR-7 kernel throughput (07_Tests/SystemTest/kernel_throughput.md):
 #   make bench-gq [MODEL=/path/to/model.gguf]
-tests/bench_gq$(EXE): tests/bench_gq.c gq.h expert_ffn.h gsgemv.h sse41_kernels.h gguf.h compat.h
+tests/bench_gq$(EXE): tests/bench_gq.c gq.h gq_i8.h expert_ffn.h gsgemv.h sse41_kernels.h gguf.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 bench-gq: tests/bench_gq$(EXE)
 	./tests/bench_gq$(EXE) $(if $(MODEL),--model "$(MODEL)")
@@ -2061,9 +2061,9 @@ tests/test_qwen36_trunk_dense$(EXE): tests/test_qwen36_trunk_dense.c gsgemv.h qg
 # compares it with ./qwen36). The kernel oracle on silicon is cuda-test-gq.
 tests/test_cuda_block_fmt_guard$(EXE): tests/test_cuda_block_fmt_guard.c backend_cuda.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-tests/test_qwen36_tier_kq$(EXE): tests/test_qwen36_tier_kq.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h gq.h gguf.h compat.h
+tests/test_qwen36_tier_kq$(EXE): tests/test_qwen36_tier_kq.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h gq.h gq_i8.h gguf.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
-tests/test_qwen36_tier_kq_engine$(EXE): tests/test_qwen36_tier_kq_engine.c qwen36.c src.h gq.h gguf.h gguf_xform.h qwen35_names.h gsgemv.h qgemv.h sse41_kernels.h tests/qwen36_fake_cuda.h expert_ffn.h qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
+tests/test_qwen36_tier_kq_engine$(EXE): tests/test_qwen36_tier_kq_engine.c qwen36.c src.h gq.h gq_i8.h gguf.h gguf_xform.h qwen35_names.h gsgemv.h qgemv.h sse41_kernels.h tests/qwen36_fake_cuda.h expert_ffn.h qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 phase5-tests: tests/test_cuda_block_fmt_guard$(EXE) tests/test_qwen36_tier_kq$(EXE) tests/test_qwen36_tier_kq_engine$(EXE)
 	./tests/test_cuda_block_fmt_guard$(EXE)
