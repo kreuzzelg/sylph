@@ -123,15 +123,15 @@ jobs:
             echo "::endgroup::"
           done
           # GGUF == container: the same engine on the same numbers prints the same ids
-          diff <(grep 'GLM C engine' gen_glm_tiny.log) <(grep 'GLM C engine' gen_glm_tiny_f32.gguf.log)
+          diff <(grep '^GLM C engine *:' gen_glm_tiny.log) <(grep '^GLM C engine *:' gen_glm_tiny_f32.gguf.log)
           diff <(grep -c 'ORACLE\] mismatch' tf_glm_tiny.log) <(grep -c 'ORACLE\] mismatch' tf_glm_tiny_f32.gguf.log)
           for cap in 1 2 8; do
-            SNAP=glm_tiny_f32.gguf REF=ref_glm.json COLI_TEMP=0 ./colibri $cap 16 16 2>/dev/null | grep 'GLM C engine' | diff - <(grep 'GLM C engine' gen_glm_tiny.log)
+            SNAP=glm_tiny_f32.gguf REF=ref_glm.json COLI_TEMP=0 ./colibri $cap 16 16 2>/dev/null | grep '^GLM C engine *:' | diff - <(grep '^GLM C engine *:' gen_glm_tiny.log)
           done
-          SNAP=glm_tiny_fused.gguf REF=ref_glm.json COLI_TEMP=0 ./colibri 8 16 16 2>&1 | tee gen_fused.log | grep 'GLM C engine' | diff - <(grep 'GLM C engine' gen_glm_tiny.log)
+          SNAP=glm_tiny_fused.gguf REF=ref_glm.json COLI_TEMP=0 ./colibri 8 16 16 2>&1 | tee gen_fused.log | grep '^GLM C engine *:' | diff - <(grep '^GLM C engine *:' gen_glm_tiny.log)
           grep -q 'kv_b from attn_kv_b' gen_fused.log
           grep -q 'kv_b from attn_k_b/attn_v_b' gen_glm_tiny_f32.gguf.log
-          DSA=0 SNAP=glm_tiny_f32.gguf REF=ref_glm.json COLI_TEMP=0 ./colibri 8 16 16 2>/dev/null | grep 'GLM C engine' | diff - <(grep 'GLM C engine' gen_glm_tiny.log)
+          DSA=0 SNAP=glm_tiny_f32.gguf REF=ref_glm.json COLI_TEMP=0 ./colibri 8 16 16 2>/dev/null | grep '^GLM C engine *:' | diff - <(grep '^GLM C engine *:' gen_glm_tiny.log)
           echo "::group::reported, not required -- Q8_0 GGUF vs torch"
           SNAP=glm_tiny_q8_0.gguf REF=ref_glm.json COLI_TEMP=0 ./colibri 8 16 16 || true
           echo "::endgroup::"

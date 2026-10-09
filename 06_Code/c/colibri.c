@@ -12248,7 +12248,13 @@ int main(int argc, char **argv){
       int est_ctx = getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default di run_serve */
       if(m.is_gguf){   /* FR-29: sidecars of a GGUF model live in <dir>/.coli-<stem>/, created on first use */
           char sd[2304]; ts_sidecar_dir(&m.src,sd,sizeof sd); snprintf(g_usage_path,sizeof(g_usage_path),"%.2000s.coli_usage",sd);
-          if(getenv("AUTOPIN")==NULL || atoi(getenv("AUTOPIN"))) { size_t L=strlen(sd); if(L>1&&sd[L-1]=='/') sd[L-1]=0; mkdir(sd,0755); }
+          if(getenv("AUTOPIN")==NULL || atoi(getenv("AUTOPIN"))) { size_t L=strlen(sd); if(L>1&&sd[L-1]=='/') sd[L-1]=0;
+#ifdef _WIN32
+              _mkdir(sd);
+#else
+              mkdir(sd,0755);
+#endif
+          }
       } else snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap);
 #ifdef COLI_VULKAN
       /* #653's correction, for the Vulkan tier. On an integrated GPU the tier's
