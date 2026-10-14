@@ -41,8 +41,17 @@ make -C 06_Code/c colibri                   # the GLM-5.2 engine
 06_Code/c/coli doctor --model /path/to/model.gguf --deep
 ```
 
-Running a model *from* a GGUF is phase 3/4 work; see `04_Tasks/tasks.md` for the
-current state and `03_Architecture/` for the plan.
+```sh
+make -C 06_Code/c qwen36                                   # the Qwen3.6 engine
+06_Code/c/coli chat --model /path/to/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+06_Code/c/coli chat --model "$(ollama show qwen3.6:35b --modelfile | awk '/^FROM/{print $2}')"   # Ollama's own blob works too
+```
+
+State (2026-10-15, first pass on the owner's RTX 3070 host): the Qwen3.6 GGUF path runs
+from llama.cpp's and from Ollama's files, the tokenizer matches `llama-tokenize` on
+wikitext-2, the CUDA expert tier passes its device oracle; equivalence and efficiency
+numbers are in `08_Documents/equivalence/` and `08_Documents/benchmarks/`. See
+`04_Tasks/tasks.md` for the current state and `03_Architecture/` for the plan.
 
 ## Keeping up with upstream colibrì
 

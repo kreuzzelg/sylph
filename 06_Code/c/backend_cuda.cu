@@ -2409,7 +2409,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
     ColiCudaTensor *first=gates[0];
     if (!first) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0,all_s4=1,any_e8=0,all_e8=1,
-        all_q4=1,any_g4=0,any_f8=0,all_f8=1;
+        all_q4=1,any_g4=0,any_f8=0,all_f8=1,any_blk=0,all_blk=1;
     GroupDesc host[64];
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
@@ -2426,10 +2426,19 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         any_g4|=g->fmt==4||u->fmt==4||d->fmt==4;
         any_f8|=g->fmt==8||u->fmt==8||d->fmt==8;
         all_f8&=g->fmt==8&&u->fmt==8&&d->fmt==8;
+        { int bg=coli_cuda_block_fmt_supported(g->fmt),bu=coli_cuda_block_fmt_supported(u->fmt),bd=coli_cuda_block_fmt_supported(d->fmt);
+          any_blk|=bg||bu||bd; all_blk&=bg&&bu&&bd; }
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
     if(any_e8&&!all_e8) return 0;
     if(any_f8&&!all_f8) return 0;   /* mixed FP8: no homogeneous kernel, sync path has the per-expert loop */
+    /* sylph: raw ggml block experts (fmt 24/28/29/30) never mix with the container
+     * formats; a mixed group is a caller error, refused as on the sync path. Found
+     * by the first run of cuda-test-gq on the owner's RTX 3070 (2026-10-14): phase 5
+     * added the blk kernels to coli_cuda_expert_group only, and this async path --
+     * the one qwen36_tier actually issues through -- fell into the per-row-scale
+     * fallback, which refuses fmt > 3. */
+    if(any_blk&&!all_blk) return 0;
     if(total>8) return 0;                       /* decode-scale only */
     DeviceContext *ctx=find_ctx(device); if(!ctx||ctx->group_pending||!select_ctx(ctx)) return 0;
     if(!prepare_group_weights(ctx,gates,ups,downs,count,host)) return 0;
@@ -2445,7 +2454,15 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
                 "expert group issue descriptors")||
        !cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
                 "expert group issue upload")) return 0;
-    if(all_e8){
+    if(all_blk){
+        /* sylph GGUF experts on the async decode path: the same launches as the
+         * sync dispatch (32 output rows per 256-thread block, blk_row numerics,
+         * SiLU fused in the dual epilogue). */
+        GroupDesc *dev=(GroupDesc*)ctx->group_desc;
+        dim3 hg((unsigned)((I+31)/32),(unsigned)max_rows,(unsigned)count),og((unsigned)((D+31)/32),(unsigned)max_rows,(unsigned)count);
+        grouped_hidden_blk_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D);
+        grouped_down_blk<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    }else if(all_e8){
         GroupDesc *dev=(GroupDesc*)ctx->group_desc;
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count);
         dim3 og((unsigned)D,(unsigned)max_rows,(unsigned)count);

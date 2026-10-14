@@ -70,14 +70,38 @@ def read_full(path):
             yield struct.unpack(f"<{V}f", raw)
 
 
-def kl_exact(ref_full, cand_full):
-    """Mean and max KL(ref || cand) over the positions of two full-logprob v1 files."""
-    kls = []
+def _log_softmax(row):
+    m = max(row); z = m + math.log(sum(math.exp(a - m) for a in row))
+    return [a - z for a in row]
+
+
+def kl_exact(ref_full, cand_full, tail_eps=1e-3):
+    """Mean and max KL(ref || cand) over the positions of two full-logprob v1 files.
+
+    Both rows are re-normalised, and every entry at which the reference sits on its own
+    floor (lp <= min + tail_eps) is lumped into one bucket with the candidate's mass there.
+    llama-perplexity's kld file stores log-probs as 16-bit values clamped at a floor
+    (-17 on the real model, rows summing to 1.03): read as exact values those ~200 000
+    tail entries alone made KL(llama || sylph) 0.15 nat while llama CPU vs CUDA measured
+    0.004 and the targets agreed within 0.04 (owner's host, 2026-10-14). A torch or sylph
+    reference has a true minimum, so the bucket is one entry and nothing changes."""
+    kls = []; tail_mass = 0.0; n_tail = 0
     for pr, qc in zip(read_full(ref_full), read_full(cand_full)):
-        kls.append(max(0.0, sum(math.exp(a) * (a - b) for a, b in zip(pr, qc))))
+        pr, qc = _log_softmax(pr), _log_softmax(qc)
+        floor = min(pr) + tail_eps
+        kl = 0.0; p_t = 0.0; q_t = 0.0
+        for a, b in zip(pr, qc):
+            if a <= floor:
+                p_t += math.exp(a); q_t += math.exp(b); n_tail += 1
+            else:
+                kl += math.exp(a) * (a - b)
+        if p_t > 0 and q_t > 0:
+            kl += p_t * (math.log(p_t) - math.log(q_t))
+        tail_mass += p_t
+        kls.append(max(0.0, kl))
     if not kls:
         return None
-    return {"n": len(kls), "mean": sum(kls) / len(kls), "max": max(kls)}
+    return {"n": len(kls), "mean": sum(kls) / len(kls), "max": max(kls), "tail_entries_per_pos": n_tail / len(kls), "tail_mass_ref": tail_mass / len(kls)}
 
 
 # ---- E2 -------------------------------------------------------------------------------
@@ -116,7 +140,20 @@ def e3_compare(ref_gens, cand_gens, margin_thr=0.05):
         while k < min(len(a), len(b)) and a[k] == b[k]:
             k += 1
         diverged = k < min(len(a), len(b))
-        margin = (r.get("margin") or [None] * (k + 1))[k] if diverged and by_ids and k < len(r.get("margin") or []) else None
+        margin = None
+        if diverged and by_ids and k < len(r.get("margin") or []):
+            margin = r["margin"][k]
+        elif diverged and not by_ids and r.get("tokens") and r.get("margin"):
+            # text comparison (Ollama returns pieces, no ids): the reference token that covers
+            # the first differing character is the position whose top-2 margin decides near-tie
+            pos, kt = 0, None
+            for j, piece in enumerate(r["tokens"]):
+                pos += len(piece or "")
+                if pos > k:
+                    kt = j
+                    break
+            if kt is not None and kt < len(r["margin"]):
+                margin = r["margin"][kt]
         if not diverged:
             verdict = "identical"
         elif margin is not None and margin < margin_thr:
@@ -141,7 +178,7 @@ def thresholds_from_floor(floor, proposal=None):
         return dict(prop, calibrated=False)
     return {"e1_mean": max(3 * floor.get("e1_mean", 0.0), PRINT_UNIT), "e1_max": max(3 * floor.get("e1_max", 0.0), 10 * PRINT_UNIT),
             "top1": min(prop["top1"], 1.0 - 3 * floor.get("e1_top1_disagree", 0.0)) if floor.get("e1_top1_disagree") is not None else prop["top1"],
-            "kl": prop["kl"], "e2_rel": max(3 * floor.get("e2_rel", 0.0), 1e-6), "calibrated": True}
+            "kl": max(3 * floor.get("kl", 0.0), prop["kl"]), "e2_rel": max(3 * floor.get("e2_rel", 0.0), 1e-6), "calibrated": True}
 
 
 # ---- report ----------------------------------------------------------------------------
@@ -171,7 +208,9 @@ def write_report(out_dir, R):
     th = R.get("thresholds", {})
     L += ["## Noise floor and thresholds", ""]
     if fl:
-        L += [f"- floor E1: mean |ΔNLL| {fmt(fl.get('e1_mean'))}, max {fmt(fl.get('e1_max'))}, top-1 disagreement {fmt(fl.get('e1_top1_disagree'))}; E2 |ΔPPL|/PPL {fmt(fl.get('e2_rel'))} ({', '.join(fl.get('samples', []))})"]
+        for name, f1 in (fl.get("per_sample") or {}).items():
+            L.append(f"- floor sample {name}: mean |ΔNLL| {fmt(f1.get('e1_mean'))}, max {fmt(f1.get('e1_max'))}, top-1 disagreement {fmt(f1.get('e1_top1_disagree'))}, KL {fmt(f1.get('kl'))}; E2 |ΔPPL|/PPL {fmt(f1.get('e2_rel'))}")
+        L += [f"- floor E1 (max over samples): mean |ΔNLL| {fmt(fl.get('e1_mean'))}, max {fmt(fl.get('e1_max'))}, top-1 disagreement {fmt(fl.get('e1_top1_disagree'))}, KL {fmt(fl.get('kl'))}; E2 |ΔPPL|/PPL {fmt(fl.get('e2_rel'))} ({', '.join(fl.get('samples', []))})"]
     else:
         L += ["- no floor measured (proposal values of spec §4.1 used)"]
     L += [f"- thresholds ({'calibrated' if th.get('calibrated') else 'proposal'}): E1 mean ≤ {fmt(th.get('e1_mean'))}, max ≤ {fmt(th.get('e1_max'))}, top-1 ≥ {fmt(th.get('top1'))}, KL ≤ {fmt(th.get('kl'))}; E2 |ΔPPL|/PPL ≤ {fmt(th.get('e2_rel'))}", ""]

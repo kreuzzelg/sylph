@@ -47,6 +47,8 @@ typedef struct {
     char dir[2048], stem[256];/* GGUF: directory and stem (sidecars live in <dir>/.coli-<stem>/) */
     /* geometry for the value-head un-permutations (GGUF only; from ts_cfg) */
     int vh, vk, vdim, kdim, convk;
+    int v_perm;               /* 1: the file carries llama.cpp's value-head order (un-permute at load);
+                               * 0: `<arch>.ssm.v_head_reordered = false` -- HF order, nothing to undo */
     int n_layers, nextn;      /* trunk blocks and skipped NextN blocks */
     int n_attn;               /* attention blocks (set by cfg_from_gguf; for the startup line) */
     /* FR-30 statistics: every expert slice read goes through ts_read_expert_slice */
@@ -62,8 +64,15 @@ static void ts_sidecar_dir(const TensorSource *ts, char *out, size_t cap) {
     else snprintf(out, cap, "%.2000s", ts->path);
 }
 
-/* A .gguf file (single or split part), or a directory that holds *.gguf and no
+/* A .gguf file (single or split part), a file that starts with the GGUF magic
+ * whatever its name (Ollama keeps its models as `blobs/sha256-<digest>`, the
+ * owner's reference file, 2026-10-14), or a directory that holds *.gguf and no
  * config.json (a container directory always has one). */
+static int ts_file_has_gguf_magic(const char *path) {
+    FILE *f = fopen(path, "rb"); if (!f) return 0;
+    char m[4]; size_t n = fread(m, 1, 4, f); fclose(f);
+    return n == 4 && !memcmp(m, "GGUF", 4);
+}
 static int ts_is_gguf_path(const char *path) {
     struct stat sb;
     if (!path || stat(path, &sb)) return 0;
@@ -76,7 +85,8 @@ static int ts_is_gguf_path(const char *path) {
         closedir(d); return found;
     }
     size_t n = strlen(path);
-    return n > 5 && !strcasecmp(path + n - 5, ".gguf");
+    if (n > 5 && !strcasecmp(path + n - 5, ".gguf")) return 1;
+    return S_ISREG(sb.st_mode) && ts_file_has_gguf_magic(path);
 }
 
 static void ts_split_path(TensorSource *ts) {
@@ -111,6 +121,14 @@ static void ts_init_arch(TensorSource *ts, shards *S, const char *snap, const ch
         fprintf(stderr, "[GGUF] %s: general.architecture is '%s'; this engine reads %s (%s) -- refusing\n", snap, arch ? arch : "(missing)", want,
                 arch_id == TS_ARCH_GLM_DSA ? "GLM-5 / 5.2, engine colibri" : "Qwen3.5/3.6 MoE, engine qwen36"); exit(1);
     }
+    /* Value-head order of the DeltaNet tensors. llama.cpp's converter permutes them
+     * (architecture §7) and writes no key; Ollama's converter writes
+     * `qwen35moe.ssm.v_head_reordered` (true = the same permutation, verified against
+     * the owner's HF-named container on the qwen3.6:35b blob, 2026-10-14). Absent or
+     * true: un-permute at load; false: the file is in HF order already. */
+    ts->v_perm = 1;
+    { int64_t f; char key[96]; snprintf(key, sizeof key, "%s.ssm.v_head_reordered", want);
+      if (gguf_kv_i64(&ts->G, key, &f)) ts->v_perm = f != 0; }
 }
 static void ts_init(TensorSource *ts, shards *S, const char *snap, const char *extra_dirs) { ts_init_arch(ts, S, snap, extra_dirs, TS_ARCH_QWEN35MOE); }
 /* the arch's name table: HF name -> GGUF name + transform (qwen35_names.h / glm_names.h) */
@@ -128,6 +146,7 @@ typedef struct {
     char gname[256];
 } TsTensor;
 
+static int ts_perm_needed(int xform);
 static int ts_find(TensorSource *ts, const char *hf, TsTensor *t) {
     memset(t, 0, sizeof *t); t->type = -1; t->layer = -1; t->expert = -1;
     if (!ts->gguf) {
@@ -138,7 +157,31 @@ static int ts_find(TensorSource *ts, const char *hf, TsTensor *t) {
     t->xform = ts_name_to_gguf(ts, hf, t->gname, sizeof t->gname, &t->layer, &t->expert);
     if (t->xform < 0) return -1;
     t->gt = gguf_find(&ts->G, t->gname);
-    if (!t->gt) return -1;
+    if (!t->gt) {
+        /* Converter spellings differ in the suffix only: llama.cpp writes
+         * `blk.N.ssm_dt.bias`, Ollama's converter `blk.N.ssm_dt` (the owner's
+         * qwen3.6:35b blob, 2026-10-14). Try the name without `.bias`/`.weight`,
+         * then with the other suffix; the transform is the table's. */
+        char alt[256]; size_t n = strlen(t->gname);
+        const char *suf[] = { ".bias", ".weight" };
+        for (int s = 0; s < 2 && !t->gt; s++) {
+            size_t l = strlen(suf[s]);
+            if (n > l && !strcmp(t->gname + n - l, suf[s])) {
+                snprintf(alt, sizeof alt, "%.*s", (int)(n - l), t->gname);
+                t->gt = gguf_find(&ts->G, alt);
+                if (!t->gt) { snprintf(alt, sizeof alt, "%.*s%s", (int)(n - l), t->gname, suf[1 - s]); t->gt = gguf_find(&ts->G, alt); }
+            }
+        }
+        if (!t->gt) { snprintf(alt, sizeof alt, "%s.weight", t->gname); t->gt = gguf_find(&ts->G, alt); }
+        if (!t->gt) return -1;
+        snprintf(t->gname, sizeof t->gname, "%s", alt);
+    }
+    /* HF head order already (v_head_reordered = false): the permutations are the identity,
+     * ssm_a still needs log(-a). */
+    if (!ts->v_perm) {
+        if (t->xform == QN_X_SSM_A) t->xform = QN_X_SSM_A_NOPERM;
+        else if (ts_perm_needed(t->xform)) t->xform = QN_X_NONE;
+    }
     t->type = t->gt->type;
     int64_t n = 1; for (int d = 0; d < t->gt->n_dims; d++) n *= t->gt->ne[d];
     if (t->expert >= 0) {               /* one slice of the 3-D expert tensor */
@@ -211,6 +254,9 @@ static void ts_read_f32(TensorSource *ts, const char *hf, float *out, int64_t nu
         gx_unperm_elems_f32(out, tmp, ts->vh, ts->vk);
         if (gx_alog_from_a(out, t.numel)) { fprintf(stderr, "[GGUF] %s holds non-negative entries; expected -exp(A_log) -- refusing\n", t.gname); exit(1); }
         break;
+    case QN_X_SSM_A_NOPERM:     /* HF head order in the file: only the value transform */
+        if (gx_alog_from_a(out, t.numel)) { fprintf(stderr, "[GGUF] %s holds non-negative entries; expected -exp(A_log) -- refusing\n", t.gname); exit(1); }
+        break;
     case QN_X_PERM_HEAD_ELEMS:
         ts_need_perm(ts, hf);
         if (t.numel != ts->vh) { fprintf(stderr, "[GGUF] %s has %lld entries, %d value heads expected\n", t.gname, (long long)t.numel, ts->vh); exit(1); }
@@ -267,12 +313,31 @@ static int ts_read_raw_rows(TensorSource *ts, const char *hf, int I, int O, uint
     if (!ts->gguf) return -1;
     TsTensor t;
     if (ts_find(ts, hf, &t)) ts_refuse_missing(ts, hf);
-    if (!gq_supported(t.type) || t.type == GQ_F32 || t.type == GQ_F16 || t.type == GQ_BF16 || t.expert >= 0 || ts_perm_needed(t.xform)) return -1;
+    if (!gq_supported(t.type) || t.type == GQ_F32 || t.type == GQ_F16 || t.type == GQ_BF16 || t.expert >= 0) return -1;
+    /* Row-block permutations (attn_qkv, attn_gate, ssm_alpha/beta) move whole rows and are
+     * lossless on any block type; a column permutation (ssm_out) needs the value-head width
+     * to be a multiple of the block (256 for K-quants: never for vdim 128), so that one
+     * goes to the caller's exact f32 path. Before 2026-10-14 every permuted matrix did,
+     * and a K-quant file like Ollama's qwen3.6:35b blob (Q4_K DeltaNet projections) then
+     * re-quantized them to int8 at load -- against NFR-3. */
+    int rowperm = t.xform == QN_X_PERM_HEAD_ROWS || t.xform == QN_X_PERM_QKV_ROWS;
+    if (ts_perm_needed(t.xform) && !rowperm) return -1;
     if (t.gt->ne[0] != I || (t.gt->n_dims > 1 ? t.gt->ne[1] : 1) != O) { fprintf(stderr, "[GGUF] %s: shape {%lld,%lld}, config implies {%d,%d} -- refusing\n", t.gname, (long long)t.gt->ne[0], (long long)(t.gt->n_dims > 1 ? t.gt->ne[1] : 1), I, O); exit(1); }
-    size_t n = gq_row_bytes(t.type, I) * (size_t)O;
-    *dst = malloc(n); if (!*dst) { fprintf(stderr, "OOM reading %s\n", hf); exit(1); }
-    ts_pread(ts, t.gt->file, t.gt->off, *dst, n, t.gname);
-    *nbytes = n; return 0;
+    if (rowperm) ts_need_perm(ts, hf);
+    size_t rb = gq_row_bytes(t.type, I), n = rb * (size_t)O;
+    uint8_t *raw = malloc(n), *fix = rowperm ? malloc(n) : raw;
+    if (!raw || !fix) { fprintf(stderr, "OOM reading %s\n", hf); exit(1); }
+    ts_pread(ts, t.gt->file, t.gt->off, raw, n, t.gname);
+    if (t.xform == QN_X_PERM_HEAD_ROWS) {
+        if (O % ts->vh) { fprintf(stderr, "[GGUF] %s: %d rows are not %d value heads\n", t.gname, O, ts->vh); exit(1); }
+        gx_unperm_rowblocks(fix, raw, O, rb, 0, ts->vh, ts->vk, O / ts->vh);
+    } else if (t.xform == QN_X_PERM_QKV_ROWS) {
+        int64_t off = 2LL * ts->vk * ts->kdim;
+        if (O != off + (int64_t)ts->vh * ts->vdim) { fprintf(stderr, "[GGUF] %s: %d rows != 2*vk*kdim + vh*vdim (%lld)\n", t.gname, O, (long long)(off + (int64_t)ts->vh * ts->vdim)); exit(1); }
+        gx_unperm_rowblocks(fix, raw, O, rb, off, ts->vh, ts->vk, ts->vdim);
+    }
+    if (fix != raw) free(raw);
+    *dst = fix; *nbytes = n; return 0;
 }
 
 /* ---- routed experts ------------------------------------------------------------------------ */
@@ -334,12 +399,17 @@ static size_t ts_expert_bytes(const TsExpert *e) { return e->bytes[0] + e->bytes
  * (qwen36_mtp.md: the Qwen engine reports it and does not use it; colibri.c loads it).
  * `embd_mode` and `out_kernel` are the engine's decisions (it knows its env and kernels);
  * everything else is read off the index. */
+/* Vision-tower tensors of a multimodal file (`v.*`, `mm.*`, llama.cpp's mmproj names;
+ * Ollama embeds them in the text GGUF): never requested by the text engines, kept out
+ * of the dense accounting. */
+static inline int ts_is_vision_name(const char *n) { return !strncmp(n, "v.", 2) || !strncmp(n, "mm.", 3); }
 static void ts_describe(TensorSource *ts, char *buf, size_t cap, const char *embd_mode, const char *out_kernel, size_t slot_bytes, const char *nextn_clause) {
     if (!ts->gguf) { snprintf(buf, cap, "safetensors container %.900s", ts->path); return; }
-    int cnt[GGML_TYPE_COUNT] = {0}; int64_t dense = 0, experts = 0, n_exp = 0;
+    int cnt[GGML_TYPE_COUNT] = {0}; int64_t dense = 0, experts = 0, n_exp = 0, vision = 0, n_vision = 0;
     for (int64_t i = 0; i < ts->G.nt; i++) {
         GgufTensor *t = &ts->G.t[i]; const char *n = gguf_tensor_name(&ts->G, t);
-        if (strstr(n, "_exps.")) { experts += t->nbytes > 0 ? t->nbytes : 0; if (t->n_dims == 3 && !n_exp) n_exp = t->ne[2]; }
+        if (ts_is_vision_name(n)) { vision += t->nbytes > 0 ? t->nbytes : 0; n_vision++; }   /* never read by the text engines */
+        else if (strstr(n, "_exps.")) { experts += t->nbytes > 0 ? t->nbytes : 0; if (t->n_dims == 3 && !n_exp) n_exp = t->ne[2]; }
         else { dense += t->nbytes > 0 ? t->nbytes : 0; if (t->type >= 0 && t->type < GGML_TYPE_COUNT) cnt[t->type]++; }
     }
     TsExpert e; const char *tg = "?", *tu = "?", *td = "?";
@@ -354,6 +424,7 @@ static void ts_describe(TensorSource *ts, char *buf, size_t cap, const char *emb
     if (w < (int)cap) w += snprintf(buf + w, cap - (size_t)w, " %.2f GB · token_embd %s %s · output %s %s%s%s · experts on CPU (gq_moe_run) · sidecars %s",
                                     dense / 1073741824.0, emb ? gguf_type_name(emb->type) : "?", embd_mode, outw ? gguf_type_name(outw->type) : "?", out_kernel,
                                     nextn_clause ? " · " : "", nextn_clause ? nextn_clause : "", side);
+    if (n_vision && w < (int)cap) w += snprintf(buf + w, cap - (size_t)w, " · vision tower %lld tensors %.2f GB ignored (text engine)", (long long)n_vision, vision / 1073741824.0);
 }
 
 #endif /* COLI_SRC_H */

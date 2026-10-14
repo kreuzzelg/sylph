@@ -392,7 +392,8 @@ and the CPU/GPU execution split.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `COLI_DENSE_I8` | `1` (on) | Quantize resident dense matrices to per-row int8 at startup. `=0` keeps the f32 reference path for quality A/Bs. |
+| `COLI_DENSE_I8` | `1` (on) | Quantize resident dense matrices to per-row int8 at startup. `=0` keeps the f32 reference path for quality A/Bs. **sylph, GGUF source:** the default is **off** — the float dense tensors of a GGUF (router, shared-expert gate, any F16/BF16 matrix) stay exact so the default configuration is what llama.cpp computes (spec §4.2); `=1` opts into the int8-at-load as a named deviation. Quantized GGUF tensors never go through this knob (Q8_0 split, K-quants raw). |
+| `COLI_GGUF_RAW` | `1` (on) | **sylph, GGUF only:** hand quantized dense matrices over as stored (`Q8_0` → lossless split, K-quants → `gq_matmul`). `=0` decodes them to exact f32 at load (A/B of the block kernels against `matmul_d`; ~1.5 GB more RSS on the 35B). |
 | `SNAP=<file.gguf>` / `<dir of parts>` | — | **sylph:** a llama.cpp `qwen35moe` GGUF (Qwen3.5/3.6 MoE) as the model source instead of a container directory; config, tokenizer and stop tokens come from the metadata, routed experts stream as raw ggml blocks (`docs/gguf.md`). Sidecars of a GGUF model live in `<dir>/.coli-<stem>/`, never beside the file. |
 | `COLI_GGUF_EMBED` | `1` (on) | **sylph, GGUF only:** decode each prompt token's `token_embd` row from the stored blocks (`gq_embed_row`) instead of holding an f32 table (2 GB less RSS on the 35B). `=0` restores the f32 table at load; both give bit-identical log-probs (A/B knob). |
 | `PPL_DUMP` | unset | **sylph:** with `PPL=1`, write one line per scored position (`pos\ttarget\tlogprob\t<logprob tail>`, the serve channel's `logprobs` format) — the E1 input of the equivalence harness (`07_Tests/SystemTest/equivalence.md`). |

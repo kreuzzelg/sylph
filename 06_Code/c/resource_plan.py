@@ -92,7 +92,7 @@ def _analyze_gguf(resolved, model):
     summary = ggufinfo.summarize(parts)
     expert_groups, dense_bytes, trunk_bytes = {}, 0, 0
     for t in ggufinfo.all_tensors(parts):
-        if not t.nbytes:
+        if not t.nbytes or ggufinfo.VISION_RE.match(t.name):   # the vision tower is never loaded
             continue
         m = ggufinfo.EXPERT_RE.match(t.name)
         if m and len(t.ne) >= 3 and t.ne[2] > 0:

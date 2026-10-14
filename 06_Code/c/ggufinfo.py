@@ -60,6 +60,9 @@ ENGINE_ARCHS = {"qwen35moe": "qwen36", "glm-dsa": "glm"}
 
 SPLIT_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$")
 EXPERT_RE = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
+# vision-tower tensors of a multimodal file (llama.cpp's mmproj names; Ollama embeds them
+# in the text GGUF): the text engines never read them, so they are neither dense nor expert
+VISION_RE = re.compile(r"^(v|mm)\.")
 INDEXER_RE = re.compile(r"^blk\.(\d+)\.indexer\.attn_k\.weight$")
 
 
@@ -257,10 +260,18 @@ def read_part(path, keep_kv=True):
 
 
 def is_gguf_source(path):
-    """True for a .gguf file or a directory that holds .gguf files (and no config.json)."""
+    """True for a .gguf file, a file that starts with the GGUF magic whatever its name
+    (Ollama's `blobs/sha256-<digest>`, the owner's reference file, 2026-10-14), or a
+    directory that holds .gguf files (and no config.json)."""
     p = Path(path)
     if p.is_file():
-        return p.suffix.lower() == ".gguf"
+        if p.suffix.lower() == ".gguf":
+            return True
+        try:
+            with open(p, "rb") as fh:
+                return fh.read(4) == b"GGUF"
+        except OSError:
+            return False
     if p.is_dir():
         return not (p / "config.json").exists() and any(p.glob("*.gguf"))
     return False
@@ -350,9 +361,14 @@ def summarize(parts):
     mix = {}
     unknown, unsupported = [], []
     total = 0
+    vision_bytes, vision_tensors = 0, 0
     for t in tensors:
         if t.type not in GGML_TYPES:
             unknown.append({"name": t.name, "type": t.type})
+            continue
+        if VISION_RE.match(t.name):
+            vision_bytes += t.nbytes
+            vision_tensors += 1
             continue
         entry = mix.setdefault(t.type_name, {"bytes": 0, "tensors": 0})
         entry["bytes"] += t.nbytes
@@ -410,6 +426,8 @@ def summarize(parts):
         "experts_per_layer": experts_per_layer,
         "expert_bytes": expert_bytes,
         "dense_bytes": total - expert_bytes,
+        "vision_bytes": vision_bytes,
+        "vision_tensors": vision_tensors,
         "typical_expert_bytes": int(statistics.median(per_layer.values())) if per_layer else 0,
         "mtp": mtp,
         "indexer_layers": indexer_layers,
@@ -465,6 +483,8 @@ def format_inspect(parts, summary, tensors=False):
         lines.append(f"experts       {summary['expert_layers']} MoE layers × {summary['experts_per_layer']} experts · "
                      f"{_fmt_bytes(summary['typical_expert_bytes'])} per expert · {_fmt_bytes(summary['expert_bytes'])} total")
         lines.append(f"dense         {_fmt_bytes(summary['dense_bytes'])} resident")
+        if summary.get("vision_tensors"):
+            lines.append(f"vision        {summary['vision_tensors']} tensors · {_fmt_bytes(summary['vision_bytes'])} (ignored by the text engine)")
     mtp = summary["mtp"]
     lines.append(f"layers        {summary['trunk_layers']} trunk + {summary['nextn_predict_layers'] or 0} nextn (block_count {summary['block_count']})")
     lines.append(f"mtp           {'blk.%d nextn · eh_proj %s (%.2f bpw)' % (mtp['layer'], mtp['eh_proj_type'], mtp['eh_proj_bits']) if mtp else 'absent'}")

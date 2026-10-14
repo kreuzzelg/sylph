@@ -155,7 +155,7 @@ def run_real(a):
     levels = set(a.levels.upper().split(","))
     model = Path(a.model)
     R = {"mode": "real", "title": f"{model.name} — sylph vs llama.cpp" + (" vs Ollama" if a.ollama else ""), "model": {"path": str(model), "inspect": inspect_summary(model)},
-         "versions": {"llama.cpp": rl.version(a.llama)}, "host": host_info(), "cap": a.cap, "threads": a.threads}
+         "versions": {"llama.cpp": rl.version(a.llama) if a.llama else "not given"}, "host": host_info(), "cap": a.cap, "threads": a.threads}
     sha = out / "model.sha256"
     if not sha.exists() or a.force:
         log("sha256 of the model (once)…"); sha.write_text(sr.sha256_file(model))
@@ -175,33 +175,58 @@ def run_real(a):
         gate_text = Path(a.text)
     else:
         gate_text.write_text("\n".join(p["text"] for p in prompts) + "\n", encoding="utf-8")
-    log("tokenizer gate…")
-    ids_llama = rl.tokenize(a.llama, model, gate_text, add_bos=False)
-    ids_sylph = sr.encode(model, gate_text)
-    first_bad = next((i for i, (x, y) in enumerate(zip(ids_sylph, ids_llama)) if x != y), None)
-    gate = {"pass": ids_sylph == ids_llama, "n_ids": len(ids_llama), "n_sylph": len(ids_sylph), "first_mismatch": first_bad}
-    R["tokenizer_gate"] = gate
-    if not gate["pass"]:
-        R["verdict"] = {"gate": False}; compare.write_report(out, R)
-        log(f"tokenizer gate FAILED: sylph {len(ids_sylph)} ids, llama {len(ids_llama)}, first mismatch at {first_bad} — E1–E3 would compare different inputs; stopping")
-        return 1
-    log(f"tokenizer gate pass: {len(ids_llama)} ids identical")
+    if not a.llama:
+        # Ollama-only run (the owner's blob is Ollama's own conversion; upstream llama.cpp
+        # refuses it: `rope.dimension_sections has wrong array length`, 2026-10-14). Without
+        # llama-tokenize there is no id-level gate; E3 against Ollama compares decoded text.
+        if levels & {"E1", "E2"}:
+            sys.exit("--llama <dir> is needed for the tokenizer gate and E1/E2 (llama-perplexity); without it only --levels E3 --ollama runs")
+        R["tokenizer_gate"] = {"pass": None, "skipped": "no llama.cpp given: no id-level gate, E3 compared by text"}
+        log("tokenizer gate skipped (no llama.cpp)")
+    else:
+        log("tokenizer gate…")
+        ids_llama = rl.tokenize(a.llama, model, gate_text, add_bos=False)
+        ids_sylph = sr.encode(model, gate_text)
+        first_bad = next((i for i, (x, y) in enumerate(zip(ids_sylph, ids_llama)) if x != y), None)
+        gate = {"pass": ids_sylph == ids_llama, "n_ids": len(ids_llama), "n_sylph": len(ids_sylph), "first_mismatch": first_bad}
+        R["tokenizer_gate"] = gate
+        if not gate["pass"]:
+            # keep both id streams: the diff names the pieces (how the uclass gap was found)
+            (out / "gate_ids_llama.txt").write_text(" ".join(map(str, ids_llama)) + "\n")
+            (out / "gate_ids_sylph.txt").write_text(" ".join(map(str, ids_sylph)) + "\n")
+            R["verdict"] = {"gate": False}; compare.write_report(out, R)
+            log(f"tokenizer gate FAILED: sylph {len(ids_sylph)} ids, llama {len(ids_llama)}, first mismatch at {first_bad} — E1–E3 would compare different inputs; stopping (ids in {out}/gate_ids_*.txt)")
+            return 1
+        log(f"tokenizer gate pass: {len(ids_llama)} ids identical")
     floor = None; th = compare.thresholds_from_floor(None)
     if levels & {"E1", "E2"}:
         if not a.text:
             sys.exit("--text <wiki.test.raw> is needed for E1/E2")
         # -- noise floor: llama.cpp vs itself at two thread counts (+ CUDA build) --
         log("noise floor: llama-perplexity -t 1 vs -t <cores>…")
-        base = rl.perplexity(a.llama, model, a.text, a.chunks, out / "llama" / "t1", threads=1, force=a.force)
-        many = rl.perplexity(a.llama, model, a.text, a.chunks, out / "llama" / "tN", threads=a.threads or os.cpu_count(), force=a.force)
+        # `-ngl 0 -dev none` pins the two floor samples to the CPU even when the llama.cpp build
+        # has CUDA (it would still reserve compute buffers on the GPU); --llama-cuda may then
+        # name the same build directory (owner's host, 2026-10-14)
+        base = rl.perplexity(a.llama, model, a.text, a.chunks, out / "llama" / "t1", threads=1, extra=["-ngl", "0", "-dev", "none"], force=a.force)
+        many = rl.perplexity(a.llama, model, a.text, a.chunks, out / "llama" / "tN", threads=a.threads or os.cpu_count(), extra=["-ngl", "0", "-dev", "none"], force=a.force)
         samples = [f"-t 1 vs -t {a.threads or os.cpu_count()}"]
         e1f = compare.e1_compare(merge_dumps(base["dumps"]), merge_dumps(many["dumps"]))
-        floor = {"e1_mean": e1f["mean"], "e1_max": e1f["max"], "e1_top1_disagree": 1 - (e1f.get("top1") or 1), "e2_rel": abs(many["ppl"] - base["ppl"]) / base["ppl"]}
+        klf = compare.kl_exact(base["full0"], many["full0"]) if base.get("full0") and many.get("full0") else None
+        floor = {"e1_mean": e1f["mean"], "e1_max": e1f["max"], "e1_top1_disagree": 1 - (e1f.get("top1") or 1), "e2_rel": abs(many["ppl"] - base["ppl"]) / base["ppl"],
+                 "kl": klf["mean"] if klf else 0.0}
+        floor["per_sample"] = {samples[0]: dict(floor)}   # each sample on its own, before the max is taken
         if a.llama_cuda:
-            cuda = rl.perplexity(a.llama_cuda, model, a.text, a.chunks, out / "llama" / "cuda", threads=a.threads, extra=["-ngl", "99"], force=a.force)
+            # no -ngl: llama.cpp's default fits as many layers as the card(s) hold (a 22 GB file on
+            # an 8 GB RTX 3070 is a CPU/GPU mix, exactly Ollama's situation); `-ngl 99` was an OOM
+            cuda = rl.perplexity(a.llama_cuda, model, a.text, a.chunks, out / "llama" / "cuda", threads=a.threads, force=a.force)
             e1c = compare.e1_compare(merge_dumps(base["dumps"]), merge_dumps(cuda["dumps"]))
+            per = floor["per_sample"]
+            klc = compare.kl_exact(base["full0"], cuda["full0"]) if base.get("full0") and cuda.get("full0") else None
+            per["CPU vs CUDA"] = {"e1_mean": e1c["mean"], "e1_max": e1c["max"], "e1_top1_disagree": 1 - (e1c.get("top1") or 1), "e2_rel": abs(cuda["ppl"] - base["ppl"]) / base["ppl"], "ppl_cuda": cuda["ppl"],
+                                  "kl": klc["mean"] if klc else None}
             floor = {"e1_mean": max(floor["e1_mean"], e1c["mean"]), "e1_max": max(floor["e1_max"], e1c["max"]),
-                     "e1_top1_disagree": max(floor["e1_top1_disagree"], 1 - (e1c.get("top1") or 1)), "e2_rel": max(floor["e2_rel"], abs(cuda["ppl"] - base["ppl"]) / base["ppl"])}
+                     "e1_top1_disagree": max(floor["e1_top1_disagree"], 1 - (e1c.get("top1") or 1)), "e2_rel": max(floor["e2_rel"], abs(cuda["ppl"] - base["ppl"]) / base["ppl"]),
+                     "kl": max(floor["kl"], klc["mean"] if klc else 0.0), "per_sample": per}
             samples.append("CPU vs CUDA")
         floor["samples"] = samples
         th = compare.thresholds_from_floor(floor)
@@ -261,7 +286,10 @@ def run_real(a):
             R.setdefault("deviations", {}).setdefault(dev, {})["e3"] = e3d
         # llama-server (ids + margins), fallback llama-cli (text)
         gens_l = []
-        try:
+        if not a.llama:
+            pass
+        else:
+          try:
             server = rl.Server(a.llama, model, port=a.port, threads=a.threads)
             try:
                 for i, p in enumerate(prompts):
@@ -270,14 +298,15 @@ def run_real(a):
                     log(f"llama-server E3 prompt {i}: {len(g['ids'])} ids")
             finally:
                 server.close()
-        except SystemExit as ex:
+          except SystemExit as ex:
             log(f"llama-server unavailable ({ex}); falling back to llama-cli text")
             for i, p in enumerate(prompts):
                 text = CHAT_TEMPLATE.format(p["text"]) if p["chat"] else p["text"]
                 g = rl.generate_cli(a.llama, model, text, a.n_predict, threads=a.threads); g["prompt"] = i; g["engine"] = "llama-cli"; gens_l.append(g)
-        (out / "e3_llama.jsonl").write_text("\n".join(json.dumps(g) for g in gens_l) + "\n")
-        e3l = compare.e3_compare(gens_l, gens_s); e3l["pass"] = e3l["n_ok"] >= math.ceil(0.95 * e3l["n"])
-        R["E3"][gens_l[0]["engine"] if gens_l else "llama.cpp"] = e3l; verdict["E3"] = e3l["pass"]
+        if gens_l:
+            (out / "e3_llama.jsonl").write_text("\n".join(json.dumps(g) for g in gens_l) + "\n")
+            e3l = compare.e3_compare(gens_l, gens_s); e3l["pass"] = e3l["n_ok"] >= math.ceil(0.95 * e3l["n"])
+            R["E3"][gens_l[0]["engine"]] = e3l; verdict["E3"] = e3l["pass"]
         if a.ollama:
             import ref_ollama as ro
             gens_o = []
@@ -312,8 +341,8 @@ def main(argv=None):
         if not a.torch_ref:
             sys.exit("--ci needs --torch-ref <dir with ref_full.json, ref_logprobs.tsv, windows/>")
         return run_ci(a)
-    if not a.llama:
-        sys.exit("--llama <llama.cpp bin dir> is required (or --ci)")
+    if not a.llama and not a.ollama:
+        sys.exit("--llama <llama.cpp bin dir> and/or --ollama <url> --tag <tag> is required (or --ci)")
     return run_real(a)
 
 

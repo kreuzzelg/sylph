@@ -3,3 +3,4 @@
 07_Tests/**/tmp_*/
 __pycache__/
 *.pyc
+08_Documents/**/*_work/

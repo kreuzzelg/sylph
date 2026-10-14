@@ -15,7 +15,14 @@ coli chat   --model ~/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf    # also serve / we
 ```
 
 `--model` may be the file, the first part of a split set, or a directory holding the
-parts. The engine prints one line that says what runs where:
+parts. A file is recognised by its `.gguf` suffix **or by the `GGUF` magic**, so Ollama's
+store works directly (`ollama show <tag> --modelfile` → `FROM /usr/share/ollama/.ollama/models/blobs/sha256-…`;
+that blob is the file the owner's `qwen3.6:35b` runs). Ollama writes its own conversion of
+Qwen3.6, not llama.cpp's: `attention.head_count_kv` as one entry per block, `blk.N.ssm_dt`
+without `.bias`, the key `ssm.v_head_reordered` (true = llama.cpp's value-head order,
+verified against the HF checkpoint), `token_embd` in `Q4_K`, and the vision tower embedded
+(`v.*`, `mm.*`, 441 tensors, 0.83 GB) — all handled since 2026-10-14; the vision tensors are
+never read and are reported as ignored. The engine prints one line that says what runs where:
 
 ```
 [GGUF] qwen35moe · 40 blocks (10 attention) · 1 part · experts Q4_K/Q4_K/Q5_K 1.90 MB each × 256 × 40 = 19.6 GB
@@ -33,8 +40,8 @@ next to the expert-cache hit rate.
 | architecture | `qwen35moe` (engine `qwen36`) and, since phase 6, `glm-dsa` (GLM-5 / 5.2, engine `colibri`, see below); anything else is refused by name. A Qwen NextN/MTP block is detected and reported (`nextn blk.L eh_proj <type> (<bpw> bpw) present, not used`), never read |
 | tensor types | `F32`, `F16`, `BF16`, `Q4_0`, `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K` (everything in the public `Q4_K_M` files); anything else is refused by name |
 | routed experts | streamed from the file as raw ggml blocks into the LRU expert cache (`--cap` slots per layer), computed on the CPU by `gq_moe_run`; `PILOT`, `HOT`/`PIN`, pins work as for containers |
-| dense matrices | `Q8_0` → lossless int8 plane + per-32 scales on upstream's kernels; K-quants → `gq_matmul`; f32/f16/bf16 → the container's int8-at-load path (`COLI_DENSE_I8=0` for exact f32) |
-| tokenizer | from `tokenizer.ggml.*` (`pre = qwen35`); identical ids to Qwen's `tokenizer.json` on the test corpus |
+| dense matrices | `Q8_0` → lossless int8 plane + per-32 scales on upstream's kernels; K-quants → `gq_matmul` (row-permuted DeltaNet projections are un-permuted on the raw rows; the column-permuted `ssm_out` of a K-quant file is decoded to exact f32); f32/f16/bf16 (router, shared-expert gate) stay **exact f32 by default** on a GGUF source — `COLI_DENSE_I8=1` opts into the container's int8-at-load as a named deviation; `COLI_GGUF_RAW=0` decodes every quantized dense matrix to f32 for an A/B |
+| tokenizer | from `tokenizer.ggml.*` (`pre = qwen35`); Unicode general categories from `unicode_cat.h` (Unicode 15); identical ids to Qwen's `tokenizer.json` on the test corpus and to `llama-tokenize --no-escape` on wikitext-2 (297 193 ids) and the corpus |
 | sidecars | `<dir>/.coli-<stem>/` — nothing is ever written beside the `.gguf` |
 | GPU | `COLI_CUDA=1` on a CUDA build (`make qwen36 CUDA=1`): the hot experts go to VRAM as the raw ggml blocks they are (`Q8_0`/`Q4_K`/`Q5_K`/`Q6_K`, backend formats 16 + type), computed by kernels that reproduce the CPU reference bit for bit; the dense trunk is placed by the same auto-placer as for containers (`output`, DeltaNet projections, attention, shared expert, as stored; a `Q8_0` split is re-joined). `coli plan --gpu 0` prices the trunk and the expert budget (`VRAM … trunk + … hot tier · ~N experts`). A CPU-only build says `COLI_CUDA=1 ignored: built without CUDA`; a type without a kernel is refused by name. Measured on the RTX 3070: `07_Tests/SystemTest/gpu_rtx3070.md` |
 

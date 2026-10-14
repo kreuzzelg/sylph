@@ -52,3 +52,4 @@ qwen36
 shaders/attention_absorb.spv
 shaders/qmatmul_gate_up.spv
 shaders/rmsnorm.spv
+gq_cuda_test

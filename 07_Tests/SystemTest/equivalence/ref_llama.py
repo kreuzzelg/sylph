@@ -41,7 +41,9 @@ def version(llama_dir):
 
 
 def tokenize(llama_dir, model, text_path, add_bos=False):
-    cmd = [str(binary(llama_dir, "llama-tokenize")), "-m", str(model), "-f", str(text_path), "--ids", "--log-disable"]
+    # --no-escape: llama-tokenize would otherwise turn a literal `\x00` or `\\` in the text
+    # into the escaped byte before tokenizing (2 of the 52 corpus lines, 2026-10-14)
+    cmd = [str(binary(llama_dir, "llama-tokenize")), "-m", str(model), "-f", str(text_path), "--ids", "--log-disable", "--no-escape"]
     if not add_bos:
         cmd.append("--no-bos")
     r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")

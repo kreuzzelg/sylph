@@ -60,6 +60,7 @@ static int qwen36_max_ctx(void) {
 #include "serve_poll.h"       /* CANCEL a meta' turno (#1332) */
 #include "cli_args.h"
 #include "st.h"
+#include "unicode_cat.h"
 #include "src.h"          /* sylph: tensor-source façade (safetensors container | GGUF), gq.h kernels */
 #include "omp_tune.h"
 #include "kv_prefix.h"
@@ -122,36 +123,22 @@ static double jnum(jval *o,const char *k){ jval *v=json_get(o,k); return (v&&v->
 
 enum { U_W=0, U_L=1, U_M=2, U_N=3, U_P=4, U_O=5 };
 static int uclass(unsigned cp){
-    if (cp==0x20||cp==0x09||cp==0x0A||cp==0x0D||cp==0x0B||cp==0x0C) return U_W;
-    if (cp==0x00A0||cp==0x2000||cp==0x2001||cp==0x2002||cp==0x2003||cp==0x2004||cp==0x2005||cp==0x2006||cp==0x2007||cp==0x2008||cp==0x2009||cp==0x200A||cp==0x2028||cp==0x2029||cp==0x202F||cp==0x205F||cp==0x3000||cp==0xFEFF) return U_W;
-    if (cp>=0x30&&cp<=0x39) return U_N;
-    if (cp>=0xFF10&&cp<=0xFF19) return U_N;
-    if (cp>=0x0660&&cp<=0x0669) return U_N;
-    if ((cp>=0x41&&cp<=0x5A)||(cp>=0x61&&cp<=0x7A)) return U_L;
-    if (cp>=0x00C0&&cp<=0x024F) return U_L;
-    if (cp>=0x0400&&cp<=0x04FF) return U_L;
-    if (cp>=0x0600&&cp<=0x06FF) return U_L;
-    if (cp>=0x1F00&&cp<=0x1FFF) return U_L;
-    if (cp>=0x3040&&cp<=0x30FF) return U_L;
-    if (cp>=0x3400&&cp<=0x4DBF) return U_L;
-    if (cp>=0x4E00&&cp<=0x9FFF) return U_L;
-    if (cp>=0xAC00&&cp<=0xD7A3) return U_L;
-    if (cp>=0x300&&cp<=0x36F) return U_M;
-    if (cp>=0x1AB0&&cp<=0x1AFF) return U_M;
-    if (cp>=0x1DC0&&cp<=0x1DFF) return U_M;
-    if (cp>=0x20D0&&cp<=0x20FF) return U_M;
-    if (cp>=0xFE20&&cp<=0xFE2F) return U_M;
-    if (cp>=0x21&&cp<=0x2F) return U_P;
-    if (cp>=0x3A&&cp<=0x40) return U_P;
-    if (cp>=0x5B&&cp<=0x60) return U_P;
-    if (cp>=0x7B&&cp<=0x7E) return U_P;
-    if (cp>=0x3000&&cp<=0x303F) return U_P;
-    if (cp>=0xFF01&&cp<=0xFF0F) return U_P;
-    if (cp>=0xFF1A&&cp<=0xFF20) return U_P;
-    if (cp>=0xFF3B&&cp<=0xFF40) return U_P;
-    if (cp>=0xFF5B&&cp<=0xFF65) return U_P;
-    if (cp>=0x2010&&cp<=0x2027) return U_P;
-    if (cp>=0x2030&&cp<=0x205E) return U_P;
+    /* ASCII decided here; everything else by the Unicode general-category tables of
+     * unicode_cat.h (sylph, 2026-10-14). The former hand-written ranges stopped at
+     * U+024F for Latin and knew no \p{N} beyond the ASCII/Arabic/fullwidth digits, so
+     * "həd", "Cẩm" and "4 ½" tokenized differently from llama.cpp (the equivalence
+     * harness's tokenizer gate on wikitext-2 found 5 such pieces in 297 193). */
+    if (cp < 0x80) {
+        if (cp==0x20||cp==0x09||cp==0x0A||cp==0x0D||cp==0x0B||cp==0x0C) return U_W;
+        if (cp>=0x30&&cp<=0x39) return U_N;
+        if ((cp>=0x41&&cp<=0x5A)||(cp>=0x61&&cp<=0x7A)) return U_L;
+        if (cp>=0x21&&cp<=0x7E) return U_P;
+        return U_O;
+    }
+    if (ucat_is_WS(cp)) return U_W;
+    if (ucat_is_N(cp)) return U_N;
+    if (ucat_is_L(cp)) return U_L;
+    if (ucat_is_M(cp)) return U_M;
     return U_O;
 }
 /* A serving payload is byte-counted and may end in a truncated multibyte
@@ -1243,7 +1230,16 @@ static void pack_int4_g64_planar(const float *w, uint8_t *q4, float *sg, int O, 
 #ifdef COLI_QWEN_BATCH_TEST
 static uint64_t g_qwen_matmul_d_calls;
 #endif
-static int dense_i8_on(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_DENSE_I8"); v=!(e&&*e=='0'); } return v; }
+/* sylph: on a GGUF source the float dense tensors (router, shared-expert gate, any
+ * F16/BF16 matrix) stay exact by default -- the reference (llama.cpp) computes them in
+ * f32/f16, and spec §4.2 wants the default configuration to pass E1-E3 as-is;
+ * COLI_DENSE_I8=1 opts into the container's int8-at-load as a named deviation. The
+ * container keeps its default (on), NFR-5. Quantized GGUF tensors never go through this
+ * knob: Q8_0 is split losslessly, K-quants stay raw blocks (COLI_GGUF_RAW=0 forces the
+ * exact f32 decode for an A/B). */
+static int g_dense_i8_default = 1;
+static int dense_i8_on(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_DENSE_I8"); v=e&&*e?*e!='0':g_dense_i8_default; } return v; }
+static int gguf_raw_on(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_GGUF_RAW"); v=!(e&&*e=='0'); } return v; }
 /* sylph: COLI_GGUF_EMBED=0 keeps the phase-3 f32 embedding table (A/B knob); default
  * decodes token_embd row by row with gq_embed_row (2 GB less RSS on the real file). */
 static int g_defer_gguf_line;   /* main() prints the [GGUF] line after the tier decision (experts on CPU / CUDA tier) */
@@ -1577,9 +1573,19 @@ static void load_meta(Cfg *c, const char *snap) {
  * qwen35moe.* keys or from tensor shapes; validate_cfg runs afterwards as for
  * the container. Layer kinds come from full_attention_interval AND must agree
  * with the tensors each block carries (FR-23). NextN blocks are skipped. */
+/* A scalar key, or a per-block array (Ollama's converter writes
+ * `qwen35moe.attention.head_count_kv` as one entry per block, 0 on the DeltaNet
+ * blocks and 2 on the attention blocks -- the owner's qwen3.6:35b blob,
+ * 2026-10-14; llama.cpp's loader accepts both forms too): the largest entry. */
+static int64_t gguf_kv_i64_or_arrmax(const GgufSet *G, const char *key, int64_t dflt) {
+    int64_t v; if (gguf_kv_i64(G, key, &v)) return v;
+    int64_t n = gguf_kv_arr_len(G, key), best = -1;
+    for (int64_t i = 0; i < n; i++) if (gguf_kv_arr_i64(G, key, i, &v) && v > best) best = v;
+    return n > 0 && best >= 0 ? best : dflt;
+}
 static void cfg_from_gguf(Model *m) {
     Cfg *c = &m->c; TensorSource *ts = &m->src; GgufSet *G = &ts->G;
-#define GK(key) gguf_kv_i64_or(G, "qwen35moe." key, -1)
+#define GK(key) gguf_kv_i64_or_arrmax(G, "qwen35moe." key, -1)
     int64_t blocks = GK("block_count"), nextn = gguf_kv_i64_or(G, "qwen35moe.nextn_predict_layers", 0);
     CFG_NEED(blocks > 0 && blocks <= 512 && nextn >= 0 && nextn < blocks, "qwen35moe.block_count %lld / nextn_predict_layers %lld out of range", (long long)blocks, (long long)nextn);
     c->n_layers = (int)(blocks - nextn);
@@ -1654,8 +1660,8 @@ static void cfg_from_gguf(Model *m) {
     const char *embd_mode = gguf_embd_on_demand() ? "on demand" : "f32 at load";
     const char *out_kernel = "matmul_d";
     { GgufTensor *ow = gguf_find(G, "output.weight");
-      if (ow && (ow->type == GQ_Q4_K || ow->type == GQ_Q5_K || ow->type == GQ_Q6_K || ow->type == GQ_Q4_0)) out_kernel = "gq_matmul";
-      else if (ow && ow->type == GQ_Q8_0 && c->hidden % 32 == 0) out_kernel = "matmul_q_gs";
+      if (ow && gguf_raw_on() && (ow->type == GQ_Q4_K || ow->type == GQ_Q5_K || ow->type == GQ_Q6_K || ow->type == GQ_Q4_0)) out_kernel = "gq_matmul";
+      else if (ow && gguf_raw_on() && ow->type == GQ_Q8_0 && c->hidden % 32 == 0) out_kernel = "matmul_q_gs";
       else if (dense_i8_on()) out_kernel = "matmul_q (int8 at load)"; }
     /* NextN (MTP) head (FR-24, phase 6 / 07_Tests/IntegrationTest/qwen36_mtp.md): detected
      * and reported with its type and bits; this engine predicts one token per step and
@@ -1721,7 +1727,7 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
          * (COLI_DENSE_I8=0) or when a permuted Q8_0 matrix cannot move whole
          * blocks, the exact dequantization to f32 is used instead. */
         int t = ts_ggml_type(&m->src, name);
-        if (quantize && dense_i8_on()) {
+        if (quantize && gguf_raw_on()) {
             if (t == GQ_Q8_0) {
                 int8_t *q = malloc((size_t)I * O); float *sc = malloc((size_t)O * (size_t)(I / 32) * sizeof(float));
                 if (!q || !sc) { fprintf(stderr, "OOM load_tq %s\n", name); exit(1); }
@@ -1734,6 +1740,9 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
         }
         float *p = load_t_n(m, name, (int64_t)I * O);
         out->w = p;
+        /* Only the float types take the container's int8-at-load path; a quantized
+         * tensor that could not be handed over as stored (a column-permuted K-quant,
+         * ssm_out) stays exact f32 -- never re-quantized (NFR-3). */
         if (quantize && dense_i8_on() && (t == GQ_F32 || t == GQ_F16 || t == GQ_BF16)) {
             qw_quantize(p, I, O, tag, out);
             if (getenv("COLI_KEEP_F32")) out->w = p; else { free(p); out->w = NULL; }
@@ -1754,6 +1763,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     m->quant_bits = bits;
     int n_layers_from_config;
     m->is_gguf = ts_is_gguf_path(snap);
+    if (m->is_gguf) g_dense_i8_default = 0;      /* exact float dense tensors unless COLI_DENSE_I8=1 (see dense_i8_on) */
     if (m->is_gguf) {
         /* sylph: a GGUF carries config, names and tokenizer itself (no
          * config.json / qwen36_meta.json); open it first, then read Cfg from
@@ -1788,7 +1798,10 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
      * models straight off this same loop and never ran the old post-hoc
      * qdw_register pass either, so gating on load_boundaries keeps their
      * f32-only numerics exactly as they were. */
-    int quantize_dense = load_boundaries && dense_i8_on();
+    /* sylph: `quantize` to load_tq also enables the GGUF as-stored handover (Q8_0 split,
+     * K-quant raw rows), which is lossless and wanted whenever a full model is loaded,
+     * int8 knob or not; load_tq itself applies int8 only to float types under dense_i8_on(). */
+    int quantize_dense = load_boundaries && (dense_i8_on() || m->is_gguf);
     int qcount = 0; double qfreed = 0;
     if (load_boundaries) {
         m->embed = NULL; m->embd_raw = NULL; m->embd_type = -1;
@@ -3691,6 +3704,29 @@ static void gguf_reads_line(Model *m, FILE *f, int tokens, int delta) {
             tokens > 0 ? dby / 1e6 / tokens : 0.0, parts, parts == 1 ? "" : "s");
 }
 
+/* sylph (efficiency_verdict.md): the expert cache's own accounting per serve turn,
+ * `CACHE hits=<n> misses=<n> expert_bytes=<n>` on stderr next to `GGUF reads:`; the
+ * container has no read counter, so its bytes per token are misses × expert_bytes
+ * (the merged_weight + .qs of one expert as stored). Deltas since the previous line. */
+static size_t expert_disk_bytes(Model *m) {
+    if (m->is_gguf) return m->gguf_slot_bytes;
+    static size_t cached = 0;
+    if (!cached && m->c.n_layers > 0) {
+        char nm[256], qs[256]; int la = m->active_of[0];
+        snprintf(nm, sizeof nm, "model.layers.%d.mlp.experts.0.merged_weight", la);
+        snprintf(qs, sizeof qs, "model.layers.%d.mlp.experts.0.qs", la);
+        st_tensor *tw = st_find(&m->S, nm), *ts = st_find(&m->S, qs);
+        cached = (size_t)((tw ? tw->nbytes : 0) + (ts ? ts->nbytes : 0));
+    }
+    return cached;
+}
+static void cache_line(Model *m, FILE *f) {
+    static uint64_t p_h = 0, p_m = 0;
+    uint64_t h = m->hits, mi = m->miss;
+    fprintf(f, "CACHE hits=%llu misses=%llu expert_bytes=%zu\n", (unsigned long long)(h - p_h), (unsigned long long)(mi - p_m), expert_disk_bytes(m));
+    p_h = h; p_m = mi;
+}
+
 static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out) {
     Cfg *c = &m->c;
     if (nfull > QWEN36_ATTN_MAX_CTX) {
@@ -4105,6 +4141,7 @@ static void serve_one(Model *m, ServeReq *q){
            dt>0?gen/dt:0.0,0.0,rss_gb(),np,limited);
     fflush(stdout);
     gguf_reads_line(m, stderr, gen, 1);     /* sylph FR-30: this turn's slice reads */
+    cache_line(m, stderr);                  /* sylph: hits/misses of this turn (efficiency tool) */
 }
 
 static void serve_loop(Model *m){

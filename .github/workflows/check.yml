@@ -137,6 +137,8 @@ jobs:
           echo "::endgroup::"
       - name: GLM-5.2 assembly integration test (phase 6, glm_assembly.md)
         run: python3 07_Tests/IntegrationTest/run_glm_assembly.py --no-build
+      - name: Efficiency verdict tool, CI subset (phase 7, efficiency_verdict.md cases 0-5)
+        run: python3 07_Tests/SystemTest/run_efficiency.py --no-build
 
   macos:
     runs-on: macos-latest

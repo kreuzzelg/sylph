@@ -1,5 +1,27 @@
 # Changelog
 
+## sylph 2026-10-15 — first real-hardware pass (owner's host: RTX 3070, Ollama, llama.cpp)
+
+- **Ollama's own GGUF conversion loads** (`qwen3.6:35b` blob, 2026-10-14): per-block `attention.head_count_kv`
+  arrays, `blk.N.ssm_dt` without `.bias`, `ssm.v_head_reordered` honoured (true = llama.cpp's order, verified
+  against the HF checkpoint), vision-tower tensors (`v.*`, `mm.*`) ignored and reported, files recognised by
+  the `GGUF` magic (no `.gguf` suffix needed) in the engine, `coli info/plan/doctor` and `ggufinfo`.
+- **Exact by default on a GGUF source:** float dense tensors (router, shared-expert gate) are no longer int8-quantized
+  at load (`COLI_DENSE_I8=1` opts in as a named deviation); row-permuted K-quant DeltaNet projections are un-permuted
+  on the raw rows instead of decoded to f32 (RSS after load 4.7 → 2.4 GB on the blob); `COLI_GGUF_RAW=0` forces the
+  f32 decode for an A/B.
+- **Tokenizer = llama.cpp:** the Qwen pre-tokenizer's Unicode classes come from `unicode_cat.h` (Unicode 15 general
+  categories); 297 193 ids of wikitext-2 identical to `llama-tokenize` (5 pieces differed before: schwa, Vietnamese
+  letters, `½`). `tests/test_unicode_cat` pins it; `test_tok_gguf --llama-tokenize` passes `--no-escape`.
+- **CUDA fused expert group on raw ggml blocks** (`coli_cuda_expert_group_issue`): the async path the tier uses had no
+  blk branch and refused every group; `make cuda-test-gq` now passes on the RTX 3070 (`all passed`).
+- Serve mode prints `CACHE hits= misses= expert_bytes=` per turn; `tools/efficiency_report.py` (phase 7) measures
+  sylph-GGUF / gs64 container / Ollama under one protocol; `run_efficiency.py` cases 0–5 green.
+- Equivalence harness: llama.cpp optional (Ollama-only E3), `--no-escape`, CPU floor pinned off the GPU, CUDA floor
+  auto-fits, Ollama greedy without its default penalties, text-mode near-tie margins, exact KL with llama's 16-bit
+  tail lumped and the KL gate calibrated on the floor, per-sample floors in the report.
+
+
 All notable changes to colibrì are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 

@@ -26,6 +26,7 @@ enum {
     QN_X_PERM_CONV_ROWS,  /* ssm_conv1d {k, conv_dim}: channels of the value third: un-permute row blocks */
     QN_X_PERM_HEAD_COLS,  /* ssm_out [hidden][vh·vdim]: input columns by value head: un-permute column blocks */
     QN_X_EXPERT,          /* slice e of a 3-D expert tensor */
+    QN_X_SSM_A_NOPERM,    /* ssm_a of a file in HF head order (`ssm.v_head_reordered = false`): A_log = log(−a), no un-permute (set by src.h, never by the table) */
 };
 
 typedef struct { const char *hf; const char *gguf; int xform; } QnEntry;

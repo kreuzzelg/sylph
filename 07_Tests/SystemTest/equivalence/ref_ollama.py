@@ -43,7 +43,13 @@ def _logprobs(res):
 
 
 def generate(base, tag, prompt, n_predict=128, seed=1, num_ctx=4096, want_logprobs=True, chat=False):
-    opts = {"temperature": 0, "seed": seed, "num_predict": n_predict, "num_ctx": num_ctx}
+    # Greedy means argmax of the model's logits: Ollama's defaults (repeat_penalty 1.1 over the
+    # last 64 tokens, top_k 40, top_p 0.9) would still reshape them under temperature 0, so
+    # they are switched off explicitly (found on the owner's host, 2026-10-14: every prompt
+    # diverged within 20-250 characters with the defaults on).
+    opts = {"temperature": 0, "seed": seed, "num_predict": n_predict, "num_ctx": num_ctx,
+            "repeat_penalty": 1.0, "repeat_last_n": 0, "top_k": 0, "top_p": 1.0, "min_p": 0.0,
+            "presence_penalty": 0.0, "frequency_penalty": 0.0}
     if chat:
         body = {"model": tag, "messages": [{"role": "user", "content": prompt}], "stream": False, "options": opts}
     else:

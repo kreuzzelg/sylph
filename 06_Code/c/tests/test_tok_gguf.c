@@ -148,7 +148,9 @@ int main(int argc, char **argv) {
             char cmd[8192]; FILE *pf;
             char tf[64]; snprintf(tf, sizeof tf, "test_tok_gguf_line_%d.txt", (int)getpid());
             FILE *lf = fopen(tf, "wb"); fwrite(L.line[i], 1, strlen(L.line[i]), lf); fclose(lf);
-            snprintf(cmd, sizeof cmd, "\"%s\" -m \"%s\" -f \"%s\" --ids --no-bos 2>/dev/null", llama, gguf, tf);
+            /* --no-escape: the corpus holds literal "\x00" and "\\\" (lines 9, 49); llama-tokenize
+             * would process them as escape sequences before tokenizing (owner's host, 2026-10-14) */
+            snprintf(cmd, sizeof cmd, "\"%s\" -m \"%s\" -f \"%s\" --ids --no-bos --no-escape 2>/dev/null", llama, gguf, tf);
             pf = popen(cmd, "r"); if (!pf) { printf("FAIL: cannot run %s\n", llama); bad_l++; break; }
             char out[1 << 16] = ""; size_t got = fread(out, 1, sizeof out - 1, pf); out[got] = 0; pclose(pf); remove(tf);
             /* "[1, 2, 3]" */

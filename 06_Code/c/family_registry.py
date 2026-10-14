@@ -1557,7 +1557,13 @@ def _gguf_config(model):
     tokens = kv.get("tokenizer.ggml.tokens")
     if arch == "qwen35moe":
         def g(key, default=None):
-            return kv.get(f"qwen35moe.{key}", default)
+            v = kv.get(f"qwen35moe.{key}", default)
+            # Ollama's converter writes attention.head_count_kv as one entry per block
+            # (0 on the DeltaNet blocks): the largest entry is the scalar the engine uses
+            if isinstance(v, list):
+                nums = [x for x in v if isinstance(x, (int, float)) and not isinstance(x, bool)]
+                v = max(nums) if nums else default
+            return v
         blocks = int(g("block_count") or 0)
         nextn = int(g("nextn_predict_layers", 0) or 0)
         layers = blocks - nextn
