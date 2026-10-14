@@ -9,7 +9,7 @@ bf16-representable, written as one float32 safetensors + config.json. --mtp adds
 block as model.layers.5.* (eh_proj [hidden, 2*hidden], enorm, hnorm, shared_head.norm + a
 full MoE block), the layout tools/convert_fp8_to_int4.py --mtp and llama.cpp both read.
 
-    python3 07_Tests/IntegrationTest/make_tiny_glm_hf.py <out_dir> [--seed N] [--wide] [--mtp]
+    python3 07_Tests/IntegrationTest/make_tiny_glm_hf.py <out_dir> [--seed N] [--wide] [--mtp] [--vocab N]
 
 Standard library only; reuses the writer of make_tiny_qwen36_hf.py.
 """
@@ -109,6 +109,7 @@ def main(argv):
         g["hidden"] = 256; g["moe_inter"] = 256
     for i, a in enumerate(argv):
         if a == "--seed": seed = int(argv[i + 1])
+        if a == "--vocab": g["vocab"] = int(argv[i + 1])   # phase 7: room for a real tokenizer (gguf_hardening.md case 5)
     rng = random.Random(seed)
     out.mkdir(parents=True, exist_ok=True)
     tensors = []

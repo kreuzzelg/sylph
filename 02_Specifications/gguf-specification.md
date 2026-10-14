@@ -57,7 +57,10 @@ specification serves:
   Qwen3.6 path is measured; the reader and kernels are architecture-agnostic.
   *Phase 6 (2026-10-09): GLM-5.2 enters scope through `colibri.c`'s GGUF arm per the v1 design; its tests are `07_Tests/IntegrationTest/glm_assembly.md`, `07_Tests/SystemTest/glm_lossless_oracle.md`, `glm_real_model.md`. The public quantizations are surveyed (`ud_survey.md`) before any type outside the set is added.*
 - Parity with Ollama's *server* features (API, templates, sampling); only the
-  **model function** is compared.
+  **model function** is compared. *Phase 7 (2026-10-14): upstream v2.0.0's multi-conversation
+  serve (`KV_SLOTS`) is an engine feature, not a server feature — a GGUF source must serve
+  slots identically to a container (`07_Tests/IntegrationTest/multi_slot_gguf.md`). The
+  Vulkan tier stays out of scope for GGUF sources (ignored by name).*
 
 ## 4. Reference semantics — what "equivalent to Ollama" means
 

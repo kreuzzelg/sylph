@@ -509,7 +509,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_segment_adapters_registration test_segment_adapters_real \
 	test_edge_adapters_registration test_edge_adapters_real \
 	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine \
-	test_e8x4g64_loader test_qwen36_tier_kq_engine \
+	test_e8x4g64_loader test_qwen36_tier_kq_engine test_tok_gguf_glm \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
@@ -1259,6 +1259,8 @@ tests/test_qwen36_tokenizer$(EXE): tests/test_qwen36_tokenizer.c gsgemv.h qgemv.
 tests/test_gguf_load$(EXE): tests/test_gguf_load.c qwen36.c src.h gq.h gq_i8.h gguf.h gguf_xform.h qwen35_names.h gsgemv.h qgemv.h sse41_kernels.h expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 tests/test_gguf_load_glm$(EXE): tests/test_gguf_load_glm.c colibri.c src.h gq.h gq_i8.h gguf.h gguf_xform.h qwen35_names.h glm_names.h st.h json.h tok.h compat.h quant.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+tests/test_tok_gguf_glm$(EXE): tests/test_tok_gguf_glm.c colibri.c src.h gq.h gq_i8.h gguf.h gguf_xform.h qwen35_names.h glm_names.h st.h json.h tok.h compat.h quant.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
 tests/test_tok_gguf$(EXE): tests/test_tok_gguf.c qwen36.c src.h gguf.h gsgemv.h qgemv.h sse41_kernels.h expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
