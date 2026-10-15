@@ -1,6 +1,7 @@
 # written by tools/upstream_sync.py --apply; read by --check
-upstream=bf2442915d6e3dd4cdfd2eb9c2a3d2aa44a25850
-tag=v2.0.0
-date=2026-10-06
-merge=
+upstream=11dbb2c61e7b19fafa0d2aec321bd42e605dabdd
+tag=
+date=2026-10-15
+branch=dev
+merge=df492992
 applied=2026-10-15
