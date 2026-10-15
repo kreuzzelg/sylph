@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sync of upstream colibrì (JustVugg/colibri, branch main) into the 06_Code subtree.
+"""Sync of upstream colibrì (JustVugg/colibri, branch main or --branch dev) into the 06_Code subtree.
 
     python3 06_Code/c/tools/upstream_sync.py --check [--json]      # read-only: fetch upstream, report
     python3 06_Code/c/tools/upstream_sync.py --trial [--json]      # dry merge in a temporary clone
@@ -32,7 +32,8 @@ ROOT = Path(__file__).resolve().parents[3]
 PREFIX = "06_Code"
 UPSTREAM_URL = "https://github.com/JustVugg/colibri"
 FALLBACK_BASE = "ce370e87"
-MERGE_RE = re.compile(r"^06_Code: merge upstream colibr[iì] main \(([^,]+), ([0-9a-f]{7,40})\) into the subtree", re.M)
+MERGE_RE = re.compile(r"^06_Code: merge upstream colibr[iì] [\w./-]+ \(([^,]+), ([0-9a-f]{7,40})\) into the subtree", re.M)
+BRANCH = "main"   # --branch: the upstream branch to merge (main, or dev for the owner's request of 2026-10-15)
 GATES = [
     "make -C 06_Code/c check",
     "the gguf-oracle recipe (.github/workflows/check.yml, job gguf-oracle) or a push and the CI run",
@@ -72,8 +73,8 @@ def upstream_remote(cwd=None):
 
 def fetch_upstream(cwd=None):
     remote = upstream_remote(cwd)
-    git("fetch", "-q", remote, "main", cwd=cwd)
-    return remote, git("rev-parse", f"{remote}/main", cwd=cwd)
+    git("fetch", "-q", remote, BRANCH, cwd=cwd)
+    return remote, git("rev-parse", f"{remote}/{BRANCH}", cwd=cwd)
 
 
 def read_base():
@@ -158,7 +159,7 @@ def check(args):
         "base": base, "base_tag": tag, "merge_commit": merge, "upstream_head": head, "upstream_head_date": head_date,
         "behind": behind, "tags_since": tags_since(remote, base, head),
         "ours_changed": len(ours), "theirs_changed": len(theirs), "overlap": overlap,
-        "command": f"git subtree pull --prefix={PREFIX} {remote} main" + (" --squash" if args.squash else ""),
+        "command": f"git subtree pull --prefix={PREFIX} {remote} {BRANCH}" + (" --squash" if args.squash else ""),
     }
     return facts
 
@@ -174,7 +175,7 @@ def print_check(f):
 
 
 def subtree_pull(cwd, remote, squash, message):
-    cmd = ["subtree", "pull", f"--prefix={PREFIX}", remote, "main", "-m", message]
+    cmd = ["subtree", "pull", f"--prefix={PREFIX}", remote, BRANCH, "-m", message]
     if squash:
         cmd.append("--squash")
     r = subprocess.run(["git", "-C", str(cwd)] + cmd, capture_output=True, text=True, errors="replace")
@@ -184,7 +185,7 @@ def subtree_pull(cwd, remote, squash, message):
 
 def merge_message(facts):
     tag = facts["tags_since"][-1] if facts["tags_since"] else "untagged"
-    return f"06_Code: merge upstream colibrì main ({tag}, {facts['upstream_head'][:7]}) into the subtree"
+    return f"06_Code: merge upstream colibrì {BRANCH} ({tag}, {facts['upstream_head'][:7]}) into the subtree"
 
 
 def trial(args):
@@ -195,7 +196,7 @@ def trial(args):
         repo = tmp / "repo"
         git("config", "user.name", "sylph trial", cwd=repo); git("config", "user.email", "trial@invalid", cwd=repo)
         remote = upstream_remote(repo)
-        git("fetch", "-q", remote, "main", cwd=repo)
+        git("fetch", "-q", remote, BRANCH, cwd=repo)
         rc, conflicts, log = subtree_pull(repo, remote, args.squash, merge_message(facts))
         conflicts = [p[len(PREFIX) + 1:] if p.startswith(PREFIX + "/") else p for p in conflicts]
         facts["trial"] = {"exit": rc, "conflicts": conflicts, "clean": rc == 0 and not conflicts}
@@ -240,7 +241,7 @@ def record_text(facts):
     tag = facts["tags_since"][-1] if facts["tags_since"] else ""
     return (f"# written by tools/upstream_sync.py --apply; read by --check\n"
             f"upstream={facts['upstream_head']}\ntag={tag}\ndate={facts['upstream_head_date']}\n"
-            f"merge=\napplied={datetime.now(timezone.utc).strftime('%Y-%m-%d')}\n")
+            f"branch={BRANCH}\nmerge=\napplied={datetime.now(timezone.utc).strftime('%Y-%m-%d')}\n")
 
 
 def write_record(path, facts):
@@ -252,7 +253,10 @@ def main(argv=None):
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--check", action="store_true"); g.add_argument("--trial", action="store_true"); g.add_argument("--apply", action="store_true")
     ap.add_argument("--json", action="store_true"); ap.add_argument("--squash", action="store_true")
+    ap.add_argument("--branch", default="main", help="upstream branch to merge (default main; the owner tracks dev)")
     a = ap.parse_args(argv)
+    global BRANCH
+    BRANCH = a.branch
     try:
         if a.check:
             f = check(a)
