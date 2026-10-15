@@ -192,6 +192,35 @@ class DownloadTest(unittest.TestCase):
                          len(self.files["config.json"]) + 1000)
         self.assertFalse(setup_download.is_complete(self.dst))
 
+    def test_a_model_split_across_drives(self):
+        # #2091: shards moved to a second drive (the engine reads them through
+        # K3_DIRS / COLI_MODEL_DIRS / MIMO_DIRS) are still the model's: complete,
+        # counted, and never fetched again. Only shards count there: the engine
+        # reads config, tokenizer and the rest from model_dir alone.
+        files = self.listing()
+        setup_download.download_repo(REPO, "main", self.dst, files, base=self.hub.base)
+        other = os.path.join(self.tmp.name, "second drive")
+        os.makedirs(other)
+        os.replace(os.path.join(self.dst, "model-00001.safetensors"), os.path.join(other, "model-00001.safetensors"))
+        self.assertFalse(setup_download.is_complete(self.dst))
+        self.assertEqual(setup_download.split_dirs(f" {other} ;, /nowhere "), [other, "/nowhere"])
+        self.assertTrue(setup_download.is_complete(self.dst, ["/nowhere", other]))
+        self.assertEqual(setup_download.bytes_present(self.dst, files, [other]), sum(map(len, self.files.values())))
+        self.assertEqual(setup_download.locate(self.dst, self.spec("model-00001.safetensors"), [other]),
+                         os.path.join(other, "model-00001.safetensors"))
+        before = len(self.hub.requests)
+        setup_download.download_repo(REPO, "main", self.dst, files, base=self.hub.base, extra_dirs=[other])
+        self.assertEqual(len(self.hub.requests), before, "a shard on the second drive was fetched again")
+        self.assertFalse(Path(self.dst, "model-00001.safetensors").exists())
+        self.assertTrue(setup_download.is_complete(self.dst, [other]))
+        # a shard of another size there is not the one listed
+        Path(other, "model-00001.safetensors").write_bytes(b"short")
+        self.assertFalse(setup_download.is_complete(self.dst, [other]))
+        # and metadata moved away is missing: the engine reads it from model_dir only
+        Path(other, "model-00001.safetensors").write_bytes(self.files["model-00001.safetensors"])
+        os.replace(os.path.join(self.dst, "config.json"), os.path.join(other, "config.json"))
+        self.assertFalse(setup_download.is_complete(self.dst, [other]))
+
     def test_repository_download_refuses_existing_symlinks_outside_model_dir(self):
         os.makedirs(self.dst)
         for index, (linked_path, name) in enumerate(((Path(self.dst, "sub"), "sub/extra.bin"),

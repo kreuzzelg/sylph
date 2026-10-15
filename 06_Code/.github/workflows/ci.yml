@@ -104,16 +104,18 @@ jobs:
   vulkan:
     name: Vulkan (Lavapipe, software)
     runs-on: ubuntu-latest
+    # 3 minutes when it works. Without a limit a stalled package mirror held a runner for
+    # the 6-hour default (#1978's run of 2026-10-07).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install the Vulkan toolchain and a software driver
         run: |
-          sudo apt-get update
           # libvulkan-dev: headers + loader. glslc: compiles the .comp shaders to SPIR-V --
           # neither is present on the runner by default, which is half of why VK=1 was
-          # never built here. mesa-vulkan-drivers carries Lavapipe (lvp).
-          sudo apt-get install -y --no-install-recommends \
-            libvulkan-dev glslc mesa-vulkan-drivers
+          # never built here. mesa-vulkan-drivers carries Lavapipe (lvp). The script puts
+          # hard limits around apt: a stalled mirror held these jobs for hours.
+          bash .github/scripts/apt-install.sh libvulkan-dev glslc mesa-vulkan-drivers
       - name: Build with VK=1
         run: |
           cd c
@@ -461,9 +463,8 @@ jobs:
           cache-dependency-path: ${{ matrix.req }}
       - name: Install the Vulkan toolchain, Lavapipe and the fixture dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libvulkan-dev glslc mesa-vulkan-drivers
+          # hard limits around apt (.github/scripts/apt-install.sh): see the vulkan job
+          bash .github/scripts/apt-install.sh libvulkan-dev glslc mesa-vulkan-drivers
           pip install -r ${{ matrix.req }} ${{ matrix.extra }}
       - name: The pinned TypeScript SDK
         if: ${{ matrix.npm }}
@@ -728,7 +729,9 @@ jobs:
           # step with "Version not available" before nvcc is ever reached.
           cuda: '12.6.2'
           method: network
-          sub-packages: '["nvcc"]'
+          # profiler-api: backend_cuda_dsv4.cu includes cuda_profiler_api.h, which
+          # the nvcc package does not bring
+          sub-packages: '["nvcc", "profiler-api"]'
       - name: Compile backend_cuda.cu (syntax only, no GPU)
         run: |
           cd c
@@ -739,6 +742,13 @@ jobs:
           nvcc -O2 -std=c++17 -arch=sm_80 -c backend_cuda.cu -o /dev/null \
             -Xcompiler=-Wall,-Wextra
           echo "CUDA syntax check passed"
+      - name: Compile cuda_chain.cu (syntax only, no GPU)
+        run: |
+          cd c
+          # the dense chain on a CUDA device (cuda_chain.h), built into the same backend
+          nvcc -O2 -std=c++17 -arch=sm_80 -c cuda_chain.cu -o /dev/null \
+            -Xcompiler=-Wall,-Wextra
+          echo "cuda_chain syntax check passed"
       - name: Compile backend_cuda_ink.cu (syntax only, no GPU)
         run: |
           cd c
@@ -747,6 +757,18 @@ jobs:
           nvcc -O2 -std=c++17 -arch=sm_80 -c backend_cuda_ink.cu -o /dev/null \
             -Xcompiler=-Wall,-Wextra
           echo "inkling CUDA syntax check passed"
+      - name: "Compile backend_cuda_dsv4.cu without cuBLASLt (the Windows package's form)"
+        run: |
+          cd c
+          # DeepSeek V4's backend as the Windows CUDA package ships it (cuda-dsv4-dll
+          # DSV4_TC=0): the opt-in cuBLASLt path left out, so the DLL needs no
+          # cublasLt64_12.dll (#2047). No cuBLAS symbol may be left in the object.
+          nvcc -O2 -std=c++20 --expt-relaxed-constexpr --expt-extended-lambda -arch=sm_80 \
+            -DCOLI_DSV4_NO_TC -c backend_cuda_dsv4.cu -o dsv4_notc.o
+          if nm -u dsv4_notc.o | grep -i cublas; then
+            echo "backend_cuda_dsv4.cu built with COLI_DSV4_NO_TC still needs cuBLAS" >&2; exit 1
+          fi
+          echo "DeepSeek V4 CUDA backend without cuBLASLt: compiled, no cuBLAS symbol"
 
   qwen36-tiny-check:
     name: Qwen3.6 tiny oracle (token-exact + ASan/UBSan)
@@ -976,6 +998,13 @@ jobs:
             echo "kernel=$k: identical logits at cap 1/2/8/16"
           done
           make tests/test_expert_ffn && ./tests/test_expert_ffn
+          # The same kernel under the CUDA expert tier (fake backend, #2090): below
+          # (2), at (8) and above (16) the fixture's 8 experts, the last logits
+          # equal the CPU build's above.
+          make tests/test_qwen36_tier_stream_engine
+          for cap in 2 8 16; do
+            ./tests/test_qwen36_tier_stream_engine $cap qwen36_tiny64_c logits_${cap}_1.f32 qwen36_tiny64/ref_full.json
+          done
       - name: Mixed expert layout (int4 gs64 gate/up, int8 down) loads and is cap-independent
         run: |
           cd c
@@ -998,9 +1027,10 @@ jobs:
           done
           cmp mixed_ids_1.txt mixed_ids_8.txt && cmp mixed_ids_2.txt mixed_ids_8.txt || { echo "FAIL: ids differ across caps"; cat mixed_ids_*.txt; exit 1; }
           echo "mixed layout: identical ids at cap 1/2/8 ($(cat mixed_ids_8.txt))"
-          # COLI_CUDA=1 on a mixed container is refused with a line, the CPU path stands
+          # COLI_CUDA=1 on a mixed container says with a line that the routed experts
+          # stay on the CPU (a CUDA build still places the dense trunk, #2090)
           COLI_CUDA=1 COLI_DENSE_I8=0 SNAP=qwen36_tiny64_d8 ./qwen36 8 4 qwen36_tiny64/ref_full.json > mixed_cuda.log 2>&1 || true
-          grep -q "COLI_CUDA=1 ignored: the VRAM expert tier does not take the mixed layout" mixed_cuda.log || { echo "FAIL: tier refusal line missing"; cat mixed_cuda.log; exit 1; }
+          grep -q "COLI_CUDA=1: the VRAM expert tier does not take the mixed layout" mixed_cuda.log || { echo "FAIL: the line for the mixed layout under COLI_CUDA=1 is missing"; cat mixed_cuda.log; exit 1; }
       - name: Pinned experts and PILOT prefetch never change the logits (int4 gs64 fixture)
         run: |
           cd c
@@ -1724,7 +1754,10 @@ jobs:
           # *compile* backend_cuda.cu), cuda-dll links it, and on Windows the
           # runtime headers/import lib ship as a separate installer component —
           # with '["nvcc"]' alone this fails at `#include <cuda_runtime.h>`.
-          sub-packages: '["nvcc", "cudart"]'
+          # cuda_profiler_api and thrust (CCCL) for DeepSeek V4's DLLs: its
+          # backend includes cuda_profiler_api.h, and the DeepGEMM flavour's
+          # CUTLASS headers the CCCL ones; neither comes with nvcc or cudart.
+          sub-packages: '["nvcc", "cudart", "cuda_profiler_api", "thrust"]'
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: UCRT64
@@ -1738,10 +1771,10 @@ jobs:
             git
             mingw-w64-ucrt-x86_64-gcc
       # The DeepSeek V4 DeepGEMM flavour compiles against a pinned checkout
-      # that tools/fetch_deepgemm.sh makes on first use (nothing vendored).
-      # CI cannot compile it (sm_120a needs CUDA >= 12.8; this job pins 12.6)
-      # but it does exercise the fetch — pin verification + MSVC patch — and
-      # caches the tree keyed on the pin so a bump is the only cache miss.
+      # that tools/fetch_deepgemm.sh makes on first use (nothing vendored):
+      # the fetch -- pin verification + MSVC patch -- is cached on the pin, so
+      # a bump is the only cache miss, and the DLL is built further down
+      # (sm_120a needs CUDA >= 12.8, which this job pins).
       - name: DeepGEMM pin (for the cache key)
         id: deepgemm-pin
         shell: bash
@@ -1791,6 +1824,28 @@ jobs:
           make kimi_k3.exe CUDA_DLL=1
           test -f kimi_k3.exe || { echo "kimi_k3 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "kimi_k3.exe built against the DLL loader"
+      - name: make cuda-dsv4-dll and cuda-dsv4-dg-dll (DeepSeek V4, as the release ships them)
+        shell: msys2 {0}
+        run: |
+          cd c
+          # deepseek_v4.exe resolves its backend at run time (backend_loader_dsv4.c):
+          # coli_cuda_dsv4_dg.dll (DeepGEMM, sm_120a: RTX 50) first, else
+          # coli_cuda_dsv4.dll (portable: sm_80/86/89/90/120 + PTX). DSV4_TC=0
+          # leaves out the opt-in cuBLASLt path, so neither needs more than the
+          # cudart64_12.dll beside it and the driver (#2047).
+          make cuda-dsv4-dll CUDA_ARCH=portable DSV4_TC=0
+          make cuda-dsv4-dg-dll DSV4_TC=0
+          for d in coli_cuda_dsv4.dll coli_cuda_dsv4_dg.dll; do
+            test -f $d || { echo "$d: the target reported success but produced no DLL" >&2; exit 1; }
+            deps=$(objdump -p $d | sed -n 's/.*DLL Name: //p' | tr 'A-Z' 'a-z' | sort -u | tr '\n' ' ')
+            echo "$d imports: $deps"
+            for x in $deps; do
+              case "$x" in
+                cudart64_12.dll|nvcuda.dll|kernel32.dll|ucrtbase.dll|user32.dll|advapi32.dll|ws2_32.dll|shell32.dll|ole32.dll|vcruntime140*.dll|msvcp140*.dll|api-ms-win-*) ;;
+                *) echo "$d needs $x, which the Windows CUDA package does not carry" >&2; exit 1 ;;
+              esac
+            done
+          done
       - name: Collect the runtime the DLL links (cudart64_12.dll)
         shell: bash
         run: |
@@ -1807,6 +1862,8 @@ jobs:
           retention-days: 30
           path: |
             c/coli_cuda.dll
+            c/coli_cuda_dsv4.dll
+            c/coli_cuda_dsv4_dg.dll
             c/cudart64_*.dll
             c/colibri.exe
             c/qwen36.exe

@@ -12703,6 +12703,7 @@ int coli_v4_prompt_build(char **output, size_t *output_length,
 
 #ifdef COLI_V4_UNIT_GENERATE_STATS
 /* ######## tools/deepseek_v4_generate_stats.c ######## */
+#include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979): in the unit with main only */
 #define COLI_V4_GENERATE_MAIN coli_v4_generate_stats_legacy_main
 #define COLI_V4_GENERATE_HELPERS_ONLY
 #define spec_print spec_print_diagnostic_legacy
@@ -13171,8 +13172,7 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
         }
         vkt_put_done();
         clock_gettime(CLOCK_MONOTONIC, &t1);
-        fprintf(stderr, "[VK] tier deepseek_v4: warm start, %d experts from the history in %.1fs\n", n,
-                (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9);
+        vkt_warm_report("deepseek_v4", n, (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9);
     }
     free(pl); free(pe);
     coli_v4_expert_store_device_tier = v4_vkt_device_tier;

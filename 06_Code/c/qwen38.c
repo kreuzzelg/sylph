@@ -60,6 +60,7 @@ static int qwen38_max_ctx(void) {
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
+#include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "cli_args.h"
 #include "st.h"
 #include "omp_tune.h"
@@ -784,7 +785,7 @@ static int decode_range_alloc(const int *arr,int from,int to,
         free(chunk);free(token);
     }
     unsigned char tail[3];int tail_n=0;
-    if(utf8_finish(carry,&carry_n,tail,sizeof tail,&tail_n)||
+    if(utf8_finish(carry,&carry_n,tail,sizeof tail,&tail_n)<0||
        q38_bytes_append(&all,&length,&capacity,tail,(size_t)tail_n)||
        q38_bytes_append(&all,&length,&capacity,(const unsigned char*)"",1u)){
         free(all);return -1;
@@ -2916,7 +2917,7 @@ static void q38_vk_tier_start(Model *m,int cap){
             }
         }
         vkt_put_done();
-        fprintf(stderr,"[VK] tier qwen38: warm start, %d experts from the history in %.1fs\n",n,now_s()-t0);
+        vkt_warm_report("qwen38", n, now_s() - t0);
     }
     free(pl);free(pe);
 }

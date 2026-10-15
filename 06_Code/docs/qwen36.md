@@ -149,8 +149,8 @@ ms in the last windows, peak RSS 29 -> 17 GB. Of the 20 ms, 11 are the kernel
 97.6% hit rate, fetched one at a time; that fetch is the next thing to
 overlap, not this kernel. `tests/test_expert_ffn` holds the numerics.
 `QWEN_EXPERT_KERNEL=0` restores the int8 path for A/Bs. The CUDA expert tier
-keeps its own path: it uploads the pair-layout int4 and computes misses from
-the int8 copy.
+uses this kernel too for the experts it leaves to the CPU, and converts the
+planar bytes to its own pair layout when it uploads one (#2090).
 
 ## The dense trunk: integer dot products
 
@@ -239,8 +239,9 @@ the rest sits in gate/up, and at equal bits Q4_K_M's asymmetric quantizer is
 ahead. Keep it as a measurement tool and a middle step for boxes with RAM to
 spare; it is not the answer to the gap. The engine tells the layout apart by
 size and reads each matrix in its own format on the CPU path; the CUDA VRAM
-tier takes one format per expert and refuses a mixed container with a line
-(`COLI_CUDA=1 ignored`), so such a container runs CPU-only for now.
+tier takes one format per expert, so the routed experts of a mixed container
+stay on the CPU, said with a line under `COLI_CUDA=1`; the dense trunk still
+goes to the card (#2090).
 
 ## Which checkpoints, and what the banner calls them
 

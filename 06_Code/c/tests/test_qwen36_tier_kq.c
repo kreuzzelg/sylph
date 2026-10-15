@@ -86,7 +86,12 @@ int main(void) {
     teardown();
     check(qt_init_gguf(NL, NE, D, IH, NE, TOPK, slot_bytes, types_ok | (1u << GQ_Q4_0)) == 0, "a Q4_0 expert type is refused by name (note on stderr)");
     check(!qt_ready(), "refused tier is not ready");
-    check(qt_init_gguf(NL, NE, D, IH, NE - 1, TOPK, slot_bytes, types_ok) == 0, "cap != n_experts still refused");
+    /* upstream v2.0.0-dev (#2090): below full RAM residency the tier runs in copy mode
+     * (qt_streaming) -- it copies every slab it takes before qt_note_kq returns, so the
+     * recycled slots of a small cache are safe; before, cap != n_experts was refused. */
+    check(qt_init_gguf(NL, NE, D, IH, NE - 1, TOPK, slot_bytes, types_ok) == 1, "cap != n_experts starts the tier in copy mode");
+    check(qt_streaming(), "copy mode below full residency (qt_streaming)");
+    teardown();
 
     printf("(b) qt_note_kq uploads three raw slices\n");
     fake_uploads = 0; memset(fake_block_uploads, 0, sizeof fake_block_uploads);

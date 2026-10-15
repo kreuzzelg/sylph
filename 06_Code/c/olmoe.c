@@ -39,6 +39,7 @@
 #if defined(__GLIBC__)
 #include <malloc.h>   /* malloc_trim: kv_room_fit gives the slots it frees back to the system */
 #endif
+#include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "cli_args.h"
 #include "st.h"
 #ifdef _OPENMP
@@ -361,7 +362,7 @@ static void matmul_res(float *y, const float *x, const float *W, void **vk, int 
     /* with the dense weights on the device only the device is the matrix's one home */
     if (g_vk_ready && serial && *vk != (void *)&g_vk_refused && (coli_vk_dense() || coli_vk_dense_device_only()) &&
         !(*vk && coli_vk_tensor_dev((ColiVkTensor *)*vk))) {   /* a matrix of the second device's layers: only its chain */
-        if (coli_vk_matmul((ColiVkTensor **)vk, y, x, W, NULL, 10, S, I, O, 0)) return;
+        if (coli_vk_matmul_f32((ColiVkTensor **)vk, y, x, W, S, I, O)) return;
         if (!*vk) *vk = &g_vk_refused;
     }
     if (!W) W = olm_dho_reload(vk);   /* the CPU needs a matrix the device holds alone (a lost device) */
@@ -943,9 +944,15 @@ static void olmoe_vk_tier_start(Model *m) {
     size_t slotb = (size_t)(3 * I * D + (2 * I + D) * 4);
     /* device only, or the chain set up already with its fit (olc_place: the CPU's layers
      * refused): placed already, or never going up */
-    size_t dense = coli_vk_dense() && !coli_vk_dense_device_only() && !g_olc_fit_on
-                 ? (size_t)c->n_layers * (size_t)(4 * D * D + (int64_t)c->n_experts * D) * 4 +
-                   (size_t)c->vocab * (size_t)D * 4 : 0;
+    size_t dense = 0;
+    if (coli_vk_dense() && !coli_vk_dense_device_only() && !g_olc_fit_on) {   /* as the device will hold them */
+        for (int i = 0; i < c->n_layers; i++) {
+            const Layer *l = &m->L[i];
+            dense += coli_vk_f32_payload(l->q, D, D) + coli_vk_f32_payload(l->k, D, D) + coli_vk_f32_payload(l->v, D, D) +
+                     coli_vk_f32_payload(l->o, D, D) + coli_vk_f32_payload(l->gate, D, c->n_experts);
+        }
+        dense += coli_vk_f32_payload(m->lm_head, D, c->vocab);
+    }
     VktConfig vc = {.engine = "olmoe", .layers = c->n_layers, .experts = c->n_experts,
                     .hidden = c->hidden, .inter = c->inter, .topk = c->topk,
                     .gate_up = {VKT_SRC_I8_ROW, 0}, .down = {VKT_SRC_I8_ROW, 0},
@@ -972,7 +979,7 @@ static void olmoe_vk_tier_start(Model *m) {
             free(tmp.g); free(tmp.gs);   /* the two blocks slot_ensure_allocated made */
         }
         vkt_put_done();
-        fprintf(stderr, "[VK] tier olmoe: warm start, %d experts from the history in %.1fs\n", n, now_s() - t0);
+        vkt_warm_report("olmoe", n, now_s() - t0);
     }
     free(pl); free(pe);
 }
@@ -1654,7 +1661,7 @@ static float *olm_dho_reload(void **vk) {
 }
 static void olm_dho_drop(Model *m, float **field, void **vk, const char *name, int I, int O, size_t *bytes) {
     if (!*field || *vk == (void *)&g_vk_refused) return;
-    if (!*vk && !coli_vk_tensor_ensure((ColiVkTensor **)vk, *field, NULL, 10, I, O, 0)) { *vk = &g_vk_refused; return; }
+    if (!*vk && !coli_vk_tensor_ensure_f32((ColiVkTensor **)vk, *field, I, O, 0)) { *vk = &g_vk_refused; return; }
     if (g_olm_dho_n == g_olm_dho_cap) {
         g_olm_dho_cap = g_olm_dho_cap ? 2 * g_olm_dho_cap : 64;
         g_olm_dho = realloc(g_olm_dho, (size_t)g_olm_dho_cap * sizeof *g_olm_dho);
@@ -1728,10 +1735,14 @@ static size_t olm_dho_layer(Model *m, int i) {
 static void olm_dho_start(Model *m) {
     Cfg *c = &m->c;
     int D = c->hidden, E = c->n_experts;
-    size_t bytes = 0;
-    for (int i = 0; i < c->n_layers; i++)
-        if (m->L[i].vk_q != (void *)&g_vk_refused) bytes += (size_t)(4 * (int64_t)D * D + (int64_t)E * D) * sizeof(float);
-    if (m->vk_lm_head != (void *)&g_vk_refused) bytes += (size_t)c->vocab * (size_t)D * sizeof(float);
+    size_t bytes = 0;   /* on the device, as it will hold them */
+    for (int i = 0; i < c->n_layers; i++) {
+        const Layer *l = &m->L[i];
+        if (l->vk_q != (void *)&g_vk_refused)
+            bytes += coli_vk_f32_payload(l->q, D, D) + coli_vk_f32_payload(l->k, D, D) + coli_vk_f32_payload(l->v, D, D) +
+                     coli_vk_f32_payload(l->o, D, D) + coli_vk_f32_payload(l->gate, D, E);
+    }
+    if (m->vk_lm_head != (void *)&g_vk_refused) bytes += coli_vk_f32_payload(m->lm_head, D, c->vocab);
     int chain = coli_vk_chain_decide(NULL, vkt_wanted() && c->n_experts > 0, OLMOE_CHAIN_IGPU);
     if (g_olc_fit_on) chain = chain && g_olc_fit.n > 0;
     if (!coli_vk_dense_host_decide("olmoe", (chain || coli_vk_dense()) && m->lm_head && bytes, bytes)) return;

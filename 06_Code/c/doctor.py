@@ -479,11 +479,47 @@ def windows_backend_dll(image):
     return None
 
 
+# The Vulkan loader a VK=1 engine opens at run time (backend_vulkan.c vk_load), by the names
+# compiled into it: ldd never sees it, so a working Vulkan engine read as CPU-only (#2081).
+_VULKAN_LOADER_NAMES = (b"libvulkan.so.1", b"vulkan-1.dll", b"libvulkan.1.dylib", b"libMoltenVK.dylib")
+
+
+def vulkan_loader_present():
+    """Whether the Vulkan loader the engine opens can be found: the GPU driver installs it."""
+    import ctypes.util
+    if sys.platform == "win32":
+        root = os.environ.get("SystemRoot", r"C:\Windows")
+        return Path(root, "System32", "vulkan-1.dll").is_file() or bool(ctypes.util.find_library("vulkan-1"))
+    if sys.platform == "darwin":
+        return bool(ctypes.util.find_library("vulkan") or ctypes.util.find_library("MoltenVK"))
+    return bool(ctypes.util.find_library("vulkan")) or any(
+        Path(d, "libvulkan.so.1").exists()
+        for d in ("/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/lib64", "/usr/lib",
+                  "/usr/local/lib"))
+
+
 def cuda_linkage(engine_path):
-    """Return CUDA linkage state without loading the executable or CUDA runtime."""
+    """Return the engine's GPU linkage state without loading the executable or a GPU
+    runtime: its CUDA/HIP runtime, else (a VK=1 build) the Vulkan loader it opens,
+    reported with "vulkan": True."""
     engine = Path(engine_path)
     if not engine.is_file():
         return {"linked": False, "missing": False}
+    state = _runtime_linkage(engine)
+    if state["linked"] or state["missing"]:
+        return state
+    try:
+        image = engine.read_bytes()
+    except OSError:
+        return state
+    if any(name in image for name in _VULKAN_LOADER_NAMES):
+        present = vulkan_loader_present()
+        return {"linked": present, "missing": not present, "vulkan": True}
+    return state
+
+
+def _runtime_linkage(engine):
+    """The CUDA/HIP runtime an engine links (POSIX) or loads beside it (Windows)."""
     # `sys.platform` alone selects the branch, so a test can exercise the
     # Windows probe on a POSIX host by faking it. Faking `os.name` instead
     # would repoint pathlib at Windows semantics and turn the POSIX fixture
@@ -594,6 +630,16 @@ def _engine_checks(engine_path, gpu_indices, gpus, linkage, engine_error=None):
     elif gpu_indices is not None and len(selected_gpus) != len(set(gpu_indices)):
         checks.append(_check("accelerator.gpu", "fail", "one or more requested GPUs were not detected",
                              requested=gpu_indices, detected=[gpu["index"] for gpu in detected_gpus]))
+    elif linkage.get("vulkan") and linkage.get("missing"):
+        checks.append(_check("accelerator.gpu", "fail",
+                             "the engine is a Vulkan build but the Vulkan loader is missing "
+                             "(the GPU driver installs it)"))
+    elif linkage.get("vulkan") and linkage.get("linked"):
+        # the device the engine picks is its own probe's (coli_vk_init): any Vulkan GPU,
+        # not only the CUDA/ROCm inventory below
+        checks.append(_check("accelerator.gpu", "pass", "Vulkan engine; the loader is installed "
+                             "(COLI_VULKAN=1 runs the expert tier and the dense chain on the GPU)",
+                             devices=[gpu["index"] for gpu in selected_gpus]))
     elif selected_gpus and linkage.get("missing"):
         checks.append(_check("accelerator.gpu", "fail", "GPU runtime library is missing"))
     elif selected_gpus and linkage.get("linked"):
@@ -893,12 +939,16 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         # passing discovered GPUs through here made doctor contradict its own
         # accelerator check and emit CUDA-only tuning advice. Keep inventory
         # details in accelerator.gpu above, but build an executable plan below.
-        plan_gpus = detected_gpus if linkage.get("linked") else []
-        plan_gpu_indices = gpu_indices if linkage.get("linked") else []
-        plan_vram_gb = vram_gb if linkage.get("linked") else 0
+        cuda = linkage.get("linked") and not linkage.get("vulkan")
+        plan_gpus = detected_gpus if cuda else []
+        plan_gpu_indices = gpu_indices if cuda else []
+        plan_vram_gb = vram_gb if cuda else 0
+        # a Vulkan engine: the plan of a COLI_VULKAN=1 run (the dense weights on the device,
+        # the Vulkan line), not the CPU path's
+        plan_env = dict(os.environ, COLI_VULKAN="1") if linkage.get("vulkan") and linkage.get("linked") else None
         plan = build_plan(model, ram_gb, context, plan_gpu_indices, plan_vram_gb,
                           available_memory=available_memory, available_disk=available_disk,
-                          gpus=plan_gpus, kv_slots=kv_slots)
+                          gpus=plan_gpus, kv_slots=kv_slots, env=plan_env)
         # build_plan() owns the single memory probe -- min(host MemAvailable,
         # finite cgroup headroom); 0 means nothing could measure it (T15).
         available_memory = plan["memory"]["available_bytes"]

@@ -28,7 +28,9 @@
  *            slots, prefetch, experts cut into parts): every device row, resident or
  *            streamed, equals the reference, the sum the all-CPU sum, the cold experts
  *            below the rule's rows stay on the CPU, and the resident set is the warm
- *            start's before and after (streaming promotes nothing).
+ *            start's before and after (streaming promotes nothing);
+ *   timeout  a batch's wait gives up (COLI_VK_WAIT_FAULT): the tier stops and the experts
+ *            that batch names keep their device memory until the device is idle.
  *
  *   make tests/test_vk_tier VK=1 && VK_ICD_FILENAMES=.../lvp_icd.json ./tests/test_vk_tier */
 #include <stdio.h>
@@ -300,6 +302,42 @@ static void warm(void) {
     CHECK(bk.dev >= 1 && r < 2e-3, "warm: the hottest expert is not served from the device (%llu, %.3g)", bk.dev, r);
     printf("  warm start: %d experts planned in heat order and resident, the hottest served by the device\n", n);
     vkt_shutdown(); model_free();
+}
+
+/* #2081: the warm start fills the device whatever the history knows. No history: a
+ * budget of 7 takes 7 experts, one layer after the other; a history's experts go
+ * first; a budget that holds every expert plans every one; a layer without a row
+ * (no experts) is never planned. */
+static void fill(void) {
+    VktFmt f = {VKT_SRC_I4U_PAIRS_GS, 64};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    static const char *const what[4] = {"no history", "a history of two", "every expert", "a layer without experts"};
+    for (int c = 0; c < 4; c++) {
+        set_budget(c < 2 ? 7 : L * E, f, f);
+        uint32_t hist[L][E], *rows[L];
+        for (int l = 0; l < L; l++) {
+            for (int e = 0; e < E; e++) hist[l][e] = c == 1 && e == 0 ? (uint32_t)(50 - l) : 0;
+            rows[l] = c == 3 && l == 1 ? NULL : hist[l];
+        }
+        VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+        CHECK(vkt_init(&vc, rows), "fill %s: the tier did not start", what[c]);
+        int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+        const int want = c < 2 ? 7 : c == 2 ? L * E : E;
+        CHECK(n == want, "fill %s: planned %d experts, not %d", what[c], n, want);
+        int per[L] = {0}, ok = 1;
+        for (int i = 0; i < n; i++) per[pl[i]]++;
+        if (c == 0) ok = per[0] - per[1] <= 1 && per[1] - per[0] <= 1;          /* one layer after the other */
+        if (c == 1) ok = n >= 2 && pl[0] == 0 && pe[0] == 0 && pl[1] == 1 && pe[1] == 0;   /* the history first */
+        if (c == 3) ok = per[1] == 0;                                                /* no row, no plan */
+        CHECK(ok, "fill %s: the plan's order or layers are wrong", what[c]);
+        for (int i = 0; i < n; i++) { VktExpertSrc src = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &src); }
+        vkt_put_done();
+        int res = 0; for (int i = 0; i < n; i++) res += vkt_resident(pl[i], pe[i]);
+        CHECK(res == n, "fill %s: %d of %d planned experts resident", what[c], res, n);
+        printf("  fill, %s: %d experts planned and resident\n", what[c], n);
+        vkt_shutdown();
+    }
+    model_free();
 }
 
 /* a third of the experts fit; the hot set moves halfway */
@@ -691,6 +729,7 @@ static void stream(void) {
         setenv("COLI_VK_TIER_RATE", "0", 1);
         setenv("COLI_VK_TIER_STREAM_SLOTS", c % 2 ? "8" : "4", 1);
         setenv("COLI_VK_TIER_STREAM_ROWS", "3", 1);    /* a cold expert with 3 rows or more streams */
+        setenv("COLI_VK_TIER_FILL", "0", 1);           /* four warm, the rest cold: what streams */
         setenv("COLI_VK_TIER_STREAM_HALF", "40", 1);   /* sub-batches of 40 rows: several a step, experts in parts */
         VktConfig vc = cfg_of(cs[c].gu, cs[c].dn, cs[c].act, v4 ? 10.0f : 0.f);
         vc.load = load_cb; vc.release = release_cb;
@@ -731,7 +770,7 @@ static void stream(void) {
         CHECK(same, "stream %s: the resident set moved", cs[c].name);
         CHECK(worst < (v4 ? 2e-2 : 2e-3), "stream %s: device rows off the reference (%.3g)", cs[c].name, worst);
         vkt_shutdown(); model_free();
-        unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS");
+        unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS"); unsetenv("COLI_VK_TIER_FILL");
     }
 }
 
@@ -790,6 +829,46 @@ static void stream_commit_failure(const char *spv) {
     vkt_shutdown(); model_free(); coli_vk_shutdown();
     unsetenv("COLI_VK_STAGED_FAULT");
     unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS");
+}
+
+/* COLI_VK_WAIT_FAULT=1: the first batch's wait gives up at once, as a wait that runs out
+ * of time does, and the batch may still be running (#1988). The tier stops; the experts
+ * that batch names, freed by the tier's shutdown, keep their device ranges until the
+ * device is idle (coli_vk_shutdown), not from the moment the wait gave up. */
+static void wait_timeout(const char *spv) {
+    setenv("COLI_VK_WAIT_FAULT", "1", 1);
+    int ready = coli_vk_init(spv);
+    CHECK(ready, "wait timeout: no device");
+    if (!ready) { unsetenv("COLI_VK_WAIT_FAULT"); return; }
+    VktFmt f = {VKT_SRC_I4U_PAIRS_GS, 64};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    set_budget(L * E, f, f);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    int on = vkt_init(&vc, NULL);
+    CHECK(on, "wait timeout: the tier did not start");
+    if (on) {
+        for (int e = 0; e < E; e++) { VktExpertSrc s = src_of(&ex[0][e]); vkt_put(0, e, &s); }
+        vkt_put_done();
+        enum { S = 4 };
+        int idx[S * K]; float w[S * K]; uint8_t taken[S * K]; const float *dev[S * K];
+        float x[S * HF_MAX];
+        route(S, 0, E, idx, w);
+        for (int i = 0; i < S * H; i++) x[i] = frnd();
+        int n = vkt_issue(0, x, S, K, idx, taken);
+        int joined = n ? vkt_join(dev) : -1;
+        CHECK(n > 0 && joined == 0, "wait timeout: %d rows issued, join %d (the device should take them and the join fail)", n, joined);
+        CHECK(vkt_devices() == 0, "wait timeout: the tier is still on");
+        ColiVkPoolStats before, after; coli_vk_pool_stats(1, &before);
+        vkt_shutdown();
+        coli_vk_pool_stats(1, &after);
+        CHECK(before.live > 0 && after.live == before.live && after.frees == before.frees,
+              "wait timeout: the tier's shutdown freed experts under the batch (%d live ranges and %llu frees "
+              "before it, %d and %llu after)", before.live, (unsigned long long)before.frees, after.live,
+              (unsigned long long)after.frees);
+        printf("  the wait gave up: tier stopped, %d expert ranges kept until the device is idle\n", after.live);
+    }
+    model_free(); coli_vk_shutdown();
+    unsetenv("COLI_VK_WAIT_FAULT");
 }
 
 /* The expert batch's grouped GEMM (qmatmul_grp.comp) and a big step's whole-step
@@ -918,12 +997,14 @@ int main(int argc, char **argv) {
     printf("partial:\n"); partial();
     printf("sync:\n"); sync_evict();
     printf("extra:\n"); extra();
+    printf("fill:\n"); fill();   /* after extra: its exact pool capacities assume no tier came before with more experts */
     printf("DeepSeek V4:\n"); v4_act();
     printf("stream:\n"); stream();
     ColiVkPoolStats ps, px; coli_vk_pool_stats(1, &ps); coli_vk_pool_stats(4, &px);
     CHECK(ps.live == 0 && px.live == 0, "%d + %d tier ranges still live after every shutdown", ps.live, px.live);
     coli_vk_shutdown();   /* with staged uploads: where the experts were ("[VK] memory at exit") */
     stream_commit_failure(spv);
+    printf("wait timeout:\n"); wait_timeout(spv);
     printf(fails ? "FAIL (%d)\n" : "PASS\n", fails);
     return fails != 0;
 }

@@ -60,6 +60,7 @@
 #include <omp.h>
 #endif
 
+#include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "cli_args.h"
 #include "compat.h"
 #include "json.h"
@@ -5062,7 +5063,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
             free(buf);
         }
         vkt_put_done();
-        fprintf(stderr, "[VK] tier deepseek_v41: warm start, %d experts from the history in %.1fs\n", n, now_s() - t0);
+        vkt_warm_report("deepseek_v41", n, now_s() - t0);
     }
     free(pl); free(pe);
 }

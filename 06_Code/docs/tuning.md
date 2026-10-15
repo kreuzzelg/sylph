@@ -10,7 +10,7 @@ is safe on any machine. See also [SETTINGS.md](SETTINGS.md) and
 |---|---|
 | `--temp T` | token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy) |
 | `--topp 0.7` | adaptive expert top-p (30–40% less disk; lossy — prints a warning) |
-| `--ngen N` | max tokens per answer (`:more` in chat continues a truncated one) |
+| `--ngen N` | max tokens per answer (`:more` in chat continues a truncated one); without it a chat server lets an answer run to the end of the context |
 | `--repin N` | adapt RAM/VRAM hot experts every N emitted tokens |
 | `RAM_GB=<n>` | claim more RAM for the expert cache than the conservative auto-detect |
 | `PIN=stats PIN_GB=g` | pin the hottest experts from a measured usage profile |

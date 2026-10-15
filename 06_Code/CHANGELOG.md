@@ -1,5 +1,12 @@
 # Changelog
 
+## sylph 2026-10-15 — upstream colibrì `dev` merged (11dbb2c, 114 commits past v2.0.0)
+
+- `tools/upstream_sync.py --branch dev`: the owner tracks colibrì's dev branch; the marker records the branch.
+- The CUDA tier's copy mode (upstream #2090) reaches GGUF experts: `COLI_CUDA=1` no longer needs `cap = n_experts`;
+  below full RAM residency the tier copies each raw-block slab as it passes (RTX 3070, unsloth UD-Q4_K_M: cap 128 at
+  9.6 GB RSS, 1613 experts in VRAM, the CPU's greedy text). `qt_cpu_misses` runs GGUF misses through the gq kernels.
+
 ## sylph 2026-10-15 — upstream colibrì v2.0.0 merged into the subtree
 
 - `git subtree pull` of JustVugg/colibri `main` (v2.0.0, bf24429, 932 commits): KV_SLOTS multi-conversation serve, the

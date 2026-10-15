@@ -17,6 +17,19 @@ DARWIN := $(findstring darwin,$(TRIPLET))
 LINUX  := $(findstring linux,$(TRIPLET))
 IS_WIN := $(MINGW)$(CYGWIN)
 
+# A gcc that targets the MSYS or Cygwin runtime (MSYS2's "MSYS" shell, or its plain
+# `gcc` package) is not a native Windows compiler: it does not define _WIN32, so
+# compat.h's Windows layer is skipped and the build dies on a POSIX call it cannot
+# find (getrusage in qwen36.c, #1979). Stop before compiling and say which compiler
+# to use. `make clean` still runs; ALLOW_MSYS_GCC=1 builds anyway.
+ifneq ($(CYGWIN)$(findstring msys,$(TRIPLET)),)
+ifneq ($(ALLOW_MSYS_GCC),1)
+ifneq ($(filter-out clean%,$(or $(MAKECMDGOALS),all)),)
+$(error $(DETECT_CC) builds for $(TRIPLET), the MSYS/Cygwin runtime, not for Windows itself. Open the "MSYS2 UCRT64" shell (not "MSYS2 MSYS"), install its MinGW compiler with `pacman -S --needed make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-libgomp`, and check that `gcc -dumpmachine` says x86_64-w64-mingw32 (docs/windows.md))
+endif
+endif
+endif
+
 # Appended to every platform's flags, so a caller can add to the build without
 # replacing it. Overriding CFLAGS= on the command line would drop that
 # platform's OpenMP and -march flags, which is how a sanitizer run ends up
@@ -531,6 +544,8 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier test_qwen36_tier_kq_engine test_tok_gguf_glm \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract
 TEST_EXCLUDE += test_vk_chain test_glm53_vk_f32
+# takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
+TEST_EXCLUDE += test_qwen36_tier_stream_engine
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -584,7 +599,7 @@ $(error choose CUDA=1 or HIP=1, not both)
 endif
 CFLAGS   += -DCOLI_CUDA
 LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lcublasLt -lcublas -lstdc++
-CUDA_OBJ  = backend_cuda.o
+CUDA_OBJ  = backend_cuda.o cuda_chain.o
 INK_CUDA_OBJ = backend_cuda_ink.o
 ifeq ($(COLI_ANS),1)
 ifeq ($(strip $(DIETGPU_ROOT)),)
@@ -639,7 +654,7 @@ $(error HIP=1 is supported only on Linux)
 endif
 CFLAGS    += -DCOLI_CUDA
 LDFLAGS   += -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -lamdhip64 -lstdc++
-CUDA_OBJ   = backend_cuda.o
+CUDA_OBJ   = backend_cuda.o cuda_chain.o
 GPUCC      = $(HIPCC)
 GPUFLAGS   = $(HIPCCFLAGS)
 GPUCC_NAME = hipcc (set ROCM_HOME or HIPCC)
@@ -724,6 +739,10 @@ VK_SPV   += shaders/chain_gemv2.spv
 VK_SPV   += shaders/chain_dsv4.spv
 # Kimi K3's attention residuals and SiTU-GLU (vk_chain.h)
 VK_SPV   += shaders/chain_ares.spv
+# the router's pick on the device, every MoE engine's kind (vk_chain.h: vkc_route)
+VK_SPV   += shaders/chain_route.spv
+# the routed experts on the device, their weights by address (vk_chain.h: vkc_moe)
+VK_SPV   += shaders/chain_moe.spv
 # inkling's chain ops (made on first use): the short convolution and the attention
 # with its relative-position bias
 VK_SPV   += shaders/chain_sconv.spv shaders/chain_relattn.spv
@@ -941,14 +960,14 @@ backend_xdna.o: backend_xdna.c .build-config
 # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
 # __declspec(dllexport) so the 15 API symbols are exported.
-cuda-dll: backend_cuda.cu backend_cuda.h fp8_format.h
+cuda-dll: backend_cuda.cu cuda_chain.cu backend_cuda.h cuda_chain.h fp8_format.h
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	# The banner is localized ("for x64" / "per x64" / "pour x64"): match the arch token only (#1531).
 	@cl 2>&1 | grep -qE "x64|AMD64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
 		-L"$(CUDA_HOME)/lib/x64" -lcudart \
-		backend_cuda.cu -o coli_cuda.dll
+		backend_cuda.cu cuda_chain.cu -o coli_cuda.dll
 
 # Windows HIP DLL: the AMD sibling of cuda-dll above. hipcc compiles the SAME
 # backend_cuda.cu (through backend_gpu_compat.h) into coli_hip.dll, exporting
@@ -971,7 +990,7 @@ cuda-dll: backend_cuda.cu backend_cuda.h fp8_format.h
 # survives. No path is hardcoded — see the HIP SDK contract above.
 #
 #   make hip-dll HIP_DLL=1 HIP_SDK_ROOT=<sdk> HIP_ARCH=gfx1151
-hip-dll: backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h
+hip-dll: backend_cuda.cu cuda_chain.cu backend_cuda.h cuda_chain.h fp8_format.h backend_gpu_compat.h
 	@test -x "$(HIPCC)" || command -v "$(HIPCC)" >/dev/null 2>&1 || { echo "hipcc not found at \"$(HIPCC)\": set HIP_SDK_ROOT=<path>, HIP_BIN_DIR=<path> or HIPCC=<path>" >&2; exit 1; }
 	@test -d "$(HIP_INCLUDE_DIR)" || { echo "HIP include dir not found: \"$(HIP_INCLUDE_DIR)\" — set HIP_INCLUDE_DIR=<path>" >&2; exit 1; }
 	@test -f "$(HIP_INCLUDE_DIR)/hip/hip_runtime.h" || { echo "hip/hip_runtime.h missing under \"$(HIP_INCLUDE_DIR)\" — set HIP_INCLUDE_DIR=<path>" >&2; exit 1; }
@@ -984,7 +1003,7 @@ hip-dll: backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h
 		-I"$(HIP_INCLUDE_DIR)" \
 		--rocm-device-lib-path="$(HIP_DEVICE_LIB_PATH)" \
 		-L"$(HIP_LIB_DIR)" -lamdhip64 \
-		backend_cuda.cu -o coli_hip.dll
+		backend_cuda.cu cuda_chain.cu -o coli_hip.dll
 
 backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h .build-config
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
@@ -993,6 +1012,12 @@ backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h .build-config
 backend_cuda.o: backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h .build-config
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c backend_cuda.cu -o $@
+
+# The dense chain on a CUDA device (cuda_chain.h): the backend's twin of vk_chain.c,
+# built into the same backend (one table export, coli_cuda_chain_ops).
+cuda_chain.o: cuda_chain.cu cuda_chain.h backend_cuda.h backend_gpu_compat.h .build-config
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) -c cuda_chain.cu -o $@
 
 
 backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h .build-config $(DSV4_DEEPGEMM_DEP)
@@ -1018,13 +1043,25 @@ deepgemm-fetch $(DEEPGEMM_STAMP):
 # coli_cuda_dsv4_dg.dll the DeepGEMM sm_120a build (tensor-core prefill paths;
 # needs the sm120 DeepGEMM checkout at DEEPGEMM_HOME, see
 # patches-deepgemm-sm120-msvc.patch). Both need -lcuda for the TMA driver API.
+# DSV4_TC=0 leaves out the opt-in cuBLASLt MXFP8 path (DSV4_CUDA_TC=1 at run
+# time): the DLL then links no cuBLASLt and needs only cudart64_12.dll beside it
+# and the NVIDIA driver -- the form the Windows CUDA package ships (#2047):
+# cublasLt64_12.dll alone is hundreds of MB.
+DSV4_TC ?= 1
+ifeq ($(DSV4_TC),0)
+DSV4_DLL_TC = -DCOLI_DSV4_NO_TC
+DSV4_DLL_LIBS = -lcudart -lcuda
+else
+DSV4_DLL_TC =
+DSV4_DLL_LIBS = -lcublasLt -lcudart -lcuda
+endif
 cuda-dsv4-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	@cl 2>&1 | grep -qE "x64|AMD64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
-	"$(NVCC)" $(NVCCFLAGS) --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=/Zc:preprocessor -shared \
+	"$(NVCC)" $(NVCCFLAGS) $(DSV4_DLL_TC) --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=/Zc:preprocessor -shared \
 		-Xlinker /DEF:dsv4.def \
-		-L"$(CUDA_HOME)/lib/x64" -lcublasLt -lcudart -lcuda \
+		-L"$(CUDA_HOME)/lib/x64" $(DSV4_DLL_LIBS) \
 		backend_cuda_dsv4.cu -o coli_cuda_dsv4.dll
 
 # The DeepGEMM sm120 headers come from tools/fetch_deepgemm.sh (pinned
@@ -1036,10 +1073,10 @@ cuda-dsv4-dg-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def $(DEEPGEMM_S
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	@cl 2>&1 | grep -qE "x64|AMD64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
 	"$(NVCC)" -O3 -std=c++20 -ftz=false --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=/Zc:preprocessor \
-		-gencode arch=compute_120a,code=sm_120a -DCOLI_DSV4_DEEPGEMM \
+		-gencode arch=compute_120a,code=sm_120a -DCOLI_DSV4_DEEPGEMM $(DSV4_DLL_TC) \
 		$(DEEPGEMM_INC) -shared \
 		-Xlinker /DEF:dsv4.def \
-		-L"$(CUDA_HOME)/lib/x64" -lcublasLt -lcudart -lcuda \
+		-L"$(CUDA_HOME)/lib/x64" $(DSV4_DLL_LIBS) \
 		backend_cuda_dsv4.cu -o coli_cuda_dsv4_dg.dll
 
 # Windows: the decode-path kernels validated through the runtime DLL loader.
@@ -1223,12 +1260,18 @@ tests/test_dsv4_mhc$(EXE): tests/test_dsv4_mhc.c
 tests/test_dsv4_quant$(EXE): tests/test_dsv4_quant.c
 	$(CC) $(CFLAGS) tests/test_dsv4_quant.c -o tests/test_dsv4_quant$(EXE) $(LDFLAGS)
 # convenience alias: kernel correctness on AMD (same test, hipcc toolchain)
+# The dense chain's ops against their CPU references, on a real device (cuda_chain.cu).
+cuda-chain-check: backend_cuda.o cuda_chain.o
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_chain.cu -o cuda_chain_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	./cuda_chain_test$(EXE)
+
 hip-test:
 	$(MAKE) cuda-test HIP=1
 
 # CI: compile the backend and its test binary WITHOUT executing them (for
 # runners with the toolchain but no GPU). Pass CUDA_ARCH/HIP=1+HIP_ARCH.
-gpu-compile: backend_cuda.o
+gpu-compile: backend_cuda.o cuda_chain.o
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_chain.cu -o cuda_chain_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE) $(GPU_TEST_LIBS)
@@ -2100,6 +2143,9 @@ tests/test_serve_codec$(EXE): tests/test_serve_codec.c
 tests/test_serve_budget$(EXE): tests/test_serve_budget.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_cpu_check$(EXE): tests/test_cpu_check.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_segment_runtime$(EXE): tests/test_segment_runtime.c tests/segment_runtime.o
 	$(CC) $(CFLAGS) tests/test_segment_runtime.c tests/segment_runtime.o -o $@ $(LDFLAGS)
 # segment_runtime.c as its own object, compiled with the flags this test gave it on
@@ -2267,6 +2313,19 @@ fuzz-rans: tests/fuzz_rans.c rans.h
 	  -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
 	  tests/fuzz_rans.c -o tests/fuzz_rans -lm
 	./tests/fuzz_rans
+
+# Structured-mutation fuzz for the GLM-5.3 expert worker's wire parser under
+# ASan+UBSan: glm53_worker_serve_one() over a socketpair with the int4 tiny
+# fixture loaded, well-formed traffic mutated at the byte and field level,
+# well-formed requests checked for a well-formed reply. Seeded and bounded
+# (FUZZ_ITERS, default 3000). NOT a test gate; build+run on demand:
+#   make fuzz-glm53-worker GLM53_FUZZ_FIXTURE=/tmp/glm53_stream-i4
+fuzz-glm53-worker: tests/fuzz_glm53_worker.c glm53.c
+	$(CC) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+	  -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+	  -Wno-misleading-indentation -Wno-format-truncation \
+	  tests/fuzz_glm53_worker.c -o tests/fuzz_glm53_worker -lm
+	ASAN_OPTIONS=detect_leaks=0 ./tests/fuzz_glm53_worker $(GLM53_FUZZ_FIXTURE)
 
 tests/test_int3$(EXE): tests/test_int3.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
@@ -2657,6 +2716,17 @@ tests/test_qwen36_tier_init_failure$(EXE): tests/test_qwen36_tier_init_failure.c
 tests/test_qwen36_tier_fp8$(EXE): tests/test_qwen36_tier_fp8.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# Same fake backend, qwen36 below full residency (#2090): cap < n_experts in copy
+# mode, the engine's planar int4 staged as the container's pairs, hits keeping
+# residents warm, the trunk-only cases, and cap == n_experts as before.
+tests/test_qwen36_tier_stream$(EXE): tests/test_qwen36_tier_stream.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# The qwen36 engine on the fake tier over the int4 gs64 fixture, at a cap below,
+# at and above n_experts: its last logits against the CPU build's (ci.yml).
+tests/test_qwen36_tier_stream_engine$(EXE): tests/test_qwen36_tier_stream_engine.c qwen36.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
 # Failed gate/up/down uploads must release every unpublished CUDA tensor.
 tests/test_qwen36_tier_rollback$(EXE): tests/test_qwen36_tier_rollback.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
@@ -2686,6 +2756,11 @@ tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c q
 
 # The DeltaNet layer on the GPU (Q36_DN_GPU=1): outputs and state against the CPU path, fake backend.
 tests/test_qwen36_dn_gpu$(EXE): tests/test_qwen36_dn_gpu.c qwen36.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# The CUDA dense chain (COLI_CUDA_CHAIN=1, qwen36_cuda_chain.h): logits, state, verify
+# rollback and a lost device against the CPU path, on the fake backend's host-side table.
+tests/test_qwen36_cuda_chain$(EXE): tests/test_qwen36_cuda_chain.c qwen36.c qwen36_tier.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # dnout / attnproj / shexp offered, placed and served from VRAM (fake backend).

@@ -126,6 +126,15 @@ picks at start-up by GPU:
 | `coli_cuda_dsv4_dg.dll` | `make cuda-dsv4-dg-dll` (from a vcvars64 shell; fetches the pinned DeepGEMM headers on first use) | DeepGEMM tensor-core prefill paths + generic kernels | compute capability 12.x (RTX 50-series) |
 | `coli_cuda_dsv4.dll` | `make cuda-dsv4-dll CUDA_ARCH=portable` | generic CUDA kernels only (fp32 compute from fp8/fp4 decode) | any sm_80+ (RTX 30/40/50, A/H series) |
 
+The release's Windows CUDA package (`colibri-<tag>-windows-x86_64-cuda.zip`)
+carries both, built with `DSV4_TC=0`: that leaves out the opt-in cuBLASLt
+MXFP8 path (`DSV4_CUDA_TC=1`), so the DLLs need only the `cudart64_12.dll`
+shipped beside them and the NVIDIA driver, not cuBLASLt's hundreds of MB.
+Unpacked next to the main archive's `deepseek_v4.exe`, the tier is on by
+default (`DSV4_CUDA=0` turns it off). A DLL that is not in the engine's folder
+and one whose own dependency is missing are told apart at start-up; Windows
+reports both as error 126.
+
 The DeepGEMM sm120 headers the DLL needs are not in the repository:
 `c/tools/fetch_deepgemm.sh` checks out the community sm120 port of DeepGEMM
 (MIT; upstream DeepGEMM has no sm120 kernels) plus its CUTLASS/CuTe submodule
