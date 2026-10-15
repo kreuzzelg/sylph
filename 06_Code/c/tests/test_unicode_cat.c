@@ -35,6 +35,7 @@ static void expect_pieces(const char *s, const char **want, int nwant) {
 #define PIECES(s, ...) do { const char *w[] = {__VA_ARGS__}; expect_pieces(s, w, (int)(sizeof w / sizeof w[0])); } while (0)
 
 int main(void) {
+    g_tok_llama = 1;   /* the classes of a GGUF tokenizer (load_tokenizer_gguf sets this); the container keeps upstream's tables */
     /* classes */
     CHECK(uclass('a') == U_L && uclass('Z') == U_L && uclass('7') == U_N && uclass(' ') == U_W && uclass('.') == U_P, "ASCII classes");
     CHECK(uclass(0x0259) == U_L, "U+0259 schwa is a letter");
