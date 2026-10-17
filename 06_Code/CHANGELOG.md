@@ -6,6 +6,8 @@
   `COLI_CUDA_CHAIN=1` and `Q36_DN_GPU=1` run on a GGUF (before: device lost / "GPU step failed"). RTX 3070,
   unsloth UD-Q4_K_M, warm heat file: tier 24 → DeltaNet-on-GPU 27 → chain 32.5 tok/s, identical greedy text.
   `make cuda-test-gq` gains B5 (chain GEMM == gq_dot_row_ref).
+- GGUF CPU misses of the CUDA tier run as one `gq_moe_run` per token and layer (scratch reused): tier-only 11.8 → 10.1
+  ms/token on the misses; the measured gap to Ollama (23 vs 30 ms/token) is itemised in the tuning report.
 
 ## sylph 2026-10-15 — upstream colibrì `dev` merged (11dbb2c, 114 commits past v2.0.0)
 

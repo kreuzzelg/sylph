@@ -3623,13 +3623,33 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
 static void qt_cpu_misses(Model *m, int layer, const float *xs, const int *idx, const float *val,
                           uint32_t mask, float *os, float *g, float *u, float *hh) {
     Cfg *c = &m->c; int D = c->hidden, K = c->topk, I = c->inter;
-    if (m->is_gguf) {   /* sylph: raw blocks take the gq path (the numerics of gq_moe_run); the tier may copy the slab */
-        for (int kk = 0; kk < K; kk++) {
+    if (m->is_gguf) {
+        /* sylph: the token's misses as ONE gq_moe_run (two OpenMP regions, the same
+         * kernels and summation order as the resident path) instead of one expert at
+         * a time: on the RTX 3070 the per-expert loop cost 11-18 ms/token in fork/join
+         * and scratch churn, whatever the activation precision (2026-10-17). The run
+         * writes its own sum; it is added to os afterwards, in rank order. */
+        GqExpert ex[32]; const GqExpert *exp[32]; int ridx[32]; float rval[32]; Slot *held[32];
+        int n = 0;
+        for (int kk = 0; kk < K && n < 32; kk++) {
             if (idx[kk] < 0 || (mask & (1u << kk))) continue;
-            Slot *e = expert_hold(m, layer, idx[kk]);
+            Slot *e = held[n] = expert_hold(m, layer, idx[kk]);
             tier_offer_slot(layer, idx[kk], e);
-            gq_expert_cpu(e, xs, val[kk], os, g, u, hh, D, I);
-            slot_release(e);
+            ex[n].g = e->kq; ex[n].u = e->kq + e->kbytes[0]; ex[n].d = e->kq + e->kbytes[0] + e->kbytes[1];
+            ex[n].tg = e->ktype[0]; ex[n].tu = e->ktype[1]; ex[n].td = e->ktype[2];
+            exp[n] = &ex[n]; ridx[n] = idx[kk]; rval[n] = val[kk]; n++;
+        }
+        if (n) {
+            /* scratch kept across layers and tokens (one caller at a time: the decode loop);
+             * a malloc per layer cost measurable time at 2-3 misses a layer */
+            static void *scratch; static size_t scratch_cap; static float *tmp; static int tmp_cap;
+            size_t need = gq_moe_scratch_bytes(1, K, D, I);
+            if (need > scratch_cap) { free(scratch); scratch = malloc(need); scratch_cap = scratch ? need : 0; }
+            if (D > tmp_cap) { free(tmp); tmp = falloc(D); tmp_cap = D; }
+            if (!scratch || !tmp) { fprintf(stderr, "OOM qt_cpu_misses (gguf)\n"); exit(1); }
+            (gq_act_mode() ? gq_moe_run_i8 : gq_moe_run)(tmp, xs, 1, n, D, I, ridx, rval, exp, scratch);
+            for (int d = 0; d < D; d++) os[d] = GQ_FMA(1.f, tmp[d], os[d]);
+            for (int j = 0; j < n; j++) slot_release(held[j]);
         }
         return;
     }

@@ -48,3 +48,31 @@ COLI_CUDA=1 COLI_GPUS=0 COLI_PLACE=auto COLI_TRUNK_PROBE=0 CUDA_EXPERT_GB=auto C
 HEAT_FILE=heat.bin OMP_NUM_THREADS=12 OMP_PLACES=cores OMP_PROC_BIND=close COLI_TEMP=0 N_NEW=128 \
 SNAP=/path/to/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf 06_Code/c/qwen36 256 4 prompt.txt   # run twice: the 2nd has the heat
 ```
+
+## Why still slower than Ollama (measured the same afternoon)
+
+Ollama on the same file, same prompt, 256 greedy tokens: **43.5 tok/s** (23 ms/token). Its log says where the
+weights sit: `CUDA0 model buffer 4984 MiB`, `CUDA1 3213 MiB`, **`CUDA_Host model buffer 13247 MiB`** — 8.2 GB on
+the two cards, 13.2 GB of experts on the host, 12 threads. While it decodes the cards are 36 % and 14 % busy:
+most of its token is the CPU's expert work too. sylph's chain holds 6.4 GB on one card (1.65 GB trunk +
+4.7 GB experts), 71 % of expert reads hit VRAM, and the card is 50 % busy.
+
+One 128-token decode of sylph's chain, per token (`COLI_TIMERS=1`, the chain's own report):
+
+| phase | ms/token | note |
+|---|---|---|
+| waiting for the device | 12.3 | trunk + resident experts + DeltaNet; **~1 100 kernel launches per token** (97 725 ops / 128 forwards), the traffic itself is ~5 ms at 448 GB/s — the rest is launch and sync latency; ggml records the decode step as one CUDA graph |
+| routed experts on the host | 5.5–15 | 93 misses × 1.95 MB = 181 MB at 12–16 GB/s; the same path moves 29 GB/s when a layer has 8 experts to do (trunk-only run: 21.7 ms for 624 MB) — 2–3 misses a layer leave the OpenMP regions mostly idle |
+| everything else on the host | ~6 | routing top-k, sampling, frame bookkeeping, embedding row |
+| **total** | **30–34** | 29–34 tok/s; Ollama 23 ms |
+
+The device wait and the host misses are **serialised** in the chain (12.3 + 11 ≈ the token); the tier-only path
+overlaps them but keeps DeltaNet on the CPU (15 ms). Two cards do not help sylph (23 tok/s at 95 % hits): the
+tier gathers per token across devices, while ggml splits whole layers between cards and never crosses them
+inside a token. `QWEN_EXPERT_ACT=i8` changed nothing on the miss path (11.4 vs 11.8 ms): it is not compute-bound.
+
+Done today on the miss path: the token's misses go to one `gq_moe_run` (two OpenMP regions instead of three per
+expert, scratch reused) — tier-only 11.8 → 10.1 ms/token, the chain 32.5 → 33.9 tok/s in the better runs. The
+three levers left, in order of size: a CUDA graph for the chain's frame (upstream's design), overlapping the host
+misses with the device's resident experts inside a layer, and a planar/pinned expert layout for the CPU misses so
+a 2-expert layer still saturates memory bandwidth.
