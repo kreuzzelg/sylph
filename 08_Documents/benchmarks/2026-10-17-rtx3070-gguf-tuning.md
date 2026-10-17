@@ -76,3 +76,32 @@ expert, scratch reused) — tier-only 11.8 → 10.1 ms/token, the chain 32.5 →
 three levers left, in order of size: a CUDA graph for the chain's frame (upstream's design), overlapping the host
 misses with the device's resident experts inside a layer, and a planar/pinned expert layout for the CPU misses so
 a 2-expert layer still saturates memory bandwidth.
+
+## Nsight Systems on the chain (same run shape, 128 tokens, 29.3 tok/s under the profiler)
+
+`nsys profile --trace=cuda` (the `.qdstrm` imported by hand: this host's nsys lacks the importer on its path). The
+GPU is busy **3.78 s of the 4.4 s decode** — the chain is GPU-bound, and the kernels are sylph's own block kernels:
+
+| kernel | total | calls | per call | what it is | achieved bandwidth |
+|---|---|---|---|---|---|
+| `blk_matmul` | 580 ms | 3 810 (30/token) | 152 µs | DeltaNet in_proj, [12288 × 2048] Q8_0, 25 MB | ~165 GB/s |
+| `blk_matmul` | 655 ms | 10 160 (79/token) | 65 µs | out_proj / attention projections, 8 MB | ~130 GB/s |
+| `blk_matmul` | 430 ms | 12 700 (99/token) | 34 µs | shared expert, [2048 × 512] Q8_0, 1 MB | **~31 GB/s** |
+| `blk_matmul` | 178 ms | 128 (1/token) | 1 393 µs | lm_head, [248320 × 2048] Q6_K, 417 MB | ~300 GB/s |
+| `grouped_hidden_blk_dual` + `grouped_down_blk` | ~900 ms | ~1/layer/token | 120–180 µs | the resident routed experts, ~6 MB per call | **~36 GB/s** |
+| everything else (DeltaNet recurrence, norms, rope, attention, copies) | ~1 000 ms | | | | |
+
+The RTX 3070 streams ~400 GB/s from a well-shaped GEMV; the dense trunk alone (1.65 GB per token) should take
+~4 ms and takes ~15. The kernels keep the CPU reference's summation (8 lanes per row, `blk_row`), one block of
+32 rows: a [2048 × 512] matrix is 16 blocks on 46 SMs, and each lane reads one byte at a time. That design was
+chosen for the bit-exact contract with `gq_dot_row_ref`; it is now the biggest single cost on the card.
+
+Host-side CUDA API time is dominated by the warm start (4 839 `cudaMalloc`/`cudaMemcpy` for 1 613 experts × 3
+tensors), not by the decode loop; `cudaLaunchKernel` is 4.7 µs a call, 94 k calls — 0.44 s of the run.
+
+**CUDA graphs**: colibrì has graph capture only in the DeepSeek-V4 backend (`dsv4_cuda_graph_begin/end/launch`,
+unused by `qwen36`); the chain (`cuda_chain.cu`) issues ~1 100 launches a token with one host wait per layer
+(the routing is decided on the host). A micro-benchmark of exactly that shape on this card (1 094 tiny launches,
+40 event waits): 2.6 ms per token plain, 1.25 ms as 40 graphs — a graph would return ~1.4 ms of the ~30, not
+the gap to Ollama. The gap is in the two block kernels above (~10–12 ms per token of avoidable GPU time) and in
+the serialised host misses.
