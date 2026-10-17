@@ -2141,26 +2141,30 @@ extern "C" int coli_cuda_dn_step(ColiCudaDn *d, ColiCudaTensor *proj, ColiCudaTe
     if (!d || !proj || !outp || !x || !out || !egh || !beta) return 0;
     size_t proj_dim = (size_t)d->conv_dim + (size_t)d->vh * d->vdim, value_dim = (size_t)d->vh * d->vdim;
     size_t want_o = projz ? (size_t)d->conv_dim : proj_dim;
-    if (proj->fmt != 1 || proj->I != d->hidden || (size_t)proj->O != want_o || proj->device != d->device ||
-        outp->fmt != 1 || (size_t)outp->I != value_dim || outp->O != d->hidden || outp->device != d->device) return 0;
-    if (projz && (projz->fmt != 1 || projz->I != d->hidden || (size_t)projz->O != value_dim || projz->device != d->device)) return 0;
+    /* int8 rows (the container's dense-i8), or sylph's raw ggml blocks (fmt 16 + type): both
+     * go through quant_matmul_launch, which dispatches the block kernel itself */
+    #define DN_FMT_OK(f) ((f) == 1 || coli_cuda_block_fmt_supported(f))
+    if (!DN_FMT_OK(proj->fmt) || proj->I != d->hidden || (size_t)proj->O != want_o || proj->device != d->device ||
+        !DN_FMT_OK(outp->fmt) || (size_t)outp->I != value_dim || outp->O != d->hidden || outp->device != d->device) return 0;
+    if (projz && (!DN_FMT_OK(projz->fmt) || projz->I != d->hidden || (size_t)projz->O != value_dim || projz->device != d->device)) return 0;
+    #undef DN_FMT_OK
     if (!select_ctx(find_ctx(d->device))) return 0;
     DnGates g;
     for (int h = 0; h < d->vh; h++) { g.egh[h] = egh[h]; g.beta[h] = beta[h]; }
     if (!cuda_ok(cudaMemcpy(d->x, x, (size_t)d->hidden * sizeof(float), cudaMemcpyHostToDevice), "dn x upload")) return 0;
-    quant_matmul_launch(d->qkvz, d->x, proj->weights, proj->scales, 1, 1, d->hidden, (int)want_o,
-                        row_bytes(1, d->hidden), proj->gs, proj->ng);
+    quant_matmul_launch(d->qkvz, d->x, proj->weights, proj->scales, proj->fmt, 1, d->hidden, (int)want_o,
+                        row_bytes(proj->fmt, d->hidden), proj->gs, proj->ng);
     if (projz)
-        quant_matmul_launch(d->qkvz + d->conv_dim, d->x, projz->weights, projz->scales, 1, 1, d->hidden, (int)value_dim,
-                            row_bytes(1, d->hidden), projz->gs, projz->ng);
+        quant_matmul_launch(d->qkvz + d->conv_dim, d->x, projz->weights, projz->scales, projz->fmt, 1, d->hidden, (int)value_dim,
+                            row_bytes(projz->fmt, d->hidden), projz->gs, projz->ng);
     dn_conv_kernel<<<(unsigned)((d->conv_dim + 255) / 256), 256>>>(d->qkvz, d->ring, d->conv_w, d->conv_out, d->conv_dim, d->convk);
     int threads = d->kdim > d->vdim ? d->kdim : d->vdim;
     threads = ((threads + 31) / 32) * 32;
     dn_head_kernel<<<(unsigned)d->vh, threads>>>(d->conv_out, d->qkvz + d->conv_dim, d->rec, d->outr, d->norm_w, g,
                                                  d->vh / d->vk, d->kdim, d->vdim, d->vk * d->kdim,
                                                  1.f / sqrtf((float)d->kdim), d->eps, d->gate_sigmoid);
-    quant_matmul_launch(d->out, d->outr, outp->weights, outp->scales, 1, 1, (int)value_dim, d->hidden,
-                        row_bytes(1, (int)value_dim), outp->gs, outp->ng);
+    quant_matmul_launch(d->out, d->outr, outp->weights, outp->scales, outp->fmt, 1, (int)value_dim, d->hidden,
+                        row_bytes(outp->fmt, (int)value_dim), outp->gs, outp->ng);
     return cuda_ok(cudaGetLastError(), "dn step launch") &&
            cuda_ok(cudaMemcpy(out, d->out, (size_t)d->hidden * sizeof(float), cudaMemcpyDeviceToHost), "dn out download");
 }
@@ -3114,6 +3118,11 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
     DeviceContext *ctx = find_ctx(t->device);
     if (!select_ctx(ctx)) return 0;
     cudaStream_t st = (cudaStream_t)stream;
+    if (coli_cuda_block_fmt_supported(t->fmt)) {   /* sylph: a GGUF matrix as raw ggml blocks, on the chain's stream */
+        blk_matmul<<<dim3((unsigned)((t->O + 31) / 32), (unsigned)S), 256, 0, st>>>(y_dev, x_dev, (const uint8_t *)t->weights,
+                                                                                     t->fmt - COLI_FMT_GGML_BASE, S, t->I, t->O, row_bytes(t->fmt, t->I));
+        return cuda_ok(cudaGetLastError(), "chain blk gemm launch");
+    }
     if (t->fmt == 1 && S <= GEMV_I8_MAX_S && t->I % 16 == 0 && t->I <= 12288) {
         dim3 blocks((unsigned)((t->O + GEMV_I8_ROWS - 1) / GEMV_I8_ROWS), (unsigned)S);
         gemv_i8_rows<<<blocks, 256, (size_t)t->I * sizeof(float), st>>>(y_dev, x_dev, (const int8_t *)t->weights, t->scales, t->I, t->O);

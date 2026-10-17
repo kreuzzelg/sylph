@@ -1,5 +1,12 @@
 # Changelog
 
+## sylph 2026-10-17 — the CUDA chain and the DeltaNet GPU step take GGUF matrices
+
+- `coli_cuda_tensor_gemm_async` (the chain's GEMM) and `coli_cuda_dn_step` accept the raw ggml block formats;
+  `COLI_CUDA_CHAIN=1` and `Q36_DN_GPU=1` run on a GGUF (before: device lost / "GPU step failed"). RTX 3070,
+  unsloth UD-Q4_K_M, warm heat file: tier 24 → DeltaNet-on-GPU 27 → chain 32.5 tok/s, identical greedy text.
+  `make cuda-test-gq` gains B5 (chain GEMM == gq_dot_row_ref).
+
 ## sylph 2026-10-15 — upstream colibrì `dev` merged (11dbb2c, 114 commits past v2.0.0)
 
 - `tools/upstream_sync.py --branch dev`: the owner tracks colibrì's dev branch; the marker records the branch.

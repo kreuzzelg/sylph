@@ -38,6 +38,7 @@ void gq_ref_fill_blocks(int type, int nb, unsigned char *dst, int wide);
 void gq_ref_fill_x(float *x, int n);
 }
 #include "../backend_cuda.h"
+extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream);   /* cuda_chain.cu's entry (no header) */
 
 enum { T_Q8_0 = 8, T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14, T_Q4_0 = 2 };
 static const int TYPES[4] = { T_Q8_0, T_Q4_K, T_Q5_K, T_Q6_K };
@@ -170,6 +171,33 @@ int main() {
         }
         CHECK(bad == 0, "under load: %d mismatching outputs over 50 launches", bad);
         coli_cuda_tensor_free(t); coli_cuda_tensor_free(busy); free(w); free(wb);
+    }
+
+    puts("B5 the chain's device-pointer GEMM on raw blocks == gq_dot_row_ref (COLI_CUDA_CHAIN, Q36_DN_GPU)");
+    {
+        /* coli_cuda_tensor_gemm_async is the entry the CUDA chain (cuda_chain.cu) and, through
+         * quant_matmul_launch, the DeltaNet GPU step take; before 2026-10-17 neither knew the
+         * block formats and a GGUF run under COLI_CUDA_CHAIN=1 lost the device. */
+        const int types5[2] = { T_Q4_K, T_Q6_K };
+        for (int ti = 0; ti < 2; ti++) {
+            int type = types5[ti], I = 2048, O = 512; size_t rb = gq_ref_row_bytes(type, I);
+            unsigned char *w = rows(type, O, I, 0); ColiCudaTensor *t = NULL;
+            CHECK(coli_cuda_tensor_upload(&t, w, NULL, fmt_of(type), I, O, 0), "B5 upload %s", gq_ref_type_name(type));
+            std::vector<float> x(3 * (size_t)I), y(3 * (size_t)O, 0.f); gq_ref_fill_x(x.data(), 3 * I);
+            float *xd = NULL, *yd = NULL;
+            CHECK(cudaMalloc(&xd, x.size() * sizeof(float)) == cudaSuccess && cudaMalloc(&yd, y.size() * sizeof(float)) == cudaSuccess, "B5 device buffers");
+            cudaMemcpy(xd, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice);
+            int bad = 0;
+            for (int S = 1; S <= 3; S += 2) {
+                CHECK(coli_cuda_tensor_gemm_async(t, yd, xd, S, NULL), "B5 gemm_async %s S=%d", gq_ref_type_name(type), S);
+                cudaDeviceSynchronize();
+                cudaMemcpy(y.data(), yd, (size_t)S * O * sizeof(float), cudaMemcpyDeviceToHost);
+                for (int s = 0; s < S; s++) for (int o = 0; o < O; o++)
+                    if (!bits_equal(y[(size_t)s * O + o], gq_ref_dot(type, w + rb * (size_t)o, x.data() + (size_t)s * I, I))) bad++;
+            }
+            CHECK(bad == 0, "B5 %s: %d outputs differ from gq_dot_row_ref", gq_ref_type_name(type), bad);
+            cudaFree(xd); cudaFree(yd); coli_cuda_tensor_free(t); free(w);
+        }
     }
 
     coli_cuda_shutdown();
