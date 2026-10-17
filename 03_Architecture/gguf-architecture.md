@@ -488,6 +488,54 @@ chosen quant (467 GB / 21 GB dense at `UD-Q4_K_XL`).
 
 **Amendment 2026-10-14 (phase-7 tests written; design fixed by them).** (1) The sync to v2.0.0 is the first item because it touches every seam; its correctness has the old gates and three new contracts: `KV_SLOTS=n` on a GGUF source must be byte-identical to the same requests served alone (upstream's `tests/serve_mux_check.py` with the GGUF as its snapshot), the GGUF slot cache stays one cache across the conversations (`GGUF reads:` counts an expert once per step), and the Vulkan tier/chain knobs are **ignored by name** on a GGUF (`[GGUF] COLI_VK_TIER ignored: …`) — porting the K-quant kernels to Vulkan is not phase 7. (2) Hardening is a seeded mutation sweep plus structural edits written on purpose, judged by exit class (ok / refused with a rule / crash / hang / silent / foreign exception) across the C reader, `ggufinfo`, `coli gguf inspect`/`doctor` and both engines; the C reader and `ggufinfo` must give the same verdict on structural defects because they implement the same rules. (3) One reader: `ggufinfo` keeps its API (`open_set`, `GgufPart`, `TensorInfo`, `summarize`) and parses through `tools/gguf_reader.GGUFReader` (`GGUF_READER_IMPL`); the differential test is the net. (4) The GLM tokenizer test needs a 320-id vocabulary (256 bytes + merges + control tokens), hence `make_tiny_glm_hf.py --vocab`; `glm_tok_load` refuses a foreign `pre`. (5) `tools/efficiency_report.py` reads the engines' own lines (`STAT`, `DONE … STAT`, `PROF`, `GGUF reads:`, the cache line) and never a wall clock it cannot attribute; bytes/token for the container is `misses × bytes per expert` from `coli plan`; the CI subset asserts the accounting identities and the report structure, never a speed.
 
+
+**Amendment 2026-10-17 (phase 8: throughput of the device kernels; design fixed before the work).**
+Measured on the owner's RTX 3070 with Nsight Systems (`08_Documents/benchmarks/2026-10-17-rtx3070-gguf-tuning.md`):
+under `COLI_CUDA_CHAIN=1` the card is busy 85 % of the decode and the time is in sylph's own block kernels —
+`blk_matmul` (the dense trunk as raw blocks) at 31–165 GB/s depending on the shape, `grouped_hidden_blk_dual` /
+`grouped_down_blk` (the resident routed experts) at ~36 GB/s, against ~400 GB/s the card streams from a
+well-shaped GEMV. Ollama's lead on the same file (43.5 vs 29–34 tok/s) is this, not placement (it holds 8.2 GB on
+two cards and 13.2 GB of experts on the host, cards 36 %/14 % busy) and not kernel launches (1 094 launches and 40
+host waits a token cost 2.6 ms here; as 40 CUDA graphs 1.25 ms — colibrì has graph capture only in the DeepSeek-V4
+backend, unused by `qwen36`).
+
+*Why the kernels are slow.* One thread per (row, lane): 8 lanes × 32 rows = one 256-thread block, each lane walks
+its row's elements `lane, lane+8, …` with one-byte loads and one dependent fma chain; `blk_row` reduces the eight
+partials through shared memory. So (1) a [2048 × 512] matrix is 16 blocks on 46 SMs (the shared expert, 120 calls a
+token, 31 GB/s), (2) a warp touches four rows 2 KB apart with 8-byte spans, (3) nothing hides the load latency but
+occupancy, which (1) denies. The structure was chosen for the contract that still holds: **bit-identical to
+`gq_dot_row_ref`** (lane = element & 7 inside each 32-block, fma per element, the type's scale folded per lane,
+the fixed 8→1 tree) — `tests/test_gq_cuda.cu` B1/B2/B5 pin it, and it is what lets the CPU path and the tier print
+the same dumps.
+
+*Design.* Three steps, each gated by `make cuda-test-gq` (bit-exact, unchanged) and measured by a device bench
+written first (`tests/bench_gq_cuda.cu`, `make bench-gq-cuda`: µs and GB/s per shape — the trunk's five shapes
+and the expert group — before and after):
+
+- **Step A, geometry.** Rows per block become a template parameter `R ∈ {32, 8, 2}` (8, 2 for small `O`); the
+  launcher picks `R` so the grid holds at least twice the SM count; the reduction buffer is sized by `R`. No
+  arithmetic changes.
+- **Step B, cooperative loads.** One warp per row: all 32 lanes copy the row's `rb` bytes into shared memory with
+  coalesced 4-byte loads (the 34/144/176/210-byte blocks are unaligned in the row, so the copy is word-granular
+  with a byte tail), the activation vector likewise once per block (8 KB for I = 2048, shared by every row of the
+  block); the eight compute lanes then read shared memory in the reference order and keep the reference's fma
+  chains and tree. The memory system sees long coalesced streams; the arithmetic is unchanged. Shared memory per
+  block = `R × rb + 4·I` bytes (R = 8, rb = 4352: 43 KB — inside the 48 KB default).
+- **Step C.** The same two steps for `grouped_hidden_blk_dual` / `grouped_down_blk` (K experts × rows, the dual
+  gate/up read).
+
+Targets (the bench decides, the end-to-end tuning protocol confirms): dense ≥ 250 GB/s on the 25 MB in_proj,
+≥ 120 GB/s on the 1 MB shared-expert matrix, groups ≥ 150 GB/s; end to end, the chain's per-token device time
+from ~12 ms toward ~6 ms, i.e. 30 ms → ~24 ms a token (≈ Ollama's 23).
+
+*Rejected for now.* (a) 32 lanes per row (would change the summation order, hence the CPU kernels — AVX2's eight
+lanes — and the E1 record of 2026-10-15; a later phase may redefine the reference deliberately). (b) CUDA graphs
+for the chain's frames (1.4 ms a token by the micro-benchmark; the attention kernel's growing context length is a
+by-value argument the graph would have to patch). (c) int8 activations on the device (a named deviation, not the
+reference). After the kernels: the host misses' overlap with the device's frame (`qt_cpu_misses` runs while the
+shared-expert frame computes, but the next layer waits for both), and G3 of `gpu_rtx3070.md` (E1–E3 CPU vs CUDA
+through the harness, `--deviation COLI_CUDA=1 --cap 256`), still open.
+
 ## 12. Phased plan (details and status in `../04_Tasks/tasks.md`)
 
 | Phase | Deliverables | Exit |
@@ -499,6 +547,7 @@ chosen quant (467 GB / 21 GB dense at `UD-Q4_K_XL`).
 | 5 — GPU | K-quant and `Q8_0`-group uploads/kernels in the tier; placement on the RTX 3070; E1–E3 CPU vs CUDA | tier bit-equal to CPU; A/B on the card |
 | 6 — breadth | GLM-5.2 (`glm-dsa`, v1 design), MTP, more types, upstream sync tooling | per item (done 2026-10-09) |
 | 7 — consolidation | upstream v2.0.0 merged (`KV_SLOTS` on GGUF, Vulkan knobs by name), hardening (mutation sweep, truncation, split sets), one stdlib reader, GLM tokenizer test, `tools/efficiency_report.py` (the R2 verdict) | `multi_slot_gguf.md`, `gguf_hardening.md`, `efficiency_verdict.md` green; the owner's efficiency report in `08_Documents/benchmarks/` |
+| 8 — device throughput | `bench_gq_cuda`, the block kernels' geometry and cooperative loads (dense and group), the end-to-end tuning protocol, G3 CPU vs CUDA, the host-miss overlap | `make cuda-test-gq` bit-exact throughout; bench targets met; chain ≥ 40 tok/s on the RTX 3070 with the warm heat file |
 
 ## 13. Open design decisions
 

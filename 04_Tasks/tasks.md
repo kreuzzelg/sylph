@@ -122,6 +122,21 @@ Pre-conditions (met 2026-10-14): `07_Tests/IntegrationTest/multi_slot_gguf.md` (
 - [ ] docs: `docs/gguf.md` (slots, hardening, the verdict tool), `ENVIRONMENT.md`, CHANGELOG, state tables, architecture amendment
 - [ ] **Owner decisions** carried over: §9 c (Qwen MTP head), §9 d (GLM-5.2 host/quant), the I-quant types, the `coli` launcher name
 
+## Phase 8 — device throughput (owner's RTX 3070; design: architecture amendment 2026-10-17)
+
+Pre-condition: the Nsight breakdown of 2026-10-17 (`08_Documents/benchmarks/2026-10-17-rtx3070-gguf-tuning.md`) —
+the card is busy 85 % of the decode, in `blk_matmul` (31–165 GB/s) and the grouped expert kernels (~36 GB/s).
+Every step keeps `make cuda-test-gq` bit-exact (B1/B2/B5) and is measured by the bench before and after.
+
+- [ ] 8.0 `tests/bench_gq_cuda.cu` + `make bench-gq-cuda`: µs and GB/s per shape (in_proj 12288×2048 Q8_0, out_proj 2048×4096 Q8_0, attention 8192×2048 Q8_0, shared expert 2048×512 Q8_0 and Q6_K, lm_head 248320×2048 Q6_K; expert group K = 8 of Q4_K/Q4_K/Q5_K at 512×2048); baseline recorded in `08_Documents/benchmarks/` before any kernel changes
+- [ ] 8.1 Step A — rows per block as a template parameter, launcher picks it from `O` and the SM count; gate: `cuda-test-gq` all passed; bench delta recorded
+- [ ] 8.2 Step B — one warp per row, cooperative coalesced loads into shared memory, compute lanes unchanged; gate: `cuda-test-gq`; targets dense ≥ 250 GB/s (25 MB) and ≥ 120 GB/s (1 MB)
+- [ ] 8.3 Step C — the same for `grouped_hidden_blk_dual` / `grouped_down_blk`; gate: B2; target ≥ 150 GB/s
+- [ ] 8.4 end to end: the tuning protocol (chain and tier-only, frozen heat file, 128 and 256 tokens), text identity across the paths, a row in the tuning report and the state table of `gpu_rtx3070.md`
+- [ ] 8.5 G3 of `gpu_rtx3070.md`: E1–E3 sylph-CPU vs sylph-CUDA through the harness (`--deviation COLI_CUDA=1`, `--cap 256`), bounds per the test; `08_Documents/equivalence/`
+- [ ] 8.6 host misses vs the device frame: measure the serialisation in the chain after 8.1–8.3 (`host_ms` vs `wait_ms`); overlap the next layer's dense frame with the miss computation only if the numbers still show it
+- [ ] 8.7 (deferred) CUDA graphs per frame — 1.4 ms a token by the micro-benchmark; after 8.1–8.3, and only with the attention length moved off the kernel arguments
+
 ## Phase 7b — first pass on the owner's host (RTX 3070, Ollama, llama.cpp; 2026-10-14/15)
 
 The repository was built in a cloud container without GPU, model files or references; this
