@@ -17,8 +17,12 @@ until this session (below). Numbers are single runs of a short prompt: ±1 tok/s
 | chain, `COLI_LOOKUP=0` | 31.8 | 71 % | lookup decoding adds ~2 %; with the chain its timing gate makes the text run-dependent at near-ties |
 | chain, `COLI_GPUS=0,1` (both cards) | 23.3 | 95 % | more experts in VRAM, slower: the cross-device synchronisation costs more than the misses it saves |
 | chain, `QWEN_EXPERT_ACT=i8` (a deviation) | 28.4 | — | faster CPU misses, different text; not the reference configuration |
+| **chain after the phase 8 kernels** (same frozen heat file, 128 tokens; `2026-10-17-rtx3070-blk-kernels.md`; after the init-race fix below, 8/8 runs correct) | **52.8 / 54.2** (two runs) | 71 % | device wait 12.3 → 6.4 ms a token; the greedy text byte-identical to the 33.8 tok/s pre-phase-8 chain run and to tier-only |
+| chain after phase 8, 256 new tokens | 55.4 | 67 % | the 256-token text continues the 128-token text |
+| tier-only after phase 8 (`COLI_CUDA_CHAIN=0`, DeltaNet on the CPU) | 30.6 | 72 % | was 24.2: the tier's expert groups and the dense trunk on the device got faster, DeltaNet (10.7 ms) and the misses (10.4 ms) did not |
 
-For scale: Ollama on the same file and card measured 43.9 tok/s (2026-10-15), the gs64 container on the CPU 14.8,
+For scale: Ollama on the same file and card measured 43.9 tok/s (2026-10-15; 43.5 the same afternoon as the chain
+rows), the gs64 container on the CPU 14.8,
 sylph-GGUF on the CPU 12.3–14.1.
 
 ## What was fixed
@@ -76,6 +80,32 @@ expert, scratch reused) — tier-only 11.8 → 10.1 ms/token, the chain 32.5 →
 three levers left, in order of size: a CUDA graph for the chain's frame (upstream's design), overlapping the host
 misses with the device's resident experts inside a layer, and a planar/pinned expert layout for the CPU misses so
 a 2-expert layer still saturates memory bandwidth.
+
+**After the phase 8 kernels (same afternoon, same frozen heat file):** the chain's own report per decode token
+reads 6.4 ms waiting for the device (was 12.3), 7.3 ms of routed experts on the host (was 11.1 in that run; 5.5
+`cpu-miss` + the take), `step()` 16.7 ms, 53–54 tok/s. The device is no longer the larger half; the three levers
+above stay in the same order with the host misses first.
+
+## A race in the chain's init, found by the faster kernels (fixed the same day)
+
+After the kernel work the chain produced garbage from the first token in about half of its runs (identical
+command, identical heat file; the other half byte-identical to the CPU text). `CUDA_LAUNCH_BLOCKING=1` made every
+run correct, so it was an ordering problem, not arithmetic: `make cuda-test-gq` and two standalone probes (the
+lm_head shape on a non-blocking stream with mapped output; an expert group concurrent with GEMMs on a second
+stream) were bit-exact throughout, and a new `QT_VERIFY=1` (every device expert result against `gq_dot_row_ref`
+inside `qt_take`) found 1 370 of 1 370 results right in a garbage run. `DUMP_LAYERS` then showed the layer-0
+DeltaNet output **exactly zero** in the bad runs with the same input row, and a read-back of the chain's
+parameter buffer right after its init upload read zeros: `cc_buf` (`cuda_chain.cu`, upstream colibrì) zeroes a
+new device buffer with a plain `cudaMemset` — legacy stream, asynchronous to the host — and the parameter arena
+then goes up with `cudaMemcpyAsync` on the chain's *non-blocking* stream. The two are unordered on the device;
+when the legacy stream is backed up (the engine's trunk uploads just before the chain's init) the memset lands
+after the copy and wipes every norm weight, conv filter and DeltaNet gate. The faster kernels and the heat file
+only changed the timing. Fix: `cudaMemsetAsync` on the chain's stream (same file), which also orders the zeroing
+of the scratch buffers `cc_reserve` grows during a frame. A second, smaller hazard of the same family was closed
+in `coli_cuda_tensor_upload`/`_overwrite`: `cudaMemcpy` from pageable memory returns before the DMA has landed,
+and the tier publishes the slot at once to kernels on a non-blocking stream; the copies now go on a per-device
+upload stream and are waited for there (no device-wide sync). After both: 8/8 short runs and the 128/256-token
+runs above correct and identical. Upstream has the first bug too (`cc_buf` is theirs): to report.
 
 ## Nsight Systems on the chain (same run shape, 128 tokens, 29.3 tok/s under the profiler)
 

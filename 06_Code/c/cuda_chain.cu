@@ -381,7 +381,15 @@ static CcBuf *cc_buf(size_t bytes, int kind) {
     if (!b) return nullptr;
     b->kind = kind; b->dev = c->device; b->bytes = bytes;
     if (kind == CC_DEV) {
-        if (cudaMalloc((void **)&b->d, bytes) != cudaSuccess || cudaMemset(b->d, 0, bytes) != cudaSuccess) {
+        /* The zeroing goes on the chain's stream, not the legacy one: c->stream is non-blocking,
+         * so a plain cudaMemset (legacy stream, asynchronous to the host) is unordered against the
+         * cudaMemcpyAsync/kernels that follow on c->stream, and when the legacy stream is backed up
+         * (the engine's trunk uploads just before the chain's init) it landed AFTER the parameter
+         * arena's upload and wiped it -- every norm weight, conv filter and DeltaNet gate zero, the
+         * DeltaNet output exactly zero, garbage from the first token in about half the runs. Found on
+         * the owner's RTX 3070 (sylph, 2026-10-17) once the block kernels got fast enough to change
+         * the timing; the same race covers the scratch buffers cc_reserve grows during a frame. */
+        if (cudaMalloc((void **)&b->d, bytes) != cudaSuccess || cudaMemsetAsync(b->d, 0, bytes, c->stream) != cudaSuccess) {
             (void)cudaGetLastError();
             if (b->d) cudaFree(b->d);
             std::free(b);

@@ -12,6 +12,7 @@
 #include "qwen36_tier.h"
 #include "backend_cuda.h"
 #include "tier.h"
+#include "gq.h"   /* QT_VERIFY: the CPU reference of a resident expert next to the device's result */
 
 #define QT_MAX_DEV 8
 /* Max rows in one issued group = max topk. The stride of a device's input
@@ -66,6 +67,7 @@ static struct {
     /* issue state of the (single) decode thread */
     int is_cnt[QT_MAX_DEV];
     int is_k[QT_MAX_DEV][QT_MAX_ROWS];
+    const QSlot *is_slot[QT_MAX_DEV][QT_MAX_ROWS]; int is_layer;   /* QT_VERIFY */
     float *is_x; size_t is_x_floats;      /* QT_MAX_ROWS*D input replicas per device */
     /* M3 */
     int *fill_order; int fill_cur;        /* warmstart order (heat desc) */
@@ -606,6 +608,8 @@ static void auto_place(int nl, int ne, int topk, const size_t *capacity, const u
 static int G_fp8_stream;
 static const float *G_fp8_lut;
 static int G_upload_sync;             /* QT_UPLOAD_SYNC=1: qt_issue waits for in-flight uploads first (tests) */
+static int G_verify;                  /* QT_VERIFY=1: every device group result against gq_dot_row_ref (GGUF experts; diagnostics) */
+static long G_verify_calls, G_verify_bad;
 
 int qt_init_fp8(int nl, int ne, int D, int Ih, int cap, int topk, const float *e4m3_lut){
     if(G.on) return 0;
@@ -674,6 +678,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         fprintf(stderr,"[qtier] RAM holds %d of %d experts a layer: the tier copies each expert it takes as it passes\n",cap,ne);
     memset(&G,0,sizeof G);
     { const char *e=getenv("QT_UPLOAD_SYNC"); G_upload_sync=e&&*e&&*e!='0'; }
+    { const char *e=getenv("QT_VERIFY"); G_verify=e&&*e&&*e!='0'; }
     G.nl=nl; G.ne=ne; G.D=D; G.Ih=Ih; G.topk=topk;
     /* Placement state is re-derived per init: the device fold-in below reads
      * COLI_PLACE before the automatic placement has decided anything, and a
@@ -1605,7 +1610,7 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
             if(s->heat<0xFFFFFFFFu) s->heat++;
             int di=home2(layer,eids[k]); int c=G.is_cnt[di];
             tg[di][c]=s->tg; tu[di][c]=s->tu; td[di][c]=s->td;
-            G.is_k[di][c]=k; G.is_cnt[di]=c+1;
+            G.is_k[di][c]=k; G.is_slot[di][c]=s; G.is_layer=layer; G.is_cnt[di]=c+1;
             mask|=1u<<k; G.hits[di]++;
         } else G.miss++;
     }
@@ -1639,6 +1644,18 @@ int qt_take(uint32_t mask,const float *val,int K,float *out){
             ok=0;
         }
     }
+    if(G_verify && ok && G.kq_mode) for(int di=0;di<G.ndev;di++) for(int j=0;j<G.is_cnt[di];j++){
+        /* the CPU reference of this expert on the row the device got: gate/up rows dotted with
+         * x (gq_dot_row_ref), SiLU(g).u, down rows dotted with h; the device's silu is expf */
+        const QSlot *s=G.is_slot[di][j]; const float *x=G.is_x+(size_t)di*QT_MAX_ROWS*G.D+(size_t)j*G.D;
+        const float *row=result[di]+(size_t)j*G.D; int D=G.D, Ih=G.Ih;
+        size_t rbg=s->kb[0]/Ih, rbu=s->kb[1]/Ih, rbd=s->kb[2]/D;
+        float *h=malloc(sizeof(float)*Ih); double worst=0; int bad=0; int wd=-1; float wg=0,wr=0;
+        for(int o=0;o<Ih;o++){ float g=gq_dot_row_ref(s->kt[0],s->g4+(size_t)o*rbg,x,D), u=gq_dot_row_ref(s->kt[1],s->u4+(size_t)o*rbu,x,D); h[o]=(g/(1.f+expf(-g)))*u; }
+        for(int d=0;d<D;d++){ float y=gq_dot_row_ref(s->kt[2],s->d4+(size_t)d*rbd,h,Ih); double rel=fabs((double)y-row[d])/(1e-3+fabs(y)); if(rel>worst){worst=rel;wd=d;wg=y;wr=row[d];} if(rel>1e-2) bad++; }
+        free(h); G_verify_calls++;
+        if(bad){ G_verify_bad++; long gi=s-G.slot; if(G_verify_bad<=12) fprintf(stderr,"[qt-verify] layer %d expert %ld slot j=%d of %d: %d/%d outputs off (worst rel %.3g at d=%d: cpu %g dev %g)\n",G.is_layer,gi%G.ne,j,G.is_cnt[di],bad,D,worst,wd,wg,wr); }
+    }
     /* Do not publish a partial contribution when any device failed. */
     for(int di=0;di<G.ndev;di++){
         if(ok && result[di]) for(int j=0;j<G.is_cnt[di];j++){
@@ -1657,6 +1674,7 @@ int qt_take(uint32_t mask,const float *val,int K,float *out){
 
 void qt_stats(void){
     if(!G.on) return;
+    if(G_verify) fprintf(stderr,"[qt-verify] %ld expert results checked against gq_dot_row_ref, %ld wrong\n",G_verify_calls,G_verify_bad);
     uint64_t hits=0; size_t res=0;
     for(size_t i=0;i<(size_t)G.nl*G.ne;i++) res += G.slot[i].resident;
     fprintf(stderr,"[qtier] resident %zu/%d experts | uploads %llu | miss(CPU) %llu | q_skips %llu\n",

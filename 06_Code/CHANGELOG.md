@@ -1,5 +1,23 @@
 # Changelog
 
+## sylph 2026-10-17 — phase 8: the raw-block device kernels at memory speed
+
+- `backend_cuda.cu`: `blk_matmul`, `grouped_hidden_blk_dual`, `grouped_down_blk` as templates over rows per block
+  (32 or 8), staging and type; the eight lanes of a row load 4-byte spans and exchange them with `__shfl_sync`;
+  the activation row staged in shared memory for the K-quant lanes; `__launch_bounds__` (40 registers Q8_0, 64
+  K-quants); the Q4_K/Q5_K min-term sums once per block. Same arithmetic: `make cuda-test-gq` bit-exact (B1/B2/B5).
+  RTX 3070 (`make bench-gq-cuda`): in_proj 174 → 376 GB/s, shared expert 50 → 126, lm_head 271 → 345, expert group
+  K = 8 52 → 156. End to end with the chain and the warm heat file: 33.8 → 53 tok/s, text unchanged (Ollama 43.5).
+  `COLI_BLK_ROWS=8|32` and `COLI_BLK_STAGE=0|1` force the policies for A/Bs.
+- `tests/bench_gq_cuda.cu` (`make bench-gq-cuda [BENCH_ITERS=n]`): device throughput per trunk shape and expert group.
+- **Chain init race fixed** (`cuda_chain.cu`, upstream code): `cc_buf` zeroed a new device buffer with a legacy-stream
+  `cudaMemset`, unordered against the parameter arena's `cudaMemcpyAsync` on the chain's non-blocking stream; with
+  the legacy stream backed up by the trunk uploads the memset landed after the copy and wiped the norms, conv filters
+  and DeltaNet gates (garbage from the first token in about half the runs once the kernels were fast). Now
+  `cudaMemsetAsync` on the chain's stream. `coli_cuda_tensor_upload`/`_overwrite` wait for their DMA on a per-device
+  upload stream before the tier publishes the slot (pageable `cudaMemcpy` returns earlier than that).
+- `QT_VERIFY=1`: `qt_take` checks every device expert result against `gq_dot_row_ref` on the raw slab (diagnostics).
+
 ## sylph 2026-10-17 — the CUDA chain and the DeltaNet GPU step take GGUF matrices
 
 - `coli_cuda_tensor_gemm_async` (the chain's GEMM) and `coli_cuda_dn_step` accept the raw ggml block formats;

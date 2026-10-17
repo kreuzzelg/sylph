@@ -498,6 +498,7 @@ read on every token), so on an 8 GB card about 2 GB remain for hot experts;
 | `Q38_TRUNK_MIN_KB=<n>` | offer matrices of at least n KiB (default 1024; a round trip costs more than a tiny GEMV saves) |
 | `Q38_TRUNK_SKIP=name,name` | leave the named components on the CPU (bisecting, or a component that does not pay) |
 | `QT_UPLOAD_SYNC=1` | the tier's `qt_issue` waits for every in-flight upload first (tests and diagnostics: deterministic residency, no upload/compute overlap) |
+| `QT_VERIFY=1` | `qt_take` recomputes every device expert result on the CPU from the raw slab (`gq_dot_row_ref`) and reports mismatches; sylph GGUF experts; slow — diagnostics only |
 | `Q38_TRUNK_CPU_INT8=0` | keep the trunk BF16 on the CPU with the f32 kernel (the numeric reference); the default is int8 rows with integer dot products, GPU or not |
 | `Q38_TRUNK_SELFTEST=1` | at start, every placed matrix is checked once: GPU GEMV against the same int8 rows on the CPU (relative error printed per matrix) |
 

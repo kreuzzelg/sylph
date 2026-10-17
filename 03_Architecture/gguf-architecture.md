@@ -528,6 +528,24 @@ Targets (the bench decides, the end-to-end tuning protocol confirms): dense ≥ 
 ≥ 120 GB/s on the 1 MB shared-expert matrix, groups ≥ 150 GB/s; end to end, the chain's per-token device time
 from ~12 ms toward ~6 ms, i.e. 30 ms → ~24 ms a token (≈ Ollama's 23).
 
+*As built (2026-10-17, same day; `08_Documents/benchmarks/2026-10-17-rtx3070-blk-kernels.md`).* Step A as
+designed, with `R ∈ {32, 8}` in the end: 16-thread blocks were never the better choice once the launch bounds
+(below) held 16 blocks an SM. Step B's row copy into shared memory was not built: the eight lanes of a row load
+their 32-byte quant segment as eight contiguous 4-byte spans and exchange them with `__shfl_sync` (width 8), which
+gives the warp a full sector per row without shared memory or a copy loop; the activation row is staged in shared
+memory for the K-quant lanes only (Q8_0 reads it from L1 — measured faster), and the Q4_K/Q5_K min-term sums are
+computed once per block into a shared table instead of on one lane at a time. The largest single factor was none
+of these but `__launch_bounds__`: the compiler's 44 registers capped the Q8_0 trunk at 1 280 resident threads;
+pinned to 40 (Q8_0) / 64 (K-quants) the trunk went 185 → 362 GB/s. Results against the targets: in_proj 376 GB/s
+(≥ 250 ✓), the 1 MB Q8_0 shared expert 126 (≥ 120 ✓), the expert group K = 8 156 (≥ 150 ✓), lm_head 345; the single
+small K-quant matrices stay under (Q6_K 512×2048 83, Q4_K 68, group K = 1 57) — 512 rows × 8 lanes is 128 warps on
+46 SMs, and only more lanes per row would change that. End to end the chain went 33.8 → 53 tok/s at 128 tokens,
+the device wait 12.3 → 6.4 ms a token, the greedy text unchanged; the bit-exact contract held through every step
+(`make cuda-test-gq` all passed). The host-miss share (7.3 ms a token) is now the larger half. The faster frame
+exposed an init race in upstream's `cuda_chain.cu` (`cc_buf`'s legacy-stream `cudaMemset` vs the parameter upload
+on the non-blocking stream — the tuning report's race section); fixed with a stream-ordered memset, and the tier's
+uploads now complete before a slot is published.
+
 *Rejected for now.* (a) 32 lanes per row (would change the summation order, hence the CPU kernels — AVX2's eight
 lanes — and the E1 record of 2026-10-15; a later phase may redefine the reference deliberately). (b) CUDA graphs
 for the chain's frames (1.4 ms a token by the micro-benchmark; the attention kernel's growing context length is a
@@ -547,7 +565,7 @@ through the harness, `--deviation COLI_CUDA=1 --cap 256`), still open.
 | 5 — GPU | K-quant and `Q8_0`-group uploads/kernels in the tier; placement on the RTX 3070; E1–E3 CPU vs CUDA | tier bit-equal to CPU; A/B on the card |
 | 6 — breadth | GLM-5.2 (`glm-dsa`, v1 design), MTP, more types, upstream sync tooling | per item (done 2026-10-09) |
 | 7 — consolidation | upstream v2.0.0 merged (`KV_SLOTS` on GGUF, Vulkan knobs by name), hardening (mutation sweep, truncation, split sets), one stdlib reader, GLM tokenizer test, `tools/efficiency_report.py` (the R2 verdict) | `multi_slot_gguf.md`, `gguf_hardening.md`, `efficiency_verdict.md` green; the owner's efficiency report in `08_Documents/benchmarks/` |
-| 8 — device throughput | `bench_gq_cuda`, the block kernels' geometry and cooperative loads (dense and group), the end-to-end tuning protocol, G3 CPU vs CUDA, the host-miss overlap | `make cuda-test-gq` bit-exact throughout; bench targets met; chain ≥ 40 tok/s on the RTX 3070 with the warm heat file |
+| 8 — device throughput | `bench_gq_cuda`, the block kernels' geometry and cooperative loads (dense and group), the end-to-end tuning protocol, G3 CPU vs CUDA, the host-miss overlap | `make cuda-test-gq` bit-exact throughout; bench targets met; chain ≥ 40 tok/s on the RTX 3070 with the warm heat file — kernels done 2026-10-17 (53 tok/s; the small single K-quant matrices under their bench target), G3 and the host-miss overlap open |
 
 ## 13. Open design decisions
 
