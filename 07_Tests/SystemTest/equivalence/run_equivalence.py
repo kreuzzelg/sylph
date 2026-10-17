@@ -35,6 +35,12 @@ FIRST_SCORED = N_CTX // 2 + 1        # llama.cpp scores targets 257…511 of a 5
 CHAT_TEMPLATE = "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"   # Qwen3 ChatML, rendered identically for every engine
 
 
+def dev_env(dev):
+    """--deviation 'K=V[,K2=V2,...]': the environment of one deviation arm (G3 wants COLI_CUDA=1
+    together with COLI_GPUS=<card> and COLI_CUDA_CHAIN=1 -- the configuration the owner runs)."""
+    return dict(p.split("=", 1) for p in dev.split(","))
+def dev_dir(dev):
+    return dev.replace("=", "_").replace(",", "+")
 def log(msg):
     print(f"[equiv {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
@@ -250,13 +256,19 @@ def run_real(a):
             R["E2"] = e2; verdict["E2"] = e2["pass"]
         # -- deliberate differences (FR-35) --
         for dev in a.deviation or []:
-            k_, v_ = dev.split("=", 1)
+            envd = dev_env(dev)
             dd = []
             for k, toks in enumerate(ref["tokens"]):
-                s = sr.ppl_window(model, toks, FIRST_SCORED, out / "sylph" / dev.replace("=", "_"), f"win_{k}", cap=a.cap, threads=a.threads, env={k_: v_}, force=a.force)
+                s = sr.ppl_window(model, toks, FIRST_SCORED, out / "sylph" / dev_dir(dev), f"win_{k}", cap=a.cap, threads=a.threads, env=envd, force=a.force)
                 dd.append(s["dump"])
             e1d = compare.e1_compare(rr, merge_dumps(dd)); e2d = compare.e2_compare(ref["chunks"], chunk_stats(dd))
-            R.setdefault("deviations", {})[dev] = {"e1_mean": e1d["mean"], "e1_max": e1d["max"], "ppl": e2d["ppl_cand"], "e2_rel": e2d["rel"]}
+            # the deviation arm against sylph's own default run (gpu_rtx3070.md G3 b: sylph-CPU vs
+            # sylph-CUDA directly, not both against the reference)
+            vs = compare.e1_compare(merge_dumps(dumps_s), merge_dumps(dd))
+            ppl_s = R["E2"]["ppl_cand"] if "E2" in R else None
+            R.setdefault("deviations", {})[dev] = {"e1_mean": e1d["mean"], "e1_max": e1d["max"], "ppl": e2d["ppl_cand"], "e2_rel": e2d["rel"],
+                                                   "vs_sylph": {"mean": vs["mean"], "max": vs["max"], "top1": vs["top1"], "n": vs["n"], "worst": vs["worst"][:3],
+                                                                "ppl_rel": abs(e2d["ppl_cand"] - ppl_s) / ppl_s if ppl_s else None}}
     R["floor"] = floor; R["thresholds"] = th
     if "E3" in levels:
         gens_s = []; srv = sr.Serve(model, cap=a.cap, threads=a.threads)
@@ -272,8 +284,7 @@ def run_real(a):
         # deviation arm (FR-35; gpu_rtx3070.md G3/G5): sylph with the deviation's environment
         # against the default sylph run above, prefix to the first near-tie as for the references
         for dev in a.deviation or []:
-            k_, v_ = dev.split("=", 1)
-            gens_d = []; srv = sr.Serve(model, cap=a.cap, env={k_: v_}, threads=a.threads)
+            gens_d = []; srv = sr.Serve(model, cap=a.cap, env=dev_env(dev), threads=a.threads)
             try:
                 for i, p in enumerate(prompts):
                     text = CHAT_TEMPLATE.format(p["text"]) if p["chat"] else p["text"]
@@ -281,7 +292,7 @@ def run_real(a):
                     log(f"sylph {dev} E3 prompt {i}: {len(g['ids'])} ids")
             finally:
                 srv.close()
-            (out / f"e3_sylph_{dev.replace('=', '_')}.jsonl").write_text("\n".join(json.dumps(g) for g in gens_d) + "\n")
+            (out / f"e3_sylph_{dev_dir(dev)}.jsonl").write_text("\n".join(json.dumps(g) for g in gens_d) + "\n")
             e3d = compare.e3_compare(gens_s, gens_d); e3d["pass"] = e3d["n_ok"] >= math.ceil(0.95 * e3d["n"])
             R.setdefault("deviations", {}).setdefault(dev, {})["e3"] = e3d
         # llama-server (ids + margins), fallback llama-cli (text)

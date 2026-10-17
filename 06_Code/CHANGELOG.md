@@ -17,6 +17,8 @@
   `cudaMemsetAsync` on the chain's stream. `coli_cuda_tensor_upload`/`_overwrite` wait for their DMA on a per-device
   upload stream before the tier publishes the slot (pageable `cudaMemcpy` returns earlier than that).
 - `QT_VERIFY=1`: `qt_take` checks every device expert result against `gq_dot_row_ref` on the raw slab (diagnostics).
+- Equivalence harness: `--deviation K=V,K2=V2` sets several variables for one arm; every arm is also compared against
+  sylph's own default run (`vs_sylph`: mean/max |ΔNLL|, top-1, |ΔPPL|/PPL) — G3 of `gpu_rtx3070.md` run on the RTX 3070.
 
 ## sylph 2026-10-17 — the CUDA chain and the DeltaNet GPU step take GGUF matrices
 

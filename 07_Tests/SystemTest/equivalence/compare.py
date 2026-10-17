@@ -240,6 +240,10 @@ def write_report(out_dir, R):
         L += ["## Deliberate differences (FR-35)", ""]
         for name, d in dv.items():
             line = f"- `{name}`: E1 mean {fmt(d.get('e1_mean'))} / max {fmt(d.get('e1_max'))}, E2 PPL {fmt(d.get('ppl'))} ({fmt(d.get('e2_rel'))} rel)"
+            vs = d.get("vs_sylph")
+            if vs:   # the arm against sylph's own default run (gpu_rtx3070.md G3 b)
+                line += (f"; **against default sylph**: mean |ΔNLL| {fmt(vs.get('mean'))} / max {fmt(vs.get('max'))}, top-1 agreement "
+                         f"{fmt(vs.get('top1'))}, |ΔPPL|/PPL {fmt(vs.get('ppl_rel'))} over {vs.get('n')} positions")
             if d.get("e3"):
                 line += f", E3 vs default sylph {d['e3']['n_ok']}/{d['e3']['n']} prompts to the first near-tie"
             L.append(line)

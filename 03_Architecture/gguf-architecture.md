@@ -565,7 +565,7 @@ through the harness, `--deviation COLI_CUDA=1 --cap 256`), still open.
 | 5 — GPU | K-quant and `Q8_0`-group uploads/kernels in the tier; placement on the RTX 3070; E1–E3 CPU vs CUDA | tier bit-equal to CPU; A/B on the card |
 | 6 — breadth | GLM-5.2 (`glm-dsa`, v1 design), MTP, more types, upstream sync tooling | per item (done 2026-10-09) |
 | 7 — consolidation | upstream v2.0.0 merged (`KV_SLOTS` on GGUF, Vulkan knobs by name), hardening (mutation sweep, truncation, split sets), one stdlib reader, GLM tokenizer test, `tools/efficiency_report.py` (the R2 verdict) | `multi_slot_gguf.md`, `gguf_hardening.md`, `efficiency_verdict.md` green; the owner's efficiency report in `08_Documents/benchmarks/` |
-| 8 — device throughput | `bench_gq_cuda`, the block kernels' geometry and cooperative loads (dense and group), the end-to-end tuning protocol, G3 CPU vs CUDA, the host-miss overlap | `make cuda-test-gq` bit-exact throughout; bench targets met; chain ≥ 40 tok/s on the RTX 3070 with the warm heat file — kernels done 2026-10-17 (53 tok/s; the small single K-quant matrices under their bench target), G3 and the host-miss overlap open |
+| 8 — device throughput | `bench_gq_cuda`, the block kernels' geometry and cooperative loads (dense and group), the end-to-end tuning protocol, G3 CPU vs CUDA, the host-miss overlap | `make cuda-test-gq` bit-exact throughout; bench targets met; chain ≥ 40 tok/s on the RTX 3070 with the warm heat file — kernels done 2026-10-17 (53 tok/s; the small single K-quant matrices under their bench target); G3 run (chain arm: E3 32/32, E1 2e-4 mean — the tier's bound does not fit the chain, owner's call); the host-miss overlap measured as a data dependency, nothing to build |
 
 ## 13. Open design decisions
 
