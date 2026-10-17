@@ -110,6 +110,7 @@ typedef struct {
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
     float *pipe_buf[27]; size_t pipe_cap[27];   /* scratch persistenti del resident pipeline */
     cudaStream_t stream;
+    cudaStream_t up_stream;   /* tensor uploads: copy + wait on this stream, not the legacy one (h2d_done) */
     cudaEvent_t ev_done; int ev_done_ok;        /* resident-group issue completion (#431 PR-C0) */
     void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
@@ -926,7 +927,12 @@ __device__ static inline float blk_bits_f32(uint32_t b) { return __uint_as_float
 /* IEEE half -> single, exact, the integer path of gq_f16_to_f32 (no fp16 intrinsics,
  * so HIP and every arch agree to the bit) */
 __device__ static inline float blk_f16(const uint8_t *p) {
-    uint32_t h = (uint32_t)p[0] | ((uint32_t)p[1] << 8);
+    uint32_t h = *(const uint16_t *)p;   /* 2-byte aligned at every call site (even row strides, 256-aligned tensors) */
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    /* the hardware conversion: IEEE half -> single is exact (every half is a single), so the
+     * value is the integer path's to the bit, in one instruction instead of twelve (phase 8) */
+    return __half2float(__ushort_as_half((unsigned short)h));
+#endif
     uint32_t sign = (h & 0x8000u) << 16, exp = (h >> 10) & 0x1Fu, man = h & 0x3FFu;
     if (exp == 0) {
         if (man == 0) return blk_bits_f32(sign);
@@ -964,47 +970,84 @@ __device__ static inline float blk_xsub32(const float *xb) {
 }
 /* lane partials of one row. Two outputs: `a` is the main accumulator the
  * tree folds; `ax` the Q4_K/Q5_K min-term accumulator (0 for the others),
- * folded by its own tree and added once -- exactly gq_dot_q45_k_ref's tail. */
-__device__ static void blk_lane(int type, const uint8_t *row, const float *x, int I, int lane, float *a, float *ax) {
+ * folded by its own tree and added once -- exactly gq_dot_q45_k_ref's tail.
+ *
+ * Phase 8 step B (architecture amendment 2026-10-17). The arithmetic is the
+ * reference's to the bit -- lane l multiplies the elements l, l+8, l+16, l+24
+ * of every 32-element block in order, fma per element, the type's scale folded
+ * per lane -- but the bytes arrive differently: the eight lanes of a row load
+ * each 32-byte quant segment as eight contiguous 4-byte spans (two 16-bit loads
+ * each: a row is only 2-byte aligned) and exchange them with shuffles, so a
+ * warp load is a full sector per row instead of eight scattered bytes; element
+ * l+8t sits in lane (l>>2)+2t at byte l&3. The activation vector is read from
+ * shared memory (staged once per block, see the kernels), and a Q4_K/Q5_K lane
+ * decodes one sub-block's scale pair and shuffles the other seven in instead of
+ * decoding all eight. Measured on the RTX 3070 against the byte-per-lane
+ * version, with the launch bounds and the row policy below: Q8_0 [12288 x 2048] 174 -> 376 GB/s
+ * (08_Documents/benchmarks/2026-10-17-rtx3070-blk-kernels.md); the oracle (test_gq_cuda.cu)
+ * unchanged. */
+__device__ static inline unsigned blk_span4(const uint8_t *seg, int lane) {   /* bytes 4l..4l+3 of a 32-byte segment, 2-byte aligned */
+    const uint16_t *q16 = (const uint16_t *)(seg + 4 * lane);
+    return (unsigned)q16[0] | ((unsigned)q16[1] << 16);
+}
+#define BLK_SHF(v, src) __shfl_sync(0xffffffffu, (v), (src), 8)
+template <int type>
+__device__ static void blk_lane(const uint8_t *row, const float *x, const float *xsub, int I, int lane, float *a, float *ax) {
     float acc = 0.f, accx = 0.f;
-    if (type == 8) {                                   /* Q8_0 */
+    const int src0 = lane >> 2, sh = 8 * (lane & 3);
+    if constexpr (type == 8) {                         /* Q8_0 */
+        #pragma unroll 4
         for (int g = 0; g < I / 32; g++) {
             const uint8_t *b = row + 34 * (size_t)g; const float d = blk_f16(b); const float *xb = x + 32 * g;
-            float ln = fmaf((float)(int8_t)b[2 + lane], xb[lane], 0.f);
-            ln = fmaf((float)(int8_t)b[2 + lane + 8],  xb[lane + 8],  ln);
-            ln = fmaf((float)(int8_t)b[2 + lane + 16], xb[lane + 16], ln);
-            ln = fmaf((float)(int8_t)b[2 + lane + 24], xb[lane + 24], ln);
+            const unsigned mine = blk_span4(b + 2, lane);
+            const unsigned w0 = BLK_SHF(mine, src0), w1 = BLK_SHF(mine, src0 + 2), w2 = BLK_SHF(mine, src0 + 4), w3 = BLK_SHF(mine, src0 + 6);
+            float ln = fmaf((float)(int8_t)(w0 >> sh), xb[lane], 0.f);
+            ln = fmaf((float)(int8_t)(w1 >> sh), xb[lane + 8],  ln);
+            ln = fmaf((float)(int8_t)(w2 >> sh), xb[lane + 16], ln);
+            ln = fmaf((float)(int8_t)(w3 >> sh), xb[lane + 24], ln);
             acc = fmaf(ln, d, acc);
         }
-    } else if (type == 12 || type == 13) {             /* Q4_K / Q5_K */
-        const int five = type == 13; const size_t bs = five ? 176 : 144;
+    } else if constexpr (type == 12 || type == 13) {   /* Q4_K / Q5_K */
+        constexpr int five = type == 13; const size_t bs = five ? 176 : 144;
         float accq0 = 0.f, accq1 = 0.f;
         for (int g = 0; g < I / 256; g++) {
             const uint8_t *b = row + bs * (size_t)g;
             const uint8_t *qh = b + 16, *ql = five ? b + 48 : b + 16;
             const float *xb = x + 256 * g;
             const float d = blk_f16(b), dmin = blk_f16(b + 2);
-            for (int j = 0; j < 4; j++) for (int half = 0; half < 2; half++) {
-                const int k = 2 * j + half;
-                const uint8_t u = (uint8_t)((half ? 2u : 1u) << (2 * j));
-                int sd, sm; blk_scale_min_k4(k, b + 4, &sd, &sm);
-                const float d1 = d * (float)sd;
-                float ln = 0.f;
-                for (int t = 0; t < 4; t++) {
-                    const int i = lane + 8 * t;
-                    int v = half ? (ql[32 * j + i] >> 4) : (ql[32 * j + i] & 0xF);
-                    if (five && (qh[i] & u)) v += 16;
-                    ln = fmaf((float)v, xb[32 * k + i], ln);
-                }
-                if (half) accq1 = fmaf(ln, d1, accq1); else accq0 = fmaf(ln, d1, accq0);
-                if (k == lane) {                          /* this lane owns sub-block k's min term */
-                    const float nm1 = -(dmin * (float)sm);
-                    accx = fmaf(blk_xsub32(xb + 32 * k), nm1, accx);
+            int sd_mine, sm_mine; blk_scale_min_k4(lane, b + 4, &sd_mine, &sm_mine);   /* lane k owns sub-block k's pair */
+            unsigned hq = 0; if (five) hq = blk_span4(qh, lane);                          /* the 32 high bits, one byte per element */
+            for (int j = 0; j < 4; j++) {
+                const unsigned mine = blk_span4(ql + 32 * j, lane);
+                const unsigned q0 = BLK_SHF(mine, src0), q1 = BLK_SHF(mine, src0 + 2), q2 = BLK_SHF(mine, src0 + 4), q3 = BLK_SHF(mine, src0 + 6);
+                unsigned h0 = 0, h1 = 0, h2 = 0, h3 = 0;
+                if (five) { h0 = BLK_SHF(hq, src0); h1 = BLK_SHF(hq, src0 + 2); h2 = BLK_SHF(hq, src0 + 4); h3 = BLK_SHF(hq, src0 + 6); }
+                for (int half = 0; half < 2; half++) {
+                    const int k = 2 * j + half;
+                    const uint8_t u = (uint8_t)((half ? 2u : 1u) << (2 * j));
+                    const int sd = BLK_SHF(sd_mine, k), sm = BLK_SHF(sm_mine, k);
+                    const float d1 = d * (float)sd;
+                    float ln = 0.f;
+                    #define BLK_Q45_ELEM(t, qw, hw) do { \
+                        const int i = lane + 8 * (t); const unsigned qb = ((qw) >> sh) & 0xFFu; \
+                        int v = half ? (int)(qb >> 4) : (int)(qb & 0xF); \
+                        if (five && (((hw) >> sh) & u)) v += 16; \
+                        ln = fmaf((float)v, xb[32 * k + i], ln); } while (0)
+                    BLK_Q45_ELEM(0, q0, h0); BLK_Q45_ELEM(1, q1, h1); BLK_Q45_ELEM(2, q2, h2); BLK_Q45_ELEM(3, q3, h3);
+                    #undef BLK_Q45_ELEM
+                    if (half) accq1 = fmaf(ln, d1, accq1); else accq0 = fmaf(ln, d1, accq0);
                 }
             }
+            /* lane k owns sub-block k's min term; the 32-element activation sums come from the
+             * block's table (blk_prologue: blk_xsub32 once per sub-block and block, read here
+             * conflict-free). Inside the k loop they ran on one lane at a time (Q4_K [512 x 2048]
+             * 23 GB/s); per lane after the loop 40, but 8-way bank conflicts on the staged row cost
+             * the expert group 104 -> 90; the table: 68 and the group 156. Same chain per lane. */
+            accx = fmaf(xsub[8 * g + lane], -(dmin * (float)sm_mine), accx);
+            (void)xb;
         }
         acc = accq0 + accq1;
-    } else if (type == 14) {                           /* Q6_K */
+    } else if constexpr (type == 14) {                 /* Q6_K */
         float acc4[4] = {0.f, 0.f, 0.f, 0.f};
         for (int g = 0; g < I / 256; g++) {
             const uint8_t *b = row + 210 * (size_t)g; const float d = blk_f16(b + 208);
@@ -1012,10 +1055,21 @@ __device__ static void blk_lane(int type, const uint8_t *row, const float *x, in
             for (int h = 0; h < 2; h++) {
                 const uint8_t *ql = b + 64 * h, *qh = b + 128 + 32 * h; const int8_t *sc = (const int8_t *)(b + 192 + 8 * h);
                 const float *xh = x + 256 * g + 128 * h;
+                /* the half's 64 ql bytes and 32 qh bytes as three 32-byte segments per lane */
+                const unsigned qa = blk_span4(ql, lane), qb2 = blk_span4(ql + 32, lane), qhh = blk_span4(qh, lane);
                 for (int k = 0; k < 8; k++) {
-                    const int r0 = 16 * k + lane, r1 = r0 + 8;
-                    float ln = fmaf((float)blk_q6_get(ql, qh, r0), xh[r0], 0.f);
-                    ln = fmaf((float)blk_q6_get(ql, qh, r1), xh[r1], ln);
+                    /* element r = 16k + lane (+8): part r>>5 = k>>1, l = 16(k&1) + lane (+8); ql byte l or l+32,
+                     * qh byte l, the nibble/bit pair by part -- blk_q6_get's cases, bytes from the shuffled spans */
+                    const int part = k >> 1, l0 = 16 * (k & 1) + lane, l1 = l0 + 8;
+                    const int s0 = l0 >> 2, s1 = l1 >> 2;                     /* source lanes of bytes l0, l1 in a 32-byte segment */
+                    const unsigned ql0 = BLK_SHF((part & 1) ? qb2 : qa, s0), ql1 = BLK_SHF((part & 1) ? qb2 : qa, s1);
+                    const unsigned qh0 = BLK_SHF(qhh, s0), qh1 = BLK_SHF(qhh, s1);
+                    const int b0 = (int)((ql0 >> sh) & 0xFFu), b1 = (int)((ql1 >> sh) & 0xFFu);
+                    const int e0 = (int)((qh0 >> sh) & 0xFFu), e1 = (int)((qh1 >> sh) & 0xFFu);
+                    const int v0 = (int)(((part & 2) ? (b0 >> 4) : (b0 & 0xF)) | (((e0 >> (2 * part)) & 3) << 4)) - 32;
+                    const int v1 = (int)(((part & 2) ? (b1 >> 4) : (b1 & 0xF)) | (((e1 >> (2 * part)) & 3) << 4)) - 32;
+                    float ln = fmaf((float)v0, xh[16 * k + lane], 0.f);
+                    ln = fmaf((float)v1, xh[16 * k + lane + 8], ln);
                     accb[k & 3] = fmaf(ln, (float)sc[k], accb[k & 3]);
                 }
             }
@@ -1025,49 +1079,151 @@ __device__ static void blk_lane(int type, const uint8_t *row, const float *x, in
     }
     *a = acc; *ax = accx;
 }
-/* 256 threads = 32 rows x 8 lanes; the row's eight partials meet in shared
- * memory and lane 0 applies the reference tree. Returns the row value on lane
- * 0 (undefined elsewhere). Every thread of the block must call it. */
-__device__ static float blk_row(int type, const uint8_t *row, const float *x, int I, float *red) {
-    const int lane = threadIdx.x & 7, base = threadIdx.x & ~7;
-    float a, ax; blk_lane(type, row, x, I, lane, &a, &ax);
-    red[threadIdx.x] = a; red[256 + threadIdx.x] = ax;
+#undef BLK_SHF
+/* R rows x 8 lanes per block; the row's eight partials meet in shared memory and
+ * lane 0 applies the reference tree. Returns the row value on lane 0 (undefined
+ * elsewhere). Every thread of the block must call it. */
+template <int type>
+__device__ static float blk_row(const uint8_t *row, const float *x, const float *xsub, int I, float *red) {
+    /* `red` holds 2 x blockDim.x floats and belongs to this call alone (a kernel that
+     * reduces two rows uses two buffers): one barrier per row, not two -- measured 14 %
+     * on the Q8_0 trunk (phase 8). The min-term partials exist only for Q4_K/Q5_K. */
+    const int lane = threadIdx.x & 7, base = threadIdx.x & ~7, nt = blockDim.x;
+    float a, ax; blk_lane<type>(row, x, xsub, I, lane, &a, &ax);
+    red[threadIdx.x] = a;
+    if constexpr (type == 12 || type == 13) red[nt + threadIdx.x] = ax;
     __syncthreads();
     float r = 0.f;
-    if (!lane) { r = blk_hsum8(red + base); if (type == 12 || type == 13) r += blk_hsum8(red + 256 + base); }
-    __syncthreads();                                   /* red is reused by the next call */
+    if (!lane) { r = blk_hsum8(red + base); if constexpr (type == 12 || type == 13) r += blk_hsum8(red + nt + base); }
     return r;
 }
-/* dense: y[S,O] = x[S,I] . W[O,I]^T, grid (ceil(O/32), S) */
-__global__ static void blk_matmul(float *y, const float *x, const uint8_t *w, int type, int S, int I, int O, size_t rb) {
-    __shared__ float red[512];
-    const int o = blockIdx.x * 32 + (threadIdx.x >> 3), s = blockIdx.y;
+/* Block prologue (every thread): STAGE copies the activation row into shared memory; for
+ * Q4_K/Q5_K the sub-block sums the min term needs (blk_xsub32 of every 32 elements, I/32
+ * floats) go into shared memory behind it. One barrier. Returns the activation pointer the
+ * lanes read, *xsub the table (nullptr for the other types). The launchers size the dynamic
+ * shared memory with blk_smem. */
+template <bool STAGE, int type>
+__device__ static inline const float *blk_prologue(float *sm, const float *x, int I, const float **xsub) {
+    constexpr bool TAB = type == 12 || type == 13;
+    float *tab = sm + (STAGE ? I : 0);
+    if constexpr (TAB) for (int i = threadIdx.x; i < I / 32; i += blockDim.x) tab[i] = blk_xsub32(x + 32 * i);
+    if constexpr (STAGE) for (int i = threadIdx.x; i < I; i += blockDim.x) sm[i] = x[i];
+    if constexpr (STAGE || TAB) __syncthreads();
+    *xsub = TAB ? tab : nullptr;
+    return STAGE ? sm : x;
+}
+static size_t blk_smem(int stg, int type, int I) {
+    return (stg ? (size_t)I * sizeof(float) : 0) + ((type == 12 || type == 13) ? (size_t)(I / 32) * sizeof(float) : 0);
+}
+/* Rows per block: 32 rows x 8 lanes = 256 threads filled the card only for the big
+ * matrices; a [2048 x 512] GEMV was 16 blocks on 46 SMs. The launcher picks 32 rows when
+ * the grid still holds twice the SM count, 8 otherwise; 2-row blocks (16 threads) were
+ * never the better choice once the launch bounds held 16 blocks an SM -- 256 resident
+ * threads (Q4_K [512 x 2048] 40 GB/s at R=2, 68 at R=8). Q8_0 takes 8 rows always: its
+ * lanes read the activation from L1 and the finer blocks spread better (in_proj 362 ->
+ * 375 GB/s); the K-quant lanes want the 32-row block that amortises the staged copy and
+ * the Q4_K/Q5_K sub-sum table. Same arithmetic for every R. */
+static int blk_sm_count(void) {
+    static int sms = 0;
+    if (!sms) { int dev = 0; cudaGetDevice(&dev); if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || sms < 1) sms = 46; }
+    return sms;
+}
+static int blk_rows_per_block(long long rows, long long other_blocks, int type) {   /* other_blocks: the grid's y*z extent */
+    static int force = -2; if (force == -2) { const char *e = getenv("COLI_BLK_ROWS"); force = e && *e ? atoi(e) : -1; }
+    if (force == 32 || force == 8) return force;
+    if (type == 8) return 8;
+    long long want = 2LL * blk_sm_count();
+    return ((rows + 31) / 32) * other_blocks >= want ? 32 : 8;
+}
+static int blk_stage_x_on(int R, int type) {
+    /* the activation row in shared memory: measured on the RTX 3070 (bench_gq_cuda) a gain for the
+     * K-quant lanes in full blocks (Q6_K lm_head 165 -> 347 GB/s, the Q4_K/Q5_K expert group 54 -> 98),
+     * a loss for Q8_0 (163 -> 157) and for the small blocks whose prologue is not amortised.
+     * COLI_BLK_STAGE=0/1 overrides for an A/B. */
+    static int v = -2; if (v == -2) { const char *e = getenv("COLI_BLK_STAGE"); v = e && *e ? atoi(e) : -1; }
+    return v >= 0 ? v : (R >= 32 && type != 8);
+}
+/* dense: y[S,O] = x[S,I] . W[O,I]^T, grid (ceil(O/R), S), block R*8, dynamic smem I floats */
+/* launch bounds: the lanes are latency-bound, so every resident warp counts -- 48 warps an SM
+ * (sm_86: 1536 threads, 16 blocks) needs <= 40 registers at 256 threads; measured 185 -> 362 GB/s
+ * on the Q8_0 trunk against the compiler's own 44 (5 blocks an SM). The largest single step of
+ * phase 8 (08_Documents/benchmarks/2026-10-17-rtx3070-blk-kernels.md). */
+#ifndef BLK_KQ_MIN_BLOCKS
+#define BLK_KQ_MIN_BLOCKS 4 /* K-quants: 64 registers, 32 warps an SM (48 and 40 spill; measured the same as 48 at 1280 threads) */
+#endif
+#define BLK_BOUNDS(R, type) __launch_bounds__((R) * 8, ((R) * 8 >= 96) ? ((type) == 8 ? 1536 / ((R) * 8) : BLK_KQ_MIN_BLOCKS) : 16)
+template <int R, bool STAGE, int type>
+__global__ static void BLK_BOUNDS(R, type) blk_matmul(float *y, const float *x, const uint8_t *w, int S, int I, int O, size_t rb) {
+    __shared__ float red[R * 16];
+    extern __shared__ float blk_xs[];
+    const int o = blockIdx.x * R + (threadIdx.x >> 3), s = blockIdx.y;
+    const float *xsub; const float *xs = blk_prologue<STAGE, type>(blk_xs, x + (size_t)s * I, I, &xsub);
     const uint8_t *row = w + (size_t)(o < O ? o : 0) * rb;
-    float r = blk_row(type, row, x + (size_t)s * I, I, red);
+    float r = blk_row<type>(row, xs, xsub, I, red);
     if (!(threadIdx.x & 7) && o < O) y[(size_t)s * O + o] = r;
     (void)S;
 }
-/* expert group, gate/up fused with the SiLU: h[(offset+s)][o] = silu(g).u, grid (ceil(I/32), max_rows, count) */
-__global__ static void grouped_hidden_blk_dual(float *gate, const float *x, const GroupDesc *desc, int I, int D) {
-    __shared__ float red[512];
-    const int o = blockIdx.x * 32 + (threadIdx.x >> 3), s = blockIdx.y, c = blockIdx.z;
+static void blk_matmul_launch(float *y, const float *x, const uint8_t *w, int type, int S, int I, int O, size_t rb, cudaStream_t st) {
+    int R = blk_rows_per_block(O, S, type), stg = blk_stage_x_on(R, type);
+    dim3 grid((unsigned)((O + R - 1) / R), (unsigned)S);
+    size_t sm = blk_smem(stg, type, I);
+    #define BLK_MM_T(RR, T) do { if (stg) blk_matmul<RR, true, T><<<grid, RR * 8, sm, st>>>(y, x, w, S, I, O, rb); \
+                                else     blk_matmul<RR, false, T><<<grid, RR * 8, sm, st>>>(y, x, w, S, I, O, rb); } while (0)
+    #define BLK_MM(RR) do { switch (type) { case 8: BLK_MM_T(RR, 8); break; case 12: BLK_MM_T(RR, 12); break; \
+                            case 13: BLK_MM_T(RR, 13); break; default: BLK_MM_T(RR, 14); break; } } while (0)
+    if (R == 32) BLK_MM(32); else BLK_MM(8);
+    #undef BLK_MM
+    #undef BLK_MM_T
+}
+/* expert group, gate/up fused with the SiLU: h[(offset+s)][o] = silu(g).u, grid (ceil(I/R), max_rows, count) */
+template <int R, bool STAGE, int TG>
+__global__ static void BLK_BOUNDS(R, TG) grouped_hidden_blk_dual(float *gate, const float *x, const GroupDesc *desc, int I, int D) {
+    __shared__ float red[R * 16], red_u[R * 16];
+    extern __shared__ float blk_xs[];
+    const int o = blockIdx.x * R + (threadIdx.x >> 3), s = blockIdx.y, c = blockIdx.z;
     GroupDesc d = desc[c]; if (s >= d.rows) return;
     const int oo = o < I ? o : 0;
     const uint8_t *gr = (const uint8_t *)d.g + (size_t)oo * row_bytes(d.gf, D);
     const uint8_t *ur = (const uint8_t *)d.u + (size_t)oo * row_bytes(d.uf, D);
-    const float *xs = x + (size_t)(d.offset + s) * D;
-    float g = blk_row(d.gf - COLI_FMT_GGML_BASE, gr, xs, D, red);
-    float u = blk_row(d.uf - COLI_FMT_GGML_BASE, ur, xs, D, red);
+    const float *xsub; const float *xs = blk_prologue<STAGE, TG>(blk_xs, x + (size_t)(d.offset + s) * D, D, &xsub);
+    float g = blk_row<TG>(gr, xs, xsub, D, red);
+    float u = blk_row<TG>(ur, xs, xsub, D, red_u);
     if (!(threadIdx.x & 7) && o < I) gate[(size_t)(d.offset + s) * I + o] = (g / (1.0f + expf(-g))) * u;
 }
-__global__ static void grouped_down_blk(float *y, const float *h, const GroupDesc *desc, int D, int I) {
-    __shared__ float red[512];
-    const int o = blockIdx.x * 32 + (threadIdx.x >> 3), s = blockIdx.y, c = blockIdx.z;
+template <int R, bool STAGE, int TD>
+__global__ static void BLK_BOUNDS(R, TD) grouped_down_blk(float *y, const float *h, const GroupDesc *desc, int D, int I) {
+    __shared__ float red[R * 16];
+    extern __shared__ float blk_xs[];
+    const int o = blockIdx.x * R + (threadIdx.x >> 3), s = blockIdx.y, c = blockIdx.z;
     GroupDesc d = desc[c]; if (s >= d.rows) return;
     const int oo = o < D ? o : 0;
     const uint8_t *row = (const uint8_t *)d.d + (size_t)oo * row_bytes(d.df, I);
-    float r = blk_row(d.df - COLI_FMT_GGML_BASE, row, h + (size_t)(d.offset + s) * I, I, red);
+    const float *hsub; const float *hs = blk_prologue<STAGE, TD>(blk_xs, h + (size_t)(d.offset + s) * I, I, &hsub);
+    float r = blk_row<TD>(row, hs, hsub, I, red);
     if (!(threadIdx.x & 7) && o < D) y[(size_t)(d.offset + s) * D + o] = r;
+}
+/* both group kernels on the stream, R from the hidden/down row count and the (rows x experts) extent */
+static void grouped_blk_launch(float *gate, float *y, const float *x, const GroupDesc *dev, const GroupDesc *host, int I, int D, int max_rows, int count, cudaStream_t st) {
+    /* one gate/up type and one down type per group (the engine's experts of a layer share them;
+     * qt_init_gguf sized the slot from block 0 and the upload refuses other shapes) */
+    const int tg = host[0].gf - COLI_FMT_GGML_BASE, td = host[0].df - COLI_FMT_GGML_BASE;
+    long long other = (long long)max_rows * count;
+    int Rh = blk_rows_per_block(I, other, tg), Rd = blk_rows_per_block(D, other, td);
+    dim3 hg((unsigned)((I + Rh - 1) / Rh), (unsigned)max_rows, (unsigned)count), og((unsigned)((D + Rd - 1) / Rd), (unsigned)max_rows, (unsigned)count);
+    int sh_ = blk_stage_x_on(Rh, tg), sd_ = blk_stage_x_on(Rd, td);
+    size_t smh = blk_smem(sh_, tg, D), smd = blk_smem(sd_, td, I);
+    #define BLK_GH_T(RR, T) do { if (sh_) grouped_hidden_blk_dual<RR, true, T><<<hg, RR * 8, smh, st>>>(gate, x, dev, I, D); \
+                                else     grouped_hidden_blk_dual<RR, false, T><<<hg, RR * 8, smh, st>>>(gate, x, dev, I, D); } while (0)
+    #define BLK_GD_T(RR, T) do { if (sd_) grouped_down_blk<RR, true, T><<<og, RR * 8, smd, st>>>(y, gate, dev, D, I); \
+                                else     grouped_down_blk<RR, false, T><<<og, RR * 8, smd, st>>>(y, gate, dev, D, I); } while (0)
+    #define BLK_GH(RR) do { switch (tg) { case 8: BLK_GH_T(RR, 8); break; case 12: BLK_GH_T(RR, 12); break; case 13: BLK_GH_T(RR, 13); break; default: BLK_GH_T(RR, 14); break; } } while (0)
+    #define BLK_GD(RR) do { switch (td) { case 8: BLK_GD_T(RR, 8); break; case 12: BLK_GD_T(RR, 12); break; case 13: BLK_GD_T(RR, 13); break; default: BLK_GD_T(RR, 14); break; } } while (0)
+    if (Rh == 32) BLK_GH(32); else BLK_GH(8);
+    if (Rd == 32) BLK_GD(32); else BLK_GD(8);
+    #undef BLK_GH
+    #undef BLK_GD
+    #undef BLK_GH_T
+    #undef BLK_GD_T
 }
 
 /* fmt=4 grouped-int4 variants (#334): identical structure to the w4 kernels,
@@ -1493,6 +1649,7 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
         cudaDeviceProp prop{};
         if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) { coli_cuda_shutdown(); return 0; }
         ctx->compute_major=prop.major;ctx->compute_minor=prop.minor;
+        if(!cuda_ok(cudaStreamCreateWithFlags(&ctx->up_stream,cudaStreamNonBlocking),"upload stream creation")){ ctx->up_stream=nullptr; }
         if(!cuda_ok(cudaStreamCreateWithFlags(&ctx->stream,cudaStreamNonBlocking),"stream creation")){
             coli_cuda_shutdown();return 0;
         }
@@ -1537,6 +1694,7 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->host_y) cudaFreeHost(ctx->host_y);
         if (ctx->host_kv) cudaFreeHost(ctx->host_kv);
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
+        if (ctx->up_stream) cudaStreamDestroy(ctx->up_stream);
         if (ctx->group_desc) cudaFree(ctx->group_desc);
 #ifdef COLI_ANS
         if(ctx->ans_copy_pending)cudaStreamSynchronize(ctx->stream);
@@ -1647,6 +1805,21 @@ static thread_local int g_upload_gs = 0;
 extern "C" int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
                                          const void *weights, const float *scales,
                                          int fmt, int I, int O, int device, int gs);
+/* A host-to-device copy that is complete when it returns. cudaMemcpy from pageable memory
+ * returns once the source is staged, with the DMA still in flight on the legacy stream --
+ * which the tier's and the chain's non-blocking streams never wait for. The tier publishes
+ * a slot the moment its upload returns, so an expert group could read a half-written slab:
+ * seen on the owner's RTX 3070 (2026-10-17) under COLI_CUDA_CHAIN once the block kernels got
+ * fast -- garbage text from the first token in about half the runs, correct text with
+ * CUDA_LAUNCH_BLOCKING=1. The copy goes on the context's own upload stream and is waited for
+ * there: no device-wide synchronisation under the async groups (the reason the in-place
+ * overwrite exists), just this transfer. */
+static int h2d_done(DeviceContext *ctx, void *dst, const void *src, size_t bytes, const char *what) {
+    if (!ctx->up_stream)
+        return cuda_ok(cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice), what) && cuda_ok(cudaStreamSynchronize(0), what);
+    return cuda_ok(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, ctx->up_stream), what) &&
+           cuda_ok(cudaStreamSynchronize(ctx->up_stream), what);
+}
 extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                                         const void *weights, const float *scales,
                                         int fmt, int I, int O, int device) {
@@ -1697,7 +1870,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
      * memcpy, or a failed H2D upload frees the tensor while weights_owned is
      * still 0 and free()'s ownership gate leaks the device buffer. */
     t->weights_owned=1;
-    if (!cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "tensor upload")) {
+    if (!h2d_done(ctx, t->weights, weights, t->weight_bytes, "tensor upload")) {
         coli_cuda_tensor_free(t);
         return 0;
     }
@@ -1707,7 +1880,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     if (blk) t->scale_count = 0;           /* in-block scales, as fmt=6 */
     if (fmt && fmt != 6 && !blk) {
         if (!cuda_ok(cudaMalloc(&t->scales, tensor_scale_bytes(t)), "scale allocation") ||
-            !cuda_ok(cudaMemcpy(t->scales, scales, tensor_scale_bytes(t), cudaMemcpyHostToDevice), "scale upload")) {
+            !h2d_done(ctx, t->scales, scales, tensor_scale_bytes(t), "scale upload")) {
             coli_cuda_tensor_free(t);
             return 0;
         }
@@ -1738,13 +1911,13 @@ extern "C" int coli_cuda_tensor_overwrite(ColiCudaTensor *t, const void *weights
     if (!select_ctx(ctx)) return 0;
     /* Same steps as the upload, into the buffers already there. A failure
      * half-way leaves the tensor's content undefined: the caller frees it. */
-    if (!cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "tensor overwrite")) return 0;
+    if (!h2d_done(ctx, t->weights, weights, t->weight_bytes, "tensor overwrite")) return 0;
     if (t->fmt==2||t->fmt==4) {
         offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
         if (!cuda_ok(cudaGetLastError(),"int4 weight conversion")) return 0;
     }
     if (t->fmt && t->fmt != 6 &&
-        !cuda_ok(cudaMemcpy(t->scales, scales, tensor_scale_bytes(t), cudaMemcpyHostToDevice), "scale overwrite")) return 0;
+        !h2d_done(ctx, t->scales, scales, tensor_scale_bytes(t), "scale overwrite")) return 0;
     return 1;
 }
 
@@ -1961,7 +2134,7 @@ static int f8_warp_mode(void) {
 static void quant_matmul_launch(float *y, const float *x, const void *w,
         const float *sc, int fmt, int S, int I, int O, size_t rb, int gs, int ng) {
     if (coli_cuda_block_fmt_supported(fmt)) {        /* sylph: raw ggml blocks, 32 rows per block */
-        blk_matmul<<<dim3((unsigned)((O + 31) / 32), (unsigned)S), 256>>>(y, x, (const uint8_t *)w, fmt - COLI_FMT_GGML_BASE, S, I, O, rb);
+        blk_matmul_launch(y, x, (const uint8_t *)w, fmt - COLI_FMT_GGML_BASE, S, I, O, rb, 0);
         (void)sc; (void)gs; (void)ng;
         return;
     }
@@ -2440,9 +2613,7 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
     if(all_blk){
         /* sylph GGUF experts: 32 output rows per 256-thread block, gq_dot_row_ref
          * numerics (blk_row), SiLU fused in the dual epilogue. */
-        dim3 hg((unsigned)((I+31)/32),(unsigned)max_rows,(unsigned)count),og((unsigned)((D+31)/32),(unsigned)max_rows,(unsigned)count);
-        grouped_hidden_blk_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D);
-        grouped_down_blk<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+        grouped_blk_launch(ctx->gate,ctx->y,ctx->x,dev,host,I,D,max_rows,count,ctx->stream);
     }else if(all_e8){
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
         grouped_hidden_e8_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D);
@@ -2650,9 +2821,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
          * sync dispatch (32 output rows per 256-thread block, blk_row numerics,
          * SiLU fused in the dual epilogue). */
         GroupDesc *dev=(GroupDesc*)ctx->group_desc;
-        dim3 hg((unsigned)((I+31)/32),(unsigned)max_rows,(unsigned)count),og((unsigned)((D+31)/32),(unsigned)max_rows,(unsigned)count);
-        grouped_hidden_blk_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D);
-        grouped_down_blk<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+        grouped_blk_launch(ctx->gate,ctx->y,ctx->x,dev,host,I,D,max_rows,count,ctx->stream);
     }else if(all_e8){
         GroupDesc *dev=(GroupDesc*)ctx->group_desc;
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count);
@@ -3119,8 +3288,7 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
     if (!select_ctx(ctx)) return 0;
     cudaStream_t st = (cudaStream_t)stream;
     if (coli_cuda_block_fmt_supported(t->fmt)) {   /* sylph: a GGUF matrix as raw ggml blocks, on the chain's stream */
-        blk_matmul<<<dim3((unsigned)((t->O + 31) / 32), (unsigned)S), 256, 0, st>>>(y_dev, x_dev, (const uint8_t *)t->weights,
-                                                                                     t->fmt - COLI_FMT_GGML_BASE, S, t->I, t->O, row_bytes(t->fmt, t->I));
+        blk_matmul_launch(y_dev, x_dev, (const uint8_t *)t->weights, t->fmt - COLI_FMT_GGML_BASE, S, t->I, t->O, row_bytes(t->fmt, t->I), st);
         return cuda_ok(cudaGetLastError(), "chain blk gemm launch");
     }
     if (t->fmt == 1 && S <= GEMV_I8_MAX_S && t->I % 16 == 0 && t->I <= 12288) {

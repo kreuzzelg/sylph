@@ -54,15 +54,17 @@ static void dense(const char *what, int type, int I, int O) {
     cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
     for (int i = 0; i < 5; i++) coli_cuda_tensor_gemm_async(t, yd, xd, 1, NULL);
     cudaDeviceSynchronize();
+    /* ten back-to-back launches per sample (as a decode frame issues them: the card stays
+     * at its working clock, launch gaps amortise), the median over the samples */
     std::vector<double> us;
     for (int i = 0; i < iters(); i++) {
         cudaEventRecord(a, 0);
-        coli_cuda_tensor_gemm_async(t, yd, xd, 1, NULL);
+        for (int k = 0; k < 10; k++) coli_cuda_tensor_gemm_async(t, yd, xd, 1, NULL);
         cudaEventRecord(b, 0); cudaEventSynchronize(b);
-        float ms = 0.f; cudaEventElapsedTime(&ms, a, b); us.push_back(ms * 1e3);
+        float ms = 0.f; cudaEventElapsedTime(&ms, a, b); us.push_back(ms * 1e3 / 10.0);
     }
-    double m = median(us), bytes = (double)rb * O + (double)I * 4;
-    printf("  %-34s %-5s %7d x %-5d %7.1f MB  %8.1f us  %6.1f GB/s\n", what, gq_ref_type_name(type), O, I, bytes / 1e6, m, bytes / m / 1e3);
+    double m = median(us), mn = *std::min_element(us.begin(), us.end()), bytes = (double)rb * O + (double)I * 4;
+    printf("  %-34s %-5s %7d x %-5d %7.1f MB  %8.1f us  %6.1f GB/s  (best %6.1f GB/s)\n", what, gq_ref_type_name(type), O, I, bytes / 1e6, m, bytes / m / 1e3, bytes / mn / 1e3);
     cudaFree(xd); cudaFree(yd); coli_cuda_tensor_free(t); free(w);
 }
 
@@ -94,7 +96,7 @@ int main() {
     int dev = 0;
     if (!coli_cuda_init(&dev, 1)) { puts("no CUDA device: bench-gq-cuda skipped"); return 0; }
     cudaDeviceProp p; cudaGetDeviceProperties(&p, 0);
-    printf("bench-gq-cuda: %s, %d SMs, %.0f GB/s theoretical (%d-bit @ %.0f MHz), median of %d launches\n",
+    printf("bench-gq-cuda: %s, %d SMs, %.0f GB/s theoretical (%d-bit @ %.0f MHz), median of %d samples of 10 back-to-back launches\n",
            p.name, p.multiProcessorCount, 2.0 * p.memoryClockRate * 1e3 * (p.memoryBusWidth / 8) / 1e9, p.memoryBusWidth, p.memoryClockRate / 1e3, iters());
     gq_ref_seed(20261017);
     puts("dense (blk_matmul through coli_cuda_tensor_gemm_async, device pointers):");
