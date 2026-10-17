@@ -128,7 +128,7 @@ Pre-condition: the Nsight breakdown of 2026-10-17 (`08_Documents/benchmarks/2026
 the card is busy 85 % of the decode, in `blk_matmul` (31–165 GB/s) and the grouped expert kernels (~36 GB/s).
 Every step keeps `make cuda-test-gq` bit-exact (B1/B2/B5) and is measured by the bench before and after.
 
-- [ ] 8.0 `tests/bench_gq_cuda.cu` + `make bench-gq-cuda`: µs and GB/s per shape (in_proj 12288×2048 Q8_0, out_proj 2048×4096 Q8_0, attention 8192×2048 Q8_0, shared expert 2048×512 Q8_0 and Q6_K, lm_head 248320×2048 Q6_K; expert group K = 8 of Q4_K/Q4_K/Q5_K at 512×2048); baseline recorded in `08_Documents/benchmarks/` before any kernel changes
+- [x] 8.0 `tests/bench_gq_cuda.cu` + `make bench-gq-cuda`: µs and GB/s per shape (in_proj 12288×2048 Q8_0, out_proj 2048×4096 Q8_0, attention 8192×2048 Q8_0, shared expert 2048×512 Q8_0 and Q6_K, lm_head 248320×2048 Q6_K; expert group K = 8 of Q4_K/Q4_K/Q5_K at 512×2048); baseline recorded in `08_Documents/benchmarks/2026-10-17-rtx3070-blk-kernels.md` before any kernel changes — done 2026-10-17: dense 15–174 GB/s by shape (Q4_K 512×2048 the worst at 15), lm_head 271, group K=8 52 GB/s
 - [ ] 8.1 Step A — rows per block as a template parameter, launcher picks it from `O` and the SM count; gate: `cuda-test-gq` all passed; bench delta recorded
 - [ ] 8.2 Step B — one warp per row, cooperative coalesced loads into shared memory, compute lanes unchanged; gate: `cuda-test-gq`; targets dense ≥ 250 GB/s (25 MB) and ≥ 120 GB/s (1 MB)
 - [ ] 8.3 Step C — the same for `grouped_hidden_blk_dual` / `grouped_down_blk`; gate: B2; target ≥ 150 GB/s

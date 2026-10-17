@@ -64,3 +64,4 @@ gq_cuda_test
 tests/xdna_exec_fixtures/
 tests/xdna_fail_fixtures/
 tests/xdna_physical_probe
+gq_cuda_bench

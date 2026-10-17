@@ -2062,6 +2062,16 @@ cuda-test-gq: tests/test_gq_cuda.cu tests/gq_ref.c backend_cuda.cu backend_cuda.
 	./gq_cuda_test$(EXE)
 .PHONY: cuda-test-gq
 
+# Device throughput of the raw-block kernels (sylph phase 8): µs and GB/s per trunk shape
+# and for an expert group, median of BENCH_ITERS launches. Numbers, not a gate.
+#   make bench-gq-cuda [BENCH_ITERS=50]
+bench-gq-cuda: tests/bench_gq_cuda.cu tests/gq_ref.c backend_cuda.cu backend_cuda.h backend_gpu_compat.h gq.h
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	$(CC) $(filter-out -Xclang -fopenmp,$(CFLAGS)) -fno-openmp -fPIC -c tests/gq_ref.c -o tests/gq_ref.o
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/bench_gq_cuda.cu $(if $(filter 1,$(HIP)),-x none) tests/gq_ref.o -o gq_cuda_bench$(EXE) $(GPU_TEST_LIBS)
+	./gq_cuda_bench$(EXE)
+.PHONY: bench-gq-cuda
+
 tests/test_st_overlay$(EXE): tests/test_st_overlay.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
